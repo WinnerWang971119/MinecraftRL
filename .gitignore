@@ -1,0 +1,60 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/.venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- PyTorch / ML artifacts ----
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+wandb/
+runs/
+tensorboard/
+*.tfevents.*
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ---- Java / Paper / Minecraft server runtime ----
+server/*.jar
+server/world/
+server/world_nether/
+server/world_the_end/
+server/logs/
+server/crash-reports/
+server/cache/
+server/libraries/
+server/versions/
+server/plugins/*.jar
+server/banned-*.json
+server/usercache.json
+server/eula.txt
+server/.console_history
+
+# ---- Logs / scratch ----
+*.log
+scratch/
+tmp/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
