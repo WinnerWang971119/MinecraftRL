@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Bridge message schema — TODO(T3): finalized by task T3. This is a skeleton placeholder.",
+  "oneOf": [
+    {
+      "title": "action (Python → Node)",
+      "type": "object",
+      "properties": {
+        "type": { "const": "action" },
+        "action_id": { "type": "integer", "description": "Discrete action index matching agent/actions.py enum" }
+      },
+      "required": ["type", "action_id"]
+    },
+    {
+      "title": "reset (Python → Node)",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reset" },
+        "seed": { "type": "integer", "description": "Optional RNG seed for the episode" }
+      },
+      "required": ["type"]
+    },
+    {
+      "title": "step (Node → Python)",
+      "type": "object",
+      "properties": {
+        "type": { "const": "step" },
+        "obs": { "type": "object", "description": "Raw observation fields — packed by Python into the obs vector" },
+        "events": { "type": "array", "description": "Damage/death events aggregated over ACTION_REPEAT ticks" }
+      },
+      "required": ["type", "obs", "events"]
+    },
+    {
+      "title": "reset_ack (Node → Python)",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reset_ack" },
+        "ok": { "type": "boolean" },
+        "readback": { "type": "object", "description": "Post-reset readback snapshot for gate verification" }
+      },
+      "required": ["type", "ok"]
+    }
+  ]
+}

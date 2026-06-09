@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mc-pvp-dqn"
+version = "0.1.0"
+description = "Dueling-DRQN agent for Minecraft PvP via the Mineflayer bridge"
+requires-python = ">=3.11"
+dependencies = []  # runtime deps listed in requirements.txt; no hard pins here
+
+[tool.setuptools]
+packages = ["env", "agent", "opponents", "eval", "distributed", "deploy", "study"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
