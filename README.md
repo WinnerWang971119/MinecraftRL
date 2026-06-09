@@ -24,13 +24,56 @@ source specs.
 | `study/` | (deferred) | Study skeleton only |
 | `tests/` | all | Unit + integration tests |
 
-## Setup (filled in by T6 once versions are pinned)
+## Versions (pinned)
 
-- **Python** 3.11+ with PyTorch — `pip install -r requirements.txt`
-- **Node** LTS (verified by the day-1 compat check) — `cd bridge && npm install`
-- **Paper** Minecraft server — see `server/README.md`
+These versions are **frozen** in `agent/contract_config.py` (stdlib-only, no heavy
+imports) after the day-1 compatibility check; see `server/compat_check.md` for the
+evidence behind each pin.
 
-Pinned versions and determinism helpers land in `agent/contract_config.py`.
+| Component | Pinned version | Notes |
+|-----------|----------------|-------|
+| Minecraft | `1.21.1` | Past the 1.9 attack-cooldown cutover the PvP combat model needs |
+| Paper | `1.21.1` build `133` (`paper-1.21.1-133.jar`, channel STABLE) | Requires **Java 21+**; dev machine runs Java 25 |
+| Node | `v24.13.0` | Node 24 "Krypton" LTS; mineflayer floor is `engines.node >=22` |
+| Python | `3.11+` | Dev machine runs 3.14.2 |
+| `mineflayer` | `4.37.1` | |
+| `minecraft-data` | `3.110.2` | Transitive via mineflayer; pinned for reproducibility |
+| `mineflayer-pvp` | `1.3.2` | 1.9+ attack-cooldown-aware attack solver |
+| `mineflayer-pathfinder` | `2.4.5` | |
+
+Every run computes a `code_version()` stamp (short git SHA + a hash of the frozen
+config) which is written onto bridge `state` messages and saved into checkpoints.
+The distributed future will reject actors whose `code_version` does not match the
+learner; the kickoff stack only logs it so train/serve skew stays visible.
+
+## Setup
+
+**Python agent** (3.11+, including 3.14):
+
+```
+python -m pip install -e .        # editable install of the agent package
+# or, to install the listed runtime deps directly:
+python -m pip install -r requirements.txt
+```
+
+(`torch` is the heavy dependency — install the CUDA/CPU variant for your machine,
+see the note in `requirements.txt`. The determinism helpers in `agent/seeding.py`
+degrade gracefully and still seed Python + NumPy if `torch` is not installed.)
+
+**Node bridge** (Node `v24.13.0`):
+
+```
+cd bridge && npm install
+```
+
+The exact npm pins (`mineflayer@4.37.1`, `minecraft-data@3.110.2`,
+`mineflayer-pvp@1.3.2`, `mineflayer-pathfinder@2.4.5`) live in
+`bridge/package.json`; the authoritative copy is also recorded in
+`agent/contract_config.py`.
+
+**Paper server** (Paper `1.21.1` build `133`, Java 21+): download the jar and do
+the first-boot/EULA/`server.properties` setup described in `server/README.md`,
+following the live-handshake steps in `server/compat_check.md`.
 
 ## Tests
 
