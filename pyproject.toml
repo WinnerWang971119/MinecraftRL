@@ -14,3 +14,7 @@ packages = ["env", "agent", "opponents", "eval", "distributed", "deploy", "study
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: marks tests that train to convergence (deselect with '-m \"not slow\"')",
+]
