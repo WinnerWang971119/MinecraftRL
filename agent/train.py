@@ -52,13 +52,14 @@ Owner: T16 (DQN core track)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from agent.actions import N_ACTIONS
+from agent.contract_config import MAX_EPISODE_STEPS, code_version
 from agent.dqn import DuelingDRQN
 from agent.replay import PrioritizedSequenceReplay, SequenceBatch
 from agent.seeding import seed_everything
@@ -70,6 +71,10 @@ __all__ = [
     "train",
     "epsilon_for_episode",
     "LearnStats",
+    "M2Result",
+    "train_vs_dummy",
+    "run_m2",
+    "main",
 ]
 
 
@@ -714,3 +719,530 @@ def train(
         log_hook=log_hook,
     )
     return trainer
+
+
+# ===========================================================================
+# T20 — the M2 integration entrypoint: train the real DRQN vs the stationary
+# dummy over the real perception+reward env, with periodic greedy eval against
+# the M2 gate.
+#
+# This composes the WHOLE stack that the other tracks built:
+#
+#   seed_everything
+#     -> MCPvPEnv(transport, ...)            # real PerceptionFilter + reward
+#        over a StationaryDummy opponent     # served by the bridge/server
+#     -> Trainer(cfg)                        # online/target DuelingDRQN +
+#                                            # PrioritizedSequenceReplay
+#     -> per-episode loop (per-EPISODE ε)    # Trainer.collect + Trainer.learn
+#        with periodic evaluate(...)         # greedy ε=0, the M2 gate (AC6)
+#        logging EACH reward component       # via MetricsLogger
+#        + checkpoint hooks
+#     -> stop at the M2 gate (passed_m2)     # win_rate>=0.95 AND
+#        OR a max-step / max-episode budget. #   aim_while_invisible==0 AND
+#                                            #   mean_len < cap
+#
+# The transport is INJECTABLE (``transport_factory``) so this exact loop runs
+# OFFLINE against a fake/scripted bridge in tests — the offline end-to-end proof.
+# The live M2 run wires the real ``TcpBridgeClient`` via ``main()`` below.
+#
+# WHAT THIS DOES NOT DO (the documented human follow-up):
+#   AC6/TC13 proper — "greedy DRQN >= 95% over 100 eval eps vs the LIVE
+#   stationary dummy" — needs the live Paper server + Node bridge and a real
+#   training budget. That is the human M2 run on the laptop+Paper stack; see
+#   server/README.md ("Live follow-up") and server/compat_check.md for the
+#   live-handshake follow-ups. This task delivers the full integration WIRING
+#   plus the offline end-to-end proof (tests/test_integration_m2.py).
+# ===========================================================================
+
+
+#: Factory that returns a fresh bridge transport (the env owns its lifecycle).
+#: The real one is ``lambda: TcpBridgeClient(host, port)``; tests inject one that
+#: returns a scripted fake bridge. A factory (not an instance) is taken so the M2
+#: entrypoint stays symmetric with the live CLI, which constructs the transport
+#: lazily, and so a future reconnect could rebuild it.
+TransportFactory = Callable[[], "Any"]
+
+
+@dataclass
+class M2Result:
+    """Outcome of an :func:`train_vs_dummy` / :func:`run_m2` integration run.
+
+    Attributes:
+        trainer: The :class:`Trainer` after the loop (online/target nets, replay,
+            grad-step count — inspectable by the caller / a checkpoint).
+        passed_m2: ``True`` iff the most recent eval cleared the full M2 gate
+            (``win_rate >= 0.95`` AND ``aim_while_invisible == 0`` AND
+            ``mean_episode_length < timeout_cap``). ``False`` if the budget ran
+            out first or no eval ran.
+        episodes_run: Number of episodes actually collected before stopping.
+        grad_steps: Number of gradient steps completed.
+        last_report: The most recent eval :class:`~eval.evaluate.EvalReport`
+            (``None`` if no eval ran — e.g. ``eval_every_episodes == 0``).
+        reports: Every eval report produced, in order (for plotting the win-rate
+            curve over training).
+        stop_reason: One of ``"passed_m2"`` / ``"max_episodes"`` / ``"max_steps"``
+            — why the loop stopped.
+        is_live: ``True`` for a real-bridge run, ``False`` for the offline proof.
+    """
+
+    trainer: "Trainer"
+    passed_m2: bool
+    episodes_run: int
+    grad_steps: int
+    last_report: Optional[Any] = None
+    reports: List[Any] = None  # type: ignore[assignment]  # set in __post_init__
+    stop_reason: str = "max_episodes"
+    is_live: bool = False
+
+    def __post_init__(self) -> None:
+        if self.reports is None:
+            self.reports = []
+
+
+def train_vs_dummy(
+    cfg: TrainConfig,
+    *,
+    transport_factory: TransportFactory,
+    max_episodes: int = 10_000,
+    max_grad_steps: Optional[int] = None,
+    updates_per_step: int = 1,
+    eval_every_episodes: int = 50,
+    eval_episodes: int = 100,
+    timeout_cap: int = MAX_EPISODE_STEPS,
+    env_max_episode_steps: int = MAX_EPISODE_STEPS,
+    rollout_step_cap: Optional[int] = None,
+    stop_on_pass: bool = True,
+    device: Optional[torch.device] = None,
+    net_kwargs: Optional[Dict[str, int]] = None,
+    logger: Optional[Any] = None,
+    checkpoint_hook: Optional[CheckpointHook] = None,
+    is_live: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> M2Result:
+    """Train the DRQN vs the stationary dummy until the M2 gate or a budget.
+
+    The full M2 composition (see the section banner above). One ``Trainer`` owns
+    the online/target :class:`~agent.dqn.DuelingDRQN` and the
+    :class:`~agent.replay.PrioritizedSequenceReplay`; this function drives the
+    episode loop, runs a GREEDY :func:`~eval.evaluate.evaluate` against the dummy
+    every ``eval_every_episodes`` episodes (logging EACH reward component via the
+    ``logger``), fires the ``checkpoint_hook``, and STOPS the moment an eval clears
+    the gate (``report.passed_m2``) — or when the episode / gradient-step budget is
+    exhausted.
+
+    The agent and the eval BOTH face the same stage-0 opponent: the
+    :class:`~opponents.dummy.StationaryDummy`. The dummy is served by the bridge /
+    Paper server (its idle policy + immunity flags are enforced server-side), so
+    this loop never steps an opponent policy in Python — it just talks to the env.
+
+    Determinism: ``Trainer`` seeds Python/NumPy/torch from ``cfg.seed`` at
+    construction (``seed_everything``), and per-episode env resets + ε RNG are
+    reseeded from ``cfg.seed + episode_index`` inside ``collect_episode`` — so the
+    whole run is replayable.
+
+    Args:
+        cfg: Training hyperparameters (net/replay geometry, ε schedule, PER, etc.).
+        transport_factory: Zero-arg callable returning a fresh bridge transport
+            (a real :class:`~env.mc_pvp_env.TcpBridgeClient` live; a scripted fake
+            offline). The env owns the returned transport's lifecycle.
+        max_episodes: Hard cap on episodes collected (the episode budget).
+        max_grad_steps: Optional hard cap on gradient steps (the compute budget);
+            ``None`` relies on ``max_episodes`` alone.
+        updates_per_step: Gradient steps per collected episode once the replay is
+            warm (forwarded to the learner).
+        eval_every_episodes: Run a greedy eval after every this-many episodes
+            (``0`` disables periodic eval — then the gate is never checked and the
+            loop runs the full episode budget).
+        eval_episodes: Episodes per greedy eval. AC6 uses 100; tests use a few.
+        timeout_cap: The episode-length horizon a timeout hits, passed to
+            ``evaluate`` (its run-away guard requires ``mean_len < timeout_cap``).
+        env_max_episode_steps: Per-episode decision cap enforced by the env itself.
+        rollout_step_cap: Optional belt-and-suspenders per-episode decision cap for
+            COLLECTION (defends against a fake env that never sets ``done``);
+            ``None`` relies on the env's own ``max_episode_steps``.
+        stop_on_pass: When True (default) stop as soon as an eval clears the M2
+            gate. Set False to run the whole budget regardless (e.g. to collect the
+            full win-rate curve).
+        device / net_kwargs: Forwarded to the :class:`Trainer` constructor.
+        logger: Optional :class:`~eval.logging.MetricsLogger`. Per-episode training
+            stats AND every periodic eval's per-component breakdown are logged
+            through it. ``None`` disables logging (the report is still computed).
+        checkpoint_hook: Optional ``(trainer, grad_step) -> None`` called after the
+            loop ends and after each eval that improves the win rate, so the caller
+            can persist the net + ``code_version``. (The cadence-driven
+            ``Trainer``-internal checkpoint hook is separate; this is the M2-level
+            "save best / save final" hook.)
+        is_live: Marks the produced reports/result as a live (vs offline) run.
+        log: Optional ``str -> None`` progress sink (``None`` silences it).
+
+    Returns:
+        An :class:`M2Result` with the trainer, the gate verdict, the episode /
+        gradient-step counts, every eval report, and the stop reason.
+
+    Raises:
+        ValueError: on a non-positive ``max_episodes`` / ``eval_episodes`` or a
+            negative ``eval_every_episodes``.
+    """
+    # Local import to keep the eval dependency at the call boundary (and to avoid
+    # any import cycle between agent.train and eval.evaluate).
+    from eval.evaluate import DRQNGreedyPolicy, evaluate
+
+    from env.mc_pvp_env import MCPvPEnv
+
+    if max_episodes <= 0:
+        raise ValueError(f"max_episodes must be > 0, got {max_episodes}")
+    if eval_episodes <= 0:
+        raise ValueError(f"eval_episodes must be > 0, got {eval_episodes}")
+    if eval_every_episodes < 0:
+        raise ValueError(
+            f"eval_every_episodes must be >= 0, got {eval_every_episodes}"
+        )
+
+    def _emit(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    # --- build the trainer (online/target DRQN + PER replay, seeded) --------
+    trainer = Trainer(cfg, device=device, net_kwargs=net_kwargs)
+
+    # --- build the real env over the injected transport ---------------------
+    # MCPvPEnv applies the real PerceptionFilter (FOV+LoS+memory gating) and the
+    # canonical reward (single-source-of-truth components) — exactly what the
+    # learner sees in production. The opponent is the stationary dummy, served by
+    # the bridge; the env owns the transport lifecycle.
+    transport = transport_factory()
+    env = MCPvPEnv(transport=transport, max_episode_steps=env_max_episode_steps)
+
+    reports: List[Any] = []
+    last_report: Optional[Any] = None
+    best_win_rate = -1.0
+    passed = False
+    stop_reason = "max_episodes"
+    episodes_run = 0
+
+    def _log_training(_trainer: "Trainer", _step: int, stats: LearnStats) -> None:
+        if logger is not None:
+            logger.log(
+                {
+                    "train/loss": stats.loss,
+                    "train/td_error_mean": stats.td_error_mean,
+                    "train/grad_norm": stats.grad_norm,
+                    "train/epsilon": stats.epsilon,
+                    "train/beta": stats.beta,
+                    "train/replay_size": stats.replay_size,
+                },
+                step=stats.grad_step,
+            )
+
+    try:
+        for episode_index in range(max_episodes):
+            # --- collect ONE episode (per-EPISODE ε, deterministic reseed) ---
+            trainer.collect_episode(env, max_steps=rollout_step_cap)
+            episodes_run += 1
+
+            # --- gradient steps once the replay is warm ----------------------
+            for _ in range(updates_per_step):
+                stats = trainer.learn()
+                if stats is None:
+                    break  # not ready yet; skip remaining updates this episode
+                _log_training(trainer, stats.grad_step, stats)
+
+            # --- periodic GREEDY eval against the M2 gate --------------------
+            do_eval = (
+                eval_every_episodes > 0
+                and (episode_index + 1) % eval_every_episodes == 0
+            )
+            if do_eval:
+                report = _eval_against_dummy(
+                    trainer=trainer,
+                    evaluate=evaluate,
+                    policy_cls=DRQNGreedyPolicy,
+                    transport_factory=transport_factory,
+                    n_episodes=eval_episodes,
+                    timeout_cap=timeout_cap,
+                    env_max_episode_steps=env_max_episode_steps,
+                    eval_step_cap=rollout_step_cap,
+                    logger=logger,
+                    is_live=is_live,
+                    base_seed=cfg.seed,
+                    log=log,
+                )
+                reports.append(report)
+                last_report = report
+
+                # Save-best hook: checkpoint whenever the win rate improves.
+                if report.win_rate > best_win_rate:
+                    best_win_rate = report.win_rate
+                    if checkpoint_hook is not None:
+                        checkpoint_hook(trainer, trainer.grad_step)
+
+                _emit(
+                    f"[m2 ep {episode_index + 1}] grad_step={trainer.grad_step} "
+                    f"win_rate={report.win_rate:.3f} "
+                    f"mean_len={report.mean_episode_length:.1f} "
+                    f"aim_invisible={report.aim_while_invisible:.3f} "
+                    f"passed_m2={report.passed_m2}"
+                )
+
+                if report.passed_m2 and stop_on_pass:
+                    passed = True
+                    stop_reason = "passed_m2"
+                    break
+
+            # --- gradient-step budget ---------------------------------------
+            if max_grad_steps is not None and trainer.grad_step >= max_grad_steps:
+                stop_reason = "max_steps"
+                break
+        else:
+            stop_reason = "max_episodes"
+    finally:
+        _close_quietly(env)
+
+    # A final save (best/final) so the caller always has a persistable net.
+    if checkpoint_hook is not None:
+        checkpoint_hook(trainer, trainer.grad_step)
+
+    return M2Result(
+        trainer=trainer,
+        passed_m2=passed,
+        episodes_run=episodes_run,
+        grad_steps=trainer.grad_step,
+        last_report=last_report,
+        reports=reports,
+        stop_reason=stop_reason,
+        is_live=bool(is_live),
+    )
+
+
+#: Alias — the plan offers ``train_vs_dummy`` OR ``run_m2`` as the entrypoint
+#: name; expose both so either reads naturally at the call site.
+run_m2 = train_vs_dummy
+
+
+def _eval_against_dummy(
+    *,
+    trainer: "Trainer",
+    evaluate: Callable[..., Any],
+    policy_cls: Callable[..., Any],
+    transport_factory: TransportFactory,
+    n_episodes: int,
+    timeout_cap: int,
+    env_max_episode_steps: int,
+    eval_step_cap: Optional[int],
+    logger: Optional[Any],
+    is_live: bool,
+    base_seed: int,
+    log: Optional[Callable[[str], None]],
+) -> Any:
+    """Run ONE greedy (ε=0) eval of the current online net vs the dummy.
+
+    Builds a fresh env over a fresh transport (eval must not consume the training
+    env's in-flight stream), wraps the online net in a greedy
+    :class:`~eval.evaluate.DRQNGreedyPolicy`, runs :func:`~eval.evaluate.evaluate`,
+    and returns its :class:`~eval.evaluate.EvalReport`. The env is always closed.
+    """
+    from env.mc_pvp_env import MCPvPEnv
+
+    policy = policy_cls(trainer.online, device=trainer.device)
+    transport = transport_factory()
+    eval_env = MCPvPEnv(transport=transport, max_episode_steps=env_max_episode_steps)
+    # Switch back to train mode afterward: DRQNGreedyPolicy flips the net to eval()
+    # for inference; the next collection/learn step expects train mode.
+    was_training = trainer.online.training
+    try:
+        report = evaluate(
+            eval_env,
+            policy,
+            n_episodes=n_episodes,
+            logger=logger,
+            timeout_cap=timeout_cap,
+            base_seed=base_seed,
+            is_live=is_live,
+            max_episode_steps=eval_step_cap,
+            log=log,
+        )
+    finally:
+        _close_quietly(eval_env)
+        if was_training:
+            trainer.online.train()
+    return report
+
+
+def _close_quietly(env: Any) -> None:
+    """Close ``env`` if it exposes a ``close()``; ignore its absence/errors.
+
+    The trainer's :class:`EnvProtocol` only requires ``reset`` / ``step``; the
+    real :class:`~env.mc_pvp_env.MCPvPEnv` also owns a transport and MUST be
+    closed, but a lightweight fake env may not implement ``close``. Teardown must
+    never mask the loop's own result or error, so a missing/raising ``close`` is
+    swallowed here.
+    """
+    close = getattr(env, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        # Teardown is best-effort; the connection is going away regardless.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# CLI — the LIVE M2 training run (AC6/TC13 prep), part of T20.
+#
+# Wires the REAL ``TcpBridgeClient`` transport to the started Node bridge / Paper
+# server (which serves the stationary dummy), runs ``train_vs_dummy`` to the M2
+# gate or the budget, logs through a ``MetricsLogger``, optionally writes a final
+# checkpoint, and exits 0 iff the gate passed. The OFFLINE end-to-end logic is
+# proved by tests/test_integration_m2.py; this entry point is the LIVE run.
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> "Any":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="train",
+        description=(
+            "T20 M2 integration: train the Dueling-DRQN vs the stationary dummy "
+            "over the real perception+reward env, with periodic greedy eval "
+            "against the M2 gate (win_rate>=95%, aim-while-invisible==0, mean "
+            "length<cap). Connects to a started Node bridge / Paper server. The "
+            "offline end-to-end wiring is proved by tests/test_integration_m2.py; "
+            "this entry point is the LIVE M2 run (AC6/TC13) - see server/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--max-episodes", type=int, default=10_000,
+        help="episode budget (default: 10000).",
+    )
+    parser.add_argument(
+        "--max-grad-steps", type=int, default=None,
+        help="optional gradient-step budget (default: none - episodes only).",
+    )
+    parser.add_argument(
+        "--eval-every-episodes", type=int, default=50,
+        help="run a greedy eval every N episodes (default: 50; 0 disables).",
+    )
+    parser.add_argument(
+        "--eval-episodes", type=int, default=100,
+        help="episodes per greedy eval (default: 100, per AC6).",
+    )
+    parser.add_argument(
+        "--host", type=str, default="127.0.0.1",
+        help="bridge host for the live run (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port", type=int, default=5555,
+        help="bridge TCP port for the live run (default: 5555).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="base RNG seed (overrides TrainConfig.seed) (default: 0).",
+    )
+    parser.add_argument(
+        "--run-name", type=str, default="m2_train",
+        help="logger run name (default: m2_train).",
+    )
+    parser.add_argument(
+        "--log-backend", type=str, default="auto",
+        help="metrics backend: auto|wandb|tensorboard|jsonl (default: auto).",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="optional path to write the final DRQN checkpoint (state_dict).",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point for the LIVE M2 training run (AC6/TC13), part of T20.
+
+    Wires a real :class:`~env.mc_pvp_env.TcpBridgeClient` to the bridge, runs
+    :func:`train_vs_dummy` to the M2 gate or the budget, logs through a
+    :class:`~eval.logging.MetricsLogger`, optionally writes a final checkpoint
+    (with the ``code_version`` stamp), and EXITS 0 iff the M2 gate passed.
+
+    Args:
+        argv: Argument vector (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 == passed the M2 gate).
+    """
+    import dataclasses
+    import sys
+
+    from eval.logging import MetricsLogger
+
+    from env.mc_pvp_env import TcpBridgeClient
+
+    args = _build_parser().parse_args(argv)
+
+    # Honor the CLI seed by replacing it on the frozen config.
+    cfg = dataclasses.replace(TrainConfig(), seed=int(args.seed))
+
+    logger = MetricsLogger(
+        run_name=args.run_name,
+        backend=args.log_backend,
+        config={
+            "host": args.host,
+            "port": args.port,
+            "seed": args.seed,
+            "max_episodes": args.max_episodes,
+            "eval_episodes": args.eval_episodes,
+            "code_version": code_version(),
+        },
+    )
+
+    checkpoint_path = args.checkpoint
+
+    def _save_checkpoint(trainer: "Trainer", grad_step: int) -> None:
+        if checkpoint_path is None:
+            return
+        torch.save(
+            {
+                "model": trainer.online.state_dict(),
+                "grad_step": grad_step,
+                "code_version": code_version(),
+            },
+            checkpoint_path,
+        )
+
+    def _transport_factory() -> Any:
+        return TcpBridgeClient(host=args.host, port=args.port)
+
+    try:
+        result = train_vs_dummy(
+            cfg,
+            transport_factory=_transport_factory,
+            max_episodes=args.max_episodes,
+            max_grad_steps=args.max_grad_steps,
+            eval_every_episodes=args.eval_every_episodes,
+            eval_episodes=args.eval_episodes,
+            logger=logger,
+            checkpoint_hook=_save_checkpoint if checkpoint_path else None,
+            is_live=True,
+            log=lambda m: print(m, file=sys.stderr),
+        )
+    finally:
+        logger.close()
+
+    report = result.last_report
+    print(
+        f"[m2 done] reason={result.stop_reason} episodes={result.episodes_run} "
+        f"grad_steps={result.grad_steps} passed_m2={result.passed_m2}",
+        file=sys.stderr,
+    )
+    if report is not None:
+        print(
+            f"  last eval: win_rate={report.win_rate:.3f} "
+            f"mean_len={report.mean_episode_length:.1f} "
+            f"aim_invisible={report.aim_while_invisible:.3f}",
+            file=sys.stderr,
+        )
+
+    return 0 if result.passed_m2 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

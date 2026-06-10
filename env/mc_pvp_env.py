@@ -96,7 +96,11 @@ from env.observation_spec import (
     validate,
 )
 from env.perception_filter import PerceptionFilter
-from env.reward import Events, TermInfo, compute_reward
+from env.reward import (
+    TermInfo,
+    compute_reward,
+    compute_reward_components,
+)
 
 __all__ = [
     "BridgeError",
@@ -123,9 +127,11 @@ DECISION_DT_SECONDS: float = ACTION_REPEAT / SERVER_TPS
 # Reward component keys exposed in ``info`` (for T19/T11 logging).
 #
 # These are the per-component decomposition of the scalar ``compute_reward``
-# output. They are recomputed here from the same frozen coefficients so the
-# logger can plot each term separately without the env and the reward function
-# disagreeing about the breakdown.
+# output. As of T20 the breakdown in ``info`` comes from the SINGLE source of
+# truth — ``env.reward.compute_reward_components`` — so the env and the reward
+# function can never disagree (and the canonical version's ``isfinite`` guard on
+# the shaping fields prevents the logged ``r_shaping`` from drifting to NaN while
+# the scalar stays finite). Mirrors ``env.reward.REWARD_COMPONENT_KEYS``.
 # ---------------------------------------------------------------------------
 REWARD_COMPONENT_KEYS: Tuple[str, ...] = (
     "r_damage_dealt",
@@ -553,8 +559,15 @@ class MCPvPEnv:
         terminal = TermInfo(done=done, won=won, lost=lost, timeout=timeout)
 
         # --- reward + per-component breakdown ------------------------------
+        # The scalar reward and its per-component decomposition both flow from the
+        # SINGLE source of truth in env.reward, so the logged components can never
+        # drift from the scalar (and they carry the canonical isfinite guard on the
+        # shaping fields — a non-finite opponent position no longer poisons the
+        # logged r_shaping while the scalar stays finite).
         reward = compute_reward(events, obs, prev_obs, terminal, self._cfg)
-        components = self._reward_components(events, obs, prev_obs, terminal)
+        components = compute_reward_components(
+            events, obs, prev_obs, terminal, self._cfg
+        )
 
         # Advance episode state.
         self._prev_obs = obs
@@ -712,79 +725,6 @@ class MCPvPEnv:
         # Fail loudly on a malformed vector rather than feeding the agent garbage.
         validate(obs)
         return obs.astype(OBS_DTYPE, copy=False)
-
-    # -- reward decomposition (for logging) -------------------------------
-
-    def _reward_components(
-        self,
-        events: Events,
-        gated_obs: np.ndarray,
-        prev_obs: np.ndarray,
-        terminal: TermInfo,
-    ) -> Dict[str, float]:
-        """Decompose the scalar reward into its named additive components.
-
-        Mirrors the exact formula in :func:`env.reward.compute_reward` using the
-        same frozen coefficients, so each term can be logged separately (T19/T11)
-        and the components SUM (within fp tolerance) to the returned scalar reward.
-        Keys are :data:`REWARD_COMPONENT_KEYS`.
-        """
-        from env.observation_spec import Obs  # local import: index enum only
-
-        cfg = self._cfg
-
-        r_dmg_out = cfg.c_dmg_out * float(events.damage_dealt)
-        r_dmg_in = -cfg.c_dmg_in * float(events.damage_taken)
-        r_step = -float(cfg.c_step)
-
-        # Visibility-gated aim bonus (exactly the reward module's _aim_bonus).
-        visible = gated_obs[Obs.VISIBLE] > 0.5
-        in_crosshair = gated_obs[Obs.IN_CROSSHAIR] > 0.5
-        r_aim = float(cfg.c_aim) if (visible and in_crosshair) else 0.0
-
-        # Potential-based shaping F = gamma*Phi(s') - Phi(s).
-        r_shaping = (
-            cfg.gamma * self._approach_potential(gated_obs)
-            - self._approach_potential(prev_obs)
-        )
-
-        # Terminal reward (win/loss/timeout), applied only when done.
-        if not terminal.done:
-            r_terminal = 0.0
-        elif terminal.won:
-            r_terminal = float(cfg.R_terminal_win)
-        elif terminal.lost:
-            r_terminal = -float(cfg.R_terminal_loss)
-        else:
-            r_terminal = float(cfg.R_terminal_timeout)
-
-        return {
-            "r_damage_dealt": float(r_dmg_out),
-            "r_damage_taken": float(r_dmg_in),
-            "r_step": float(r_step),
-            "r_aim": float(r_aim),
-            "r_shaping": float(r_shaping),
-            "r_terminal": float(r_terminal),
-        }
-
-    def _approach_potential(self, obs: np.ndarray) -> float:
-        """Potential Φ(s) for the positional shaping term (mirrors env.reward).
-
-        Zero unless ``cfg.c_approach`` is enabled AND the opponent is visible, so
-        an unseen/zeroed position never produces a phantom potential. Kept in
-        lock-step with ``env.reward._approach_potential`` so the logged shaping
-        component matches the scalar reward.
-        """
-        from env.observation_spec import Obs, field_slice  # local: index helpers
-
-        cfg = self._cfg
-        if cfg.c_approach == 0.0:
-            return 0.0
-        if obs[Obs.VISIBLE] <= 0.5:
-            return 0.0
-        pos = np.asarray(obs[field_slice("opp_pos_local")], dtype=np.float64)
-        distance = float(np.linalg.norm(pos))
-        return -float(cfg.c_approach) * distance
 
 
 # ===========================================================================
