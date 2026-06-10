@@ -720,7 +720,14 @@ class ArenaBots {
         await this.handleStep(msg);
         break;
       case 'close':
-        await this.close();
+        // Per-episode client teardown, NOT process shutdown: the env opens a
+        // fresh connection per episode and sends `close` when that client is
+        // done. Drop only the client socket; the bots stay in-game and the
+        // server keeps listening (the next reset re-establishes all bot state
+        // anyway). Full teardown — close() — is reserved for process exit
+        // (SIGINT in run.js). Treating `close` as full teardown killed the
+        // live run after its first episode.
+        this.transport.dropConnection();
         break;
       default:
         // The Python side never sends an unknown type (it validates outbound);
@@ -746,6 +753,14 @@ class ArenaBots {
     this._sendCommand(this.dummy, `/tp ${this.config.dummyUsername} ${spawn.x + 3} ${spawn.y} ${spawn.z}`);
     this._sendCommand(this.learner, `/effect clear ${this.config.learnerUsername}`);
     this._sendCommand(this.dummy, `/effect clear ${this.config.dummyUsername}`);
+    // Health does NOT reset on /tp: damage from the previous episode (or from
+    // join jank like fall damage) persists on the player, and natural regen is
+    // far slower than the gate's 3 s window. Force full health with an instant
+    // effect — applied within a tick and never lingering in active effects, so
+    // the gate's no-effects check is unaffected. Heal BOTH bots: the learner
+    // for the gate, the dummy so every episode starts from equal health.
+    this._sendCommand(this.learner, `/effect give ${this.config.learnerUsername} minecraft:instant_health 1 10 true`);
+    this._sendCommand(this.dummy, `/effect give ${this.config.dummyUsername} minecraft:instant_health 1 10 true`);
     this._regear(this.learner);
     this._regear(this.dummy);
 
@@ -770,6 +785,25 @@ class ArenaBots {
       ok: result.ok,
       readback: result.readback === null ? {} : result.readback,
     });
+
+    // The frozen reset reply is TWO messages, not one: `state` doubles as the
+    // post-reset first observation (schema.md), and the env's reset() blocks on
+    // _recv_state() right after an ok:true ack — without this send the env
+    // waits out its full recv timeout and tears the connection down. Only on
+    // ok:true: after ok:false the env immediately retries the reset, and a
+    // stray state would desync its request/reply stream.
+    if (result.ok) {
+      this.transport.send(
+        assembleStateMsg({
+          self: this._snapshotSelf(),
+          opponent: this._snapshotOpponent(),
+          events: this.events.drain(),
+          wallDistances: this._probeWallDistances(),
+          tick: this._currentTick,
+          codeVersion: resolveCodeVersion(),
+        }),
+      );
+    }
   }
 
   /** Current attack-cooldown for the learner's held weapon, in [0,1]. */
@@ -862,7 +896,13 @@ class ArenaBots {
     // lands.
     const pos = this.dummy && this.dummy.entity ? this.dummy.entity.position : null;
     if (pos && typeof pos.x === 'number' && typeof pos.y === 'number' && typeof pos.z === 'number') {
-      this._lastSeenOpponentPos = { x: pos.x, y: pos.y, z: pos.z };
+      // SNAPSHOT as a Vec3, not a plain {x,y,z}: bot.lookAt requires a Vec3
+      // (it calls point.minus(...) — a plain object made the live lookAt throw
+      // and the unhandled rejection killed the bridge mid-episode). clone()
+      // keeps the memory a snapshot of where the opponent WAS rather than an
+      // alias of the live, moving position vector.
+      this._lastSeenOpponentPos =
+        typeof pos.clone === 'function' ? pos.clone() : { x: pos.x, y: pos.y, z: pos.z };
     }
   }
 
@@ -937,12 +977,23 @@ class ArenaBots {
     }
   }
 
-  /** Regear a bot to the template (T7b/T8 fill the real /give or kit logic). */
+  /**
+   * Regear a bot to the template gear via opped /clear + /give. Like the other
+   * reset commands these are async and unacked; the read-back gate remains the
+   * source of truth that the gear actually arrived. /clear first so leftovers
+   * from the previous episode (or a picked-up drop) cannot fail the gate's
+   * exact-set inventory check.
+   */
   _regear(bot) {
-    // Placeholder: a real regear clears the inventory and gives the template
-    // gear via opped /clear + /give (or a kit plugin). Left as a hook so the
-    // read-back gate is the source of truth that gear actually arrived.
-    void bot;
+    if (!bot || typeof bot.username !== 'string') {
+      return;
+    }
+    this._sendCommand(bot, `/clear ${bot.username}`);
+    for (const item of this.resetTemplate.inventory) {
+      // Template names are mineflayer item names (e.g. "iron_sword"); the
+      // command needs the namespaced id.
+      this._sendCommand(bot, `/give ${bot.username} minecraft:${item} 1`);
+    }
   }
 
   /** Tear down both bots and the transport. */

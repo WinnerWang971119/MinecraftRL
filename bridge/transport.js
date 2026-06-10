@@ -394,13 +394,25 @@ class BridgeServer extends EventEmitter {
     });
   }
 
-  /** Wire a newly accepted client socket. Rejects a second concurrent client. */
+  /**
+   * Wire a newly accepted client socket. If an old connection is still
+   * registered, ADOPT the new one and drop the stale socket: the env client is
+   * the only legitimate peer (one logical connection per arena process), and a
+   * new connect means it abandoned the old socket — typically its documented
+   * single-reconnect recovery racing our 'close' event on loopback. The
+   * previous behavior (refuse the newcomer via socket.destroy(err)) emitted
+   * 'error' on a socket with no listeners attached yet, which is process-fatal
+   * and killed the bridge during the first live run. A genuinely concurrent
+   * second client now steals the stream; that is operator error, made visible
+   * by the 'disconnect'/'connection' events the launcher logs.
+   */
   _onConnection(socket) {
     if (this._socket !== null && !this._socket.destroyed) {
-      // One connection per arena: refuse extras loudly rather than interleaving
-      // two arenas' streams onto one framer.
-      socket.destroy(new Error('BridgeServer already has an active connection'));
-      return;
+      const stale = this._socket;
+      // Detach before destroying so the stale socket's 'close' handler cannot
+      // clobber the newly adopted socket.
+      this._socket = null;
+      stale.destroy();
     }
 
     this._socket = socket;
@@ -455,6 +467,22 @@ class BridgeServer extends EventEmitter {
       throw new Error('cannot send: no active bridge connection');
     }
     return this._socket.write(line);
+  }
+
+  /**
+   * Drop the active client connection (if any) WITHOUT stopping the server.
+   * This is the per-episode `close` semantics: the env opens a fresh client
+   * per episode and sends `close` when it is done with this one, so only the
+   * client socket goes away — the listener (and the bots above us) stay up
+   * for the next episode's connection. Idempotent.
+   */
+  dropConnection() {
+    const socket = this._socket;
+    this._socket = null;
+    this._framer.reset();
+    if (socket !== null && !socket.destroyed) {
+      socket.destroy();
+    }
   }
 
   /**

@@ -42,6 +42,7 @@ const {
   ACTION_MIN,
   ACTION_MAX,
   DEFAULT_PORT,
+  BridgeServer,
 } = require('./transport');
 
 const {
@@ -482,4 +483,89 @@ test('computeAttackCooldown ramps linearly to 1.0 over the weapon period', () =>
 test('computeAttackCooldown is defensive against a zero/negative weapon speed', () => {
   assert.equal(computeAttackCooldown(100, 50, 0), 1.0);
   assert.equal(computeAttackCooldown(100, 50, -5), 1.0);
+});
+
+// ---------------------------------------------------------------------------
+// BridgeServer._onConnection adoption (mock sockets, no real TCP). The env's
+// single-reconnect recovery can race the old socket's 'close' on loopback, so
+// a new connection must ADOPT (drop the stale socket) — the old refuse path
+// destroyed the listenerless newcomer with an error, which is process-fatal
+// and killed the bridge during the first live run.
+// ---------------------------------------------------------------------------
+
+const { EventEmitter: TestEmitter } = require('node:events');
+
+/** Just enough net.Socket surface for _onConnection: destroy(err) mirrors the
+ *  real process-fatal behavior (EventEmitter throws on unlistened 'error'). */
+class FakeSocket extends TestEmitter {
+  constructor() {
+    super();
+    this.destroyed = false;
+  }
+
+  setNoDelay() {}
+
+  destroy(err) {
+    this.destroyed = true;
+    if (err !== undefined) {
+      this.emit('error', err); // throws if nothing listens — like a real socket
+    }
+    this.emit('close');
+  }
+}
+
+test('a reconnect while the old socket is still registered ADOPTS the new one', () => {
+  const server = new BridgeServer();
+  server.on('error', () => {}); // keep server-level errors non-fatal in the test
+
+  const stale = new FakeSocket();
+  server._onConnection(stale);
+  assert.equal(server.isConnected, true);
+
+  const fresh = new FakeSocket();
+  // Old behavior: this threw (unlistened 'error' on the refused socket).
+  assert.doesNotThrow(() => server._onConnection(fresh));
+
+  assert.equal(stale.destroyed, true, 'the stale socket is dropped');
+  assert.equal(server.isConnected, true, 'the new socket is the active one');
+
+  // The adopted socket actually serves the stream end to end.
+  const seen = [];
+  server.on('message', (m) => seen.push(m));
+  fresh.emit('data', Buffer.from('{"type":"step","action":3}\n'));
+  assert.deepEqual(seen, [{ type: 'step', action: 3 }]);
+});
+
+test('a reconnect after the old socket closed normally still connects', () => {
+  const server = new BridgeServer();
+  const first = new FakeSocket();
+  server._onConnection(first);
+  first.destroy(); // normal disconnect: 'close' clears the registration
+  assert.equal(server.isConnected, false);
+
+  const second = new FakeSocket();
+  server._onConnection(second);
+  assert.equal(server.isConnected, true);
+});
+
+test('dropConnection closes the client but keeps accepting new connections', () => {
+  const server = new BridgeServer();
+  const first = new FakeSocket();
+  server._onConnection(first);
+  assert.equal(server.isConnected, true);
+
+  server.dropConnection();
+  assert.equal(first.destroyed, true, 'the active client socket is destroyed');
+  assert.equal(server.isConnected, false);
+
+  // dropConnection is idempotent and does not poison the next episode.
+  server.dropConnection();
+  const second = new FakeSocket();
+  server._onConnection(second);
+  assert.equal(server.isConnected, true, 'a fresh per-episode client connects fine');
+
+  const seen = [];
+  server.on('message', (m) => seen.push(m));
+  second.emit('data', Buffer.from('{"type":"reset","episode":1,"seed":1}\n'));
+  assert.deepEqual(seen, [{ type: 'reset', episode: 1, seed: 1 }]);
 });

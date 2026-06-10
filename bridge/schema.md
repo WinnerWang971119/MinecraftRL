@@ -89,7 +89,10 @@ Node aggregates events over the interval and replies with one
 
 ### `close`
 
-Tear down the arena: disconnect bots and close this connection. No reply.
+End this client's session: the bridge closes this connection but keeps both
+bots in-game and keeps listening — the env opens a fresh connection per
+episode, and `reset` re-establishes all bot state. Bots disconnect only when
+the bridge process exits. No reply.
 
 | Field  | Type             | Meaning        |
 |--------|------------------|----------------|

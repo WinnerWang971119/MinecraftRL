@@ -20,6 +20,14 @@
 
 const { ArenaBots } = require('./bot');
 
+// Fire-and-forget Mineflayer calls (lookAt, attack) reject outside any await
+// chain, and an unhandled rejection is process-fatal in Node — one killed the
+// bridge mid-episode during the first live run. The M1 bar is zero crashes:
+// log it, lose at worst one decision window, keep serving.
+process.on('unhandledRejection', (reason) => {
+  console.error('[bridge] unhandled rejection (continuing):', reason);
+});
+
 async function main() {
   const bots = new ArenaBots(); // BridgeServer on 127.0.0.1:5555
 

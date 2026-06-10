@@ -778,3 +778,25 @@ test('W1b self death→respawn→hit: post-respawn damage_taken is counted corre
     'post-respawn hit is counted correctly from the re-seeded self baseline',
   );
 });
+
+// ---------------------------------------------------------------------------
+// Fire-and-forget lookAt rejection safety. bot.lookAt is async and begin() is
+// sync, so a rejecting lookAt used to surface as an unhandled rejection and
+// kill the whole bridge process live (TURN_TO_LAST_SEEN with a non-Vec3
+// point). The executor must swallow-and-log, never propagate. This test FAILS
+// THE WHOLE RUN (unhandled rejection) if the catch is missing.
+// ---------------------------------------------------------------------------
+
+test('_turnToLastSeen survives a rejecting bot.lookAt (no unhandled rejection)', async () => {
+  const bot = {
+    lookAt: () => Promise.reject(new TypeError('point.minus is not a function')),
+  };
+  const executor = new MacroExecutor(bot, { weaponAttackSpeedTicks: 12.5 });
+
+  const looked = executor._turnToLastSeen({ x: 3.5, y: 64, z: 0.5 });
+  assert.equal(looked, true, 'the turn is still reported as issued');
+
+  // Give the rejection a tick to settle; an uncaught one aborts node --test.
+  await new Promise((resolve) => setImmediate(resolve));
+});
+

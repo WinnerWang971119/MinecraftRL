@@ -478,7 +478,17 @@ class MacroExecutor {
       return false;
     }
     if (this.bot && typeof this.bot.lookAt === 'function') {
-      this.bot.lookAt(lastSeenPosition, true);
+      // lookAt is async but begin() is synchronous, so this is deliberately
+      // fire-and-forget — which makes any rejection an UNHANDLED rejection,
+      // and that is process-fatal in Node (it killed the bridge live when a
+      // non-Vec3 point made lookAt throw). Catch and log; a missed turn must
+      // never take the whole bridge down.
+      const pending = this.bot.lookAt(lastSeenPosition, true);
+      if (pending && typeof pending.catch === 'function') {
+        pending.catch((err) => {
+          console.error('[bridge] lookAt failed:', err && err.message ? err.message : err);
+        });
+      }
       return true;
     }
     return false;
