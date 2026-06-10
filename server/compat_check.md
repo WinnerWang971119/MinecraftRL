@@ -133,6 +133,31 @@ two plugins load against a real 1.21.1 server:
    attack cooldown** (swings pace to the cooldown, not spammed every tick). This
    is the behavior the project's combat model depends on.
 
+### TC7b live assertions (damage-event feed — must verify by hand)
+
+After T7b wires both bots, two additional live checks are required before the
+damage-event feed is considered production-ready:
+
+**TC7b-W1a — reconnect/re-wire does not double-count damage.**
+Simulate a reconnect: call `arena.wireDamageEvents()` a second time while both
+bots are already connected (e.g. after a bot drop and rejoin in the same
+process). Then land one real hit on the dummy bot and observe the `state`
+message the bridge emits at the next step boundary. `events.damage_dealt` must
+equal the actual hit amount **exactly once** — not twice. A double-count here
+means the reconnect re-registered the handler without removing the previous one,
+which silently corrupts every reward signal going forward.
+
+**TC7b-W1b — opponent respawn mid-observation does not drop the next hit.**
+Let the dummy bot die (opponent health → 0) and wait for it to respawn to full
+health. Without resetting, land one real hit on the (now-full-health) dummy and
+observe the `state` message. `events.damage_dealt` must equal the actual hit
+amount, **not zero or a truncated value**. A dropped or under-counted hit means
+`_prevOpponentHealth` was left at the stale post-death value and the health
+increase on respawn was measured as a negative delta that silently zeroed the
+damage. The same scenario applies symmetrically to the learner bot (self death
+→ respawn → take a hit): `events.damage_taken` must equal the actual hit, not
+zero.
+
 If step 5 reports a version/protocol mismatch or either plugin fails to attach,
 re-pin to the highest 1.21.x that mineflayer cleanly supports (do **not** drop
 below 1.9 — pre-1.9 has no attack cooldown) and update T6/T8 accordingly.
