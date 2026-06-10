@@ -23,7 +23,14 @@ spec's start table:
 Anti-hacking notes for the tuner (T17):
   - ``c_step`` is the single most important knob. Too large → suicide-rushing;
     too small → the agent runs away forever. Re-check it whenever the action
-    set or episode length changes.
+    set or episode length changes. **Finalized at 0.005** (T17): at the spec's
+    episode horizon the accumulated step penalty over a full episode stays an
+    order of magnitude below a single landed hit (``c_dmg_out`` per HP) and far
+    below ``R_terminal_win``, so it nudges decisiveness without ever making
+    death (which stops the bleed early) look attractive — i.e. it is too small
+    to motivate a suicide-rush, yet large enough that endlessly running away
+    is strictly worse than engaging. Tune up only if the agent stalls/kites;
+    tune down if it trades recklessly to end episodes.
   - ``c_aim`` is deliberately tiny and **visibility-gated** (see ``compute_reward``)
     so the agent cannot spin in place to farm an always-on aim bonus.
   - ``R_terminal_win``/``R_terminal_loss`` start equal (symmetric) inside the
