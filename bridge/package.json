@@ -5,6 +5,7 @@
   "type": "commonjs",
   "main": "bot.js",
   "scripts": {
+    "start": "node run.js",
     "test": "node --test"
   },
   "dependencies": {
