@@ -512,6 +512,12 @@ class ArenaBots {
         requireNoEffects: true,
       });
 
+    // Read-back gate overrides (timeout/poll cadence + injectable now/sleep)
+    // merged over DEFAULT_READBACK inside handleReset. Injectable so the gate
+    // timing is tunable and, crucially, so tests can drive the gate with a fake
+    // clock instead of burning real wall-clock on a never-matching mock bot.
+    this._readbackOptions = deps.readbackOptions || {};
+
     // Iron sword ~1.6 atk/s in 1.9+ combat -> ticks for a full swing recharge.
     // Imported from actions.js (IRON_SWORD_ATTACK_SPEED_TICKS) so the two
     // modules share a single source of truth and cannot drift (S2).
@@ -720,19 +726,51 @@ class ArenaBots {
         await this.handleStep(msg);
         break;
       case 'close':
-        // Per-episode client teardown, NOT process shutdown: the env opens a
-        // fresh connection per episode and sends `close` when that client is
-        // done. Drop only the client socket; the bots stay in-game and the
-        // server keeps listening (the next reset re-establishes all bot state
-        // anyway). Full teardown — close() — is reserved for process exit
-        // (SIGINT in run.js). Treating `close` as full teardown killed the
-        // live run after its first episode.
+        // Client teardown, NOT bridge shutdown. The training env holds ONE
+        // connection for the whole run and sends `close` once, at shutdown
+        // (the periodic eval BORROWS that same connection, so it never sends its
+        // own close). Drop only the client socket and keep both bots in-game with
+        // the server still listening, so a reconnect (the env's single-reconnect
+        // recovery, or a re-launched driver) resumes without re-spawning bots.
+        // Full teardown via close() is reserved for process exit (SIGINT in
+        // run.js); treating `close` as full teardown would kill the bridge on a
+        // transient drop. NOTE: the bridge does NOT self-exit when the connection
+        // goes idle — it stays up until SIGINT.
         this.transport.dropConnection();
         break;
       default:
         // The Python side never sends an unknown type (it validates outbound);
         // surface it loudly if it ever happens.
         this.transport.emit('error', new Error(`unknown inbound type "${msg.type}"`));
+    }
+  }
+
+  /**
+   * Send an outbound reply, tolerating a client that vanished during a slow
+   * path (e.g. the up-to-3 s read-back gate). transport.send() throws
+   * synchronously when there is no active connection; in the reset/step reply
+   * path that throw escapes to wireTransport's .catch and is reported as a
+   * bridge 'error', dropping the reply for a connection that is already gone.
+   * A client disconnect is not a bridge fault, so skip the send cleanly: the
+   * next connection re-establishes all state via reset.
+   *
+   * @param {object} msg A schema-valid outbound message.
+   * @returns {boolean} True if the message was written, false if skipped.
+   */
+  _trySend(msg) {
+    // Only bail when the transport EXPLICITLY reports no connection; mock
+    // transports in unit tests omit isConnected and must still send.
+    if (this.transport.isConnected === false) {
+      return false;
+    }
+    try {
+      this.transport.send(msg);
+      return true;
+    } catch (err) {
+      // The socket dropped between the isConnected check and the write (TOCTOU),
+      // or the transport has no live connection. A disconnect is not a bridge
+      // fault — do not emit 'error'; the reply for a gone client is simply lost.
+      return false;
     }
   }
 
@@ -778,9 +816,9 @@ class ArenaBots {
     this._prevOpponentHealth = MAX_HEALTH;
 
     // READ-BACK GATE: poll the learner until it matches the template or times out.
-    const result = await runReadbackGate(this.learner, this.resetTemplate);
+    const result = await runReadbackGate(this.learner, this.resetTemplate, this._readbackOptions);
 
-    this.transport.send({
+    const acked = this._trySend({
       type: 'reset_ack',
       ok: result.ok,
       readback: result.readback === null ? {} : result.readback,
@@ -791,9 +829,11 @@ class ArenaBots {
     // _recv_state() right after an ok:true ack — without this send the env
     // waits out its full recv timeout and tears the connection down. Only on
     // ok:true: after ok:false the env immediately retries the reset, and a
-    // stray state would desync its request/reply stream.
-    if (result.ok) {
-      this.transport.send(
+    // stray state would desync its request/reply stream. Skip it if the ack
+    // didn't go out (the client disconnected during the gate): a state with no
+    // matching reset_ack would desync the env's request/reply stream too.
+    if (acked && result.ok) {
+      this._trySend(
         assembleStateMsg({
           self: this._snapshotSelf(),
           opponent: this._snapshotOpponent(),
@@ -871,7 +911,7 @@ class ArenaBots {
       tick: this._currentTick,
       codeVersion: resolveCodeVersion(),
     });
-    this.transport.send(stateMsg);
+    this._trySend(stateMsg);
   }
 
   /** The opponent (dummy) Mineflayer entity, the bot.attack target, or null. */

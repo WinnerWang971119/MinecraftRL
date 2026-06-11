@@ -142,11 +142,29 @@ test('a close message drops only the client; bots stay in-game (per-episode clos
   assert.equal(quits, 0, 'neither bot quits on a per-episode close');
 });
 
+/** Gate options driving an instant timeout via an injected clock (no real wait). */
+function instantTimeoutGate() {
+  let t = 0;
+  return {
+    timeoutMs: 100,
+    pollIntervalMs: 10,
+    now: () => {
+      const v = t;
+      t += 60; // two polls exceed timeoutMs=100 -> immediate timeout
+      return v;
+    },
+    sleep: async () => {},
+  };
+}
+
 test('handleReset after a FAILED gate sends ok:false and NO state (env retries)', async () => {
   const sent = [];
-  const bots = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
-  // No gear ever shows up in the readback, so the gate burns its full window
-  // (3 s — this test is deliberately the slow one in the suite) and rejects.
+  // Drive the gate with an injected clock + no-op sleep so the never-matching
+  // learner fails the gate INSTANTLY instead of burning the real 3 s timeout.
+  const bots = new ArenaBots({}, {
+    transport: { send: (msg) => sent.push(msg) },
+    readbackOptions: instantTimeoutGate(),
+  });
   bots.learner = mockBot('learner_bot', { inventory: [] });
   bots.dummy = mockBot('dummy_bot');
 
@@ -156,4 +174,31 @@ test('handleReset after a FAILED gate sends ok:false and NO state (env retries)'
   assert.equal(sent.length, 1);
   assert.equal(sent[0].type, 'reset_ack');
   assert.equal(sent[0].ok, false);
+});
+
+test('handleReset skips the reply (no bridge error) when the client disconnects during the gate', async () => {
+  const sent = [];
+  const errors = [];
+  // isConnected passes the guard, but the write throws like BridgeServer.send on
+  // a dead socket (the client disconnected during the gate — a TOCTOU drop).
+  const transport = {
+    isConnected: true,
+    send: () => {
+      throw new Error('cannot send: no active bridge connection');
+    },
+    emit: (event, payload) => {
+      if (event === 'error') errors.push(payload);
+    },
+  };
+  const bots = new ArenaBots({}, { transport, readbackOptions: instantTimeoutGate() });
+  bots.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  bots.dummy = mockBot('dummy_bot');
+
+  // The reply send fails, but a gone client is not a bridge fault: handleReset
+  // must resolve, send nothing, and NOT report a bridge 'error'.
+  await assert.doesNotReject(() =>
+    bots.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+  assert.deepEqual(sent, [], 'nothing reaches a disconnected client');
+  assert.deepEqual(errors, [], 'a disconnect during the gate is not a bridge error');
 });
