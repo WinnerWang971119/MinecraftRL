@@ -50,7 +50,16 @@ async function main() {
 
   process.once('SIGINT', () => {
     console.error('[bridge] SIGINT, shutting down');
-    bots.close().then(() => process.exit(0));
+    bots
+      .close()
+      .then(() => process.exit(0))
+      .catch((err) => {
+        // A teardown rejection (e.g. learner.quit() throwing) is otherwise
+        // swallowed by the unhandledRejection handler above and process.exit
+        // never runs, hanging the bridge until a second Ctrl-C. Exit anyway.
+        console.error('[bridge] error during shutdown (exiting anyway):', err);
+        process.exit(0);
+      });
   });
 }
 
