@@ -61,6 +61,7 @@ import torch.nn.functional as F
 from agent.actions import N_ACTIONS
 from agent.contract_config import MAX_EPISODE_STEPS, code_version
 from agent.dqn import DuelingDRQN
+from agent.progress import ProgressReporter, progress_metrics
 from agent.replay import PrioritizedSequenceReplay, SequenceBatch
 from agent.seeding import seed_everything
 from agent.train_config import TrainConfig
@@ -818,6 +819,10 @@ def train_vs_dummy(
     checkpoint_hook: Optional[CheckpointHook] = None,
     is_live: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    show_progress: bool = True,
+    progress_log_interval: float = 30.0,
+    progress_stream: Optional[Any] = None,
+    progress_reporter: Optional[ProgressReporter] = None,
 ) -> M2Result:
     """Train the DRQN vs the stationary dummy until the M2 gate or a budget.
 
@@ -873,7 +878,19 @@ def train_vs_dummy(
             ``Trainer``-internal checkpoint hook is separate; this is the M2-level
             "save best / save final" hook.)
         is_live: Marks the produced reports/result as a live (vs offline) run.
-        log: Optional ``str -> None`` progress sink (``None`` silences it).
+        log: Optional ``str -> None`` progress sink (``None`` silences it). When a
+            progress reporter is active the loop's own eval-summary lines are
+            routed through it instead (so they never garble the in-place bar).
+        show_progress: When True (default) attach a
+            :class:`~agent.progress.ProgressReporter` — a live status bar (on a
+            TTY) plus a periodic progress LINE with throughput and a budget ETA.
+            Ignored when ``progress_reporter`` is supplied.
+        progress_log_interval: Seconds between persistent progress lines / metrics
+            rows (the bar itself redraws faster on a TTY).
+        progress_stream: Where the bar/lines are drawn (defaults to the reporter's
+            own default, ``sys.stderr``). Ignored when ``progress_reporter`` is set.
+        progress_reporter: Inject a pre-built reporter (mainly for tests); when
+            given it overrides ``show_progress`` / the stream / the interval.
 
     Returns:
         An :class:`M2Result` with the trainer, the gate verdict, the episode /
@@ -899,7 +916,11 @@ def train_vs_dummy(
         )
 
     def _emit(message: str) -> None:
-        if log is not None:
+        # Route standalone lines through the reporter when present so they clear
+        # the in-place bar first (otherwise the bar and the line collide on a TTY).
+        if reporter is not None:
+            reporter.message(message)
+        elif log is not None:
             log(message)
 
     # --- build the trainer (online/target DRQN + PER replay, seeded) --------
@@ -919,6 +940,31 @@ def train_vs_dummy(
     passed = False
     stop_reason = "max_episodes"
     episodes_run = 0
+    total_steps = 0  # env transitions collected across episodes (for throughput)
+
+    # --- live progress reporter (status bar + throughput/ETA log) -----------
+    reporter = progress_reporter
+    if reporter is None and show_progress:
+        reporter = ProgressReporter(
+            total_episodes=max_episodes,
+            stream=progress_stream,
+            log_interval=progress_log_interval,
+            # On a TTY, tick the bar ~1/s so it doesn't look frozen across the
+            # slow (~90 s) live episodes. Auto-disabled when output is redirected.
+            heartbeat_interval=1.0,
+        )
+    if reporter is not None:
+        # Immediate, redirect-safe confirmation the run is up — the first
+        # throughput/ETA numbers can't appear until episode 1 finishes (~90 s live).
+        eval_note = (
+            f"eval every {eval_every_episodes} eps" if eval_every_episodes > 0
+            else "eval disabled"
+        )
+        _emit(
+            f"[m2] training started - budget {max_episodes} episodes, {eval_note}. "
+            f"Throughput + ETA appear after episode 1 completes (~90 s live)."
+        )
+        reporter.start(epsilon=trainer.last_epsilon)
 
     def _log_training(_trainer: "Trainer", _step: int, stats: LearnStats) -> None:
         if logger is not None:
@@ -937,8 +983,9 @@ def train_vs_dummy(
     try:
         for episode_index in range(max_episodes):
             # --- collect ONE episode (per-EPISODE ε, deterministic reseed) ---
-            trainer.collect_episode(env, max_steps=rollout_step_cap)
+            n_transitions, _ = trainer.collect_episode(env, max_steps=rollout_step_cap)
             episodes_run += 1
+            total_steps += n_transitions
 
             # --- gradient steps once the replay is warm ----------------------
             for _ in range(updates_per_step):
@@ -947,12 +994,28 @@ def train_vs_dummy(
                     break  # not ready yet; skip remaining updates this episode
                 _log_training(trainer, stats.grad_step, stats)
 
+            # --- live progress: status bar + periodic throughput/ETA line ----
+            if reporter is not None:
+                snap = reporter.update(
+                    episodes_run=episodes_run,
+                    steps_collected=total_steps,
+                    grad_step=trainer.grad_step,
+                    epsilon=trainer.last_epsilon,
+                    last_win_rate=(
+                        last_report.win_rate if last_report is not None else None
+                    ),
+                )
+                if snap is not None and logger is not None:
+                    logger.log(progress_metrics(snap), step=trainer.grad_step)
+
             # --- periodic GREEDY eval against the M2 gate --------------------
             do_eval = (
                 eval_every_episodes > 0
                 and (episode_index + 1) % eval_every_episodes == 0
             )
             if do_eval:
+                if reporter is not None:
+                    reporter.clear()  # drop the bar before the (long) eval output
                 report = _eval_against_dummy(
                     trainer=trainer,
                     evaluate=evaluate,
@@ -997,6 +1060,10 @@ def train_vs_dummy(
             stop_reason = "max_episodes"
     finally:
         _close_quietly(env)
+        if reporter is not None:
+            final_snap = reporter.close()
+            if final_snap is not None and logger is not None:
+                logger.log(progress_metrics(final_snap), step=trainer.grad_step)
 
     # A final save (best/final) so the caller always has a persistable net.
     if checkpoint_hook is not None:
@@ -1152,6 +1219,15 @@ def _build_parser() -> "Any":
         "--checkpoint", type=str, default=None,
         help="optional path to write the final DRQN checkpoint (state_dict).",
     )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="disable the live status bar / progress log (default: enabled).",
+    )
+    parser.add_argument(
+        "--progress-interval", type=float, default=30.0,
+        help="seconds between persistent progress lines / metrics rows "
+        "(the on-TTY bar redraws faster) (default: 30).",
+    )
     return parser
 
 
@@ -1223,6 +1299,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             checkpoint_hook=_save_checkpoint if checkpoint_path else None,
             is_live=True,
             log=lambda m: print(m, file=sys.stderr),
+            show_progress=not args.no_progress,
+            progress_log_interval=args.progress_interval,
+            progress_stream=sys.stderr,
         )
     finally:
         logger.close()
