@@ -40,11 +40,24 @@ server/crash-reports/
 server/cache/
 server/libraries/
 server/versions/
-server/plugins/*.jar
+server/plugins/
 server/banned-*.json
 server/usercache.json
 server/eula.txt
 server/.console_history
+
+# Paper-generated / setup-script-generated config (server.properties is written
+# by server/setup/setup.ps1; the rest Paper regenerates on first boot). The
+# source of truth is the setup script + the committed arena datapack, not these.
+server/server.properties
+server/bukkit.yml
+server/spigot.yml
+server/commands.yml
+server/help.yml
+server/permissions.yml
+server/config/
+server/version_history.json
+server/whitelist.json
 
 # ---- Logs / scratch ----
 *.log
