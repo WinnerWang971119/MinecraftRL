@@ -675,3 +675,176 @@ def test_generative_bridge_is_a_valid_transport():
 def test_bridge_error_importable_for_offline_tests():
     """BridgeError is the documented failure type the offline contract raises."""
     assert issubclass(BridgeError, RuntimeError)
+
+
+# ===========================================================================
+# Single-connection regression: a periodic eval must NOT open a second bridge
+# connection (the real bridge serves exactly one; a second steals the stream and
+# aborts the live run). This models the bridge as a single-slot server and proves
+# the train -> eval -> train sequence never holds two connections at once, and
+# that training resumes with intact env state afterward.
+# ===========================================================================
+
+
+class _SingleSlotBridgeServer:
+    """Models the production bridge: ONE listening server, ONE live connection.
+
+    Every :class:`_TrackedBridge` handed out by the factory registers/unregisters
+    here on ``connect``/``close``. ``live`` is the current open-connection count and
+    ``peak`` the max ever held at once — the regression asserts ``peak == 1`` (a
+    second concurrent connection is exactly the bug). ``total_connects`` counts how
+    many times anyone connected at all.
+    """
+
+    def __init__(self):
+        self.live = 0
+        self.peak = 0
+        self.total_connects = 0
+
+    def open(self):
+        self.live += 1
+        self.total_connects += 1
+        self.peak = max(self.peak, self.live)
+
+    def close(self):
+        if self.live > 0:
+            self.live -= 1
+
+
+class _TrackedBridge(GenerativeBridge):
+    """A GenerativeBridge that reports its connect/close to a shared server.
+
+    Reuses the generative state stream (endless valid episodes) but routes the
+    connection lifecycle through ``server`` so concurrency is observable. The real
+    bridge's stream is per-connection; this fake faithfully keeps its own per-stream
+    counters, so a shared transport re-syncs on the next ``reset`` exactly like the
+    live bridge re-initializes its arena.
+    """
+
+    def __init__(self, server, **kwargs):
+        super().__init__(**kwargs)
+        self._server = server
+
+    def connect(self):
+        super().connect()
+        self._server.open()
+
+    def close(self):
+        # Only the FIRST close of an open socket frees the slot (close is
+        # idempotent on the env side); mirror that so double-close can't underflow.
+        was_open = self.is_open
+        super().close()
+        if was_open:
+            self._server.close()
+
+
+def test_eval_opens_no_second_concurrent_connection(monkeypatch):
+    """A periodic eval reuses the training connection; never a 2nd concurrent one.
+
+    Regression for the release blocker: the eval used to build a FRESH transport,
+    opening a SECOND connection to the single-slot bridge. The bridge adopts the
+    new socket and destroys the training one, so training aborts at the next reset.
+    With the fix, eval borrows the (idle) training transport, so across
+    train -> eval -> train the server never holds more than ONE connection, and the
+    factory is called exactly once (the training env's only connect).
+    """
+    pytest.importorskip("torch", exc_type=ImportError)
+    from agent.train import train_vs_dummy
+
+    server = _SingleSlotBridgeServer()
+    bridges = []
+    factory_calls = {"n": 0}
+
+    def factory():
+        factory_calls["n"] += 1
+        bridge = _TrackedBridge(server, opp_pos=(0.0, 64.0, 2.0), kill_step=_KILL_STEP)
+        bridges.append(bridge)
+        return bridge
+
+    cfg = _tiny_cfg()
+    result = train_vs_dummy(
+        cfg,
+        transport_factory=factory,
+        max_episodes=6,
+        updates_per_step=1,
+        eval_every_episodes=3,  # evals fire after episodes 3 and 6
+        eval_episodes=2,
+        timeout_cap=64,
+        env_max_episode_steps=64,
+        rollout_step_cap=64,
+        net_kwargs=dict(_TINY_NET),
+        stop_on_pass=False,  # run the whole budget so BOTH evals execute
+    )
+
+    # Two evals ran (episodes 3 and 6) over a full 6-episode budget.
+    assert result.episodes_run == 6
+    assert len(result.reports) == 2
+
+    # THE REGRESSION: the single-slot server never held two connections at once.
+    assert server.peak == 1, (
+        f"a second concurrent bridge connection was opened (peak={server.peak}); "
+        "eval must reuse the training connection, not open its own"
+    )
+    # Exactly ONE transport was ever created: the training env's. Eval borrowed it
+    # instead of calling the factory again.
+    assert factory_calls["n"] == 1
+    assert len(bridges) == 1
+    # And exactly one connect happened over the whole run.
+    assert server.total_connects == 1
+
+    # The single shared connection is closed exactly once at run teardown.
+    assert bridges[0].closes == 1
+    assert bridges[0].is_open is False
+
+
+def test_training_env_state_intact_after_eval():
+    """Training resumes with correct env state after an eval shares its socket.
+
+    Proves the eval (a separate MCPvPEnv over the SHARED transport) does not corrupt
+    the training env: the training env keeps collecting episodes through the same
+    connection after eval, the per-episode reset reseeds the bridge stream, and the
+    run completes the full budget with both evals producing populated reports.
+    """
+    pytest.importorskip("torch", exc_type=ImportError)
+    from agent.train import train_vs_dummy
+    from eval.evaluate import EvalReport
+
+    server = _SingleSlotBridgeServer()
+    bridges = []
+
+    def factory():
+        bridge = _TrackedBridge(server, opp_pos=(0.0, 64.0, 2.0), kill_step=_KILL_STEP)
+        bridges.append(bridge)
+        return bridge
+
+    result = train_vs_dummy(
+        _tiny_cfg(),
+        transport_factory=factory,
+        max_episodes=4,
+        eval_every_episodes=2,  # eval after episodes 2 and 4
+        eval_episodes=2,
+        timeout_cap=64,
+        env_max_episode_steps=64,
+        rollout_step_cap=64,
+        net_kwargs=dict(_TINY_NET),
+        stop_on_pass=False,
+    )
+
+    # Both evals ran AFTER training continued past them (episode 2 eval, then more
+    # training, then episode 4 eval) on the one shared connection.
+    assert result.episodes_run == 4
+    assert len(result.reports) == 2
+    assert server.peak == 1
+    assert len(bridges) == 1  # the shared transport, never a second one
+
+    # Both eval reports are populated EvalReports (training was healthy across the
+    # eval boundary — a torn socket would have aborted with a BridgeError instead).
+    for report in result.reports:
+        assert isinstance(report, EvalReport)
+        assert report.n_episodes == 2
+        assert report.n_wins + report.n_losses + report.n_timeouts == 2
+
+    # The bridge stream advanced through training AND eval episodes on the one
+    # transport: training episodes (4) + eval episodes (2 evals * 2 eps) = 8 resets.
+    reset_count = sum(1 for m in bridges[0].sent if m.get("type") == "reset")
+    assert reset_count == 4 + 2 * 2

@@ -1016,11 +1016,15 @@ def train_vs_dummy(
             if do_eval:
                 if reporter is not None:
                     reporter.clear()  # drop the bar before the (long) eval output
+                # Eval BORROWS the training env's (now idle) transport instead of
+                # opening a second connection — the bridge serves exactly one
+                # connection, so a fresh eval socket would steal the stream out from
+                # under training and abort the run. See _eval_against_dummy.
                 report = _eval_against_dummy(
                     trainer=trainer,
                     evaluate=evaluate,
                     policy_cls=DRQNGreedyPolicy,
-                    transport_factory=transport_factory,
+                    shared_transport=transport,
                     n_episodes=eval_episodes,
                     timeout_cap=timeout_cap,
                     env_max_episode_steps=env_max_episode_steps,
@@ -1091,7 +1095,7 @@ def _eval_against_dummy(
     trainer: "Trainer",
     evaluate: Callable[..., Any],
     policy_cls: Callable[..., Any],
-    transport_factory: TransportFactory,
+    shared_transport: Any,  # the training env's bridge transport (BridgeTransport)
     n_episodes: int,
     timeout_cap: int,
     env_max_episode_steps: int,
@@ -1103,16 +1107,38 @@ def _eval_against_dummy(
 ) -> Any:
     """Run ONE greedy (ε=0) eval of the current online net vs the dummy.
 
-    Builds a fresh env over a fresh transport (eval must not consume the training
-    env's in-flight stream), wraps the online net in a greedy
-    :class:`~eval.evaluate.DRQNGreedyPolicy`, runs :func:`~eval.evaluate.evaluate`,
-    and returns its :class:`~eval.evaluate.EvalReport`. The env is always closed.
+    The bridge serves EXACTLY ONE connection, so eval must not open a second one:
+    a fresh eval socket adopts the stream and the bridge destroys the training
+    socket, which then aborts the run on the next ``reset``. Eval therefore BORROWS
+    the training env's ``shared_transport`` — safe because at the eval boundary the
+    training env is genuinely idle: ``collect_episode`` has finished (its last
+    ``step`` already got its ``state`` reply) and the gradient steps touch no
+    socket, so no reply is in flight on the shared connection.
+
+    The eval :class:`~env.mc_pvp_env.MCPvPEnv` is a SEPARATE instance built with
+    ``auto_connect=False`` over that transport, so it has its OWN per-episode state
+    (``_episode`` / PerceptionFilter / ``_prev_obs`` / ``_done``) and cannot corrupt
+    the training env's. It does NOT own the socket: the training env opened it and
+    closes it once in ``train_vs_dummy``'s ``finally``. Eval never sends ``close``
+    or closes the transport (that would kill the live bridge mid-run); it leaves the
+    connection idle for training to resume. (Honoring the design intent: eval still
+    does not consume the training env's IN-FLIGHT stream — there is none in flight at
+    the boundary — it just shares the one idle connection.)
+
+    Wraps the online net in a greedy :class:`~eval.evaluate.DRQNGreedyPolicy`, runs
+    :func:`~eval.evaluate.evaluate`, and returns its
+    :class:`~eval.evaluate.EvalReport`.
     """
     from env.mc_pvp_env import MCPvPEnv
 
     policy = policy_cls(trainer.online, device=trainer.device)
-    transport = transport_factory()
-    eval_env = MCPvPEnv(transport=transport, max_episode_steps=env_max_episode_steps)
+    # auto_connect=False: the shared transport is already connected by the training
+    # env; reconnecting would re-handshake the live bridge mid-run.
+    eval_env = MCPvPEnv(
+        transport=shared_transport,
+        max_episode_steps=env_max_episode_steps,
+        auto_connect=False,
+    )
     # Switch back to train mode afterward: DRQNGreedyPolicy flips the net to eval()
     # for inference; the next collection/learn step expects train mode.
     was_training = trainer.online.training
@@ -1129,7 +1155,9 @@ def _eval_against_dummy(
             log=log,
         )
     finally:
-        _close_quietly(eval_env)
+        # Do NOT close eval_env: it borrows training's socket and must not send
+        # `close` or tear down the shared transport. The training env owns and
+        # closes that socket exactly once in train_vs_dummy's finally.
         if was_training:
             trainer.online.train()
     return report

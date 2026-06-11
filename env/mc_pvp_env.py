@@ -158,6 +158,27 @@ class BridgeError(RuntimeError):
     """
 
 
+class _ResetGateError(BridgeError):
+    """Internal: the read-back gate failed twice (NOT a transport failure).
+
+    Subclasses :class:`BridgeError` so callers still see a single error type, but
+    lets :meth:`MCPvPEnv.reset` distinguish a verified-bad world (never retry — the
+    bridge answered, it just refused) from a *transport* drop (reconnect + retry
+    the whole exchange). The reset transport-retry loop must NOT swallow this.
+    """
+
+
+class _ResetProtocolError(BridgeError):
+    """Internal: the bridge replied during reset, but with the WRONG message.
+
+    An out-of-order / wrong-type reply (e.g. a ``state`` where a ``reset_ack`` was
+    due) is a protocol violation, not a dropped socket. Reconnecting and re-sending
+    cannot fix a bridge that speaks the protocol wrong, so :meth:`MCPvPEnv.reset`
+    must propagate this immediately rather than burning its transport retries on it.
+    Subclasses :class:`BridgeError` so external callers still catch one type.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Transport seam.
 # ---------------------------------------------------------------------------
@@ -389,6 +410,14 @@ class MCPvPEnv:
     #: Observation vector length (frozen). Mirrors ``observation_spec.OBS_DIM``.
     obs_dim: int = OBS_DIM
 
+    #: Max times reset() re-attempts the FULL reset exchange after a *transport*
+    #: drop (reconnect + re-send from scratch). reset() is idempotent and carries
+    #: no in-flight episode state, so a dropped socket here — e.g. a periodic eval
+    #: stole the bridge's single connection mid-run — is recoverable. Bounded so a
+    #: genuinely-down bridge still aborts LOUDLY instead of spinning forever. This
+    #: is layered AROUND the read-back-gate retry, which is a separate concern.
+    _RESET_MAX_TRANSPORT_ATTEMPTS: int = 3
+
     def __init__(
         self,
         transport: BridgeTransport,
@@ -417,6 +446,12 @@ class MCPvPEnv:
         self._episode: int = -1
         self._step_count: int = 0
         self._prev_obs: Optional[np.ndarray] = None
+        # True only while reset() is doing wire I/O. Switches _send/_recv from
+        # their step-time semantics (self-recover on send; reconnect-then-re-raise
+        # on recv) to "propagate the raw transport error" so reset()'s own bounded
+        # transport-retry loop owns the reconnect-and-redo decision. step() never
+        # sets this, so mid-episode desync protection is untouched.
+        self._in_reset_exchange: bool = False
         self._done: bool = True  # no episode in progress until reset()
 
         if auto_connect:
@@ -446,6 +481,15 @@ class MCPvPEnv:
         success the PerceptionFilter memory and step counter are reset and the
         post-reset ``state`` message is gated/packed into the initial observation.
 
+        Transport resilience: unlike :meth:`step`, ``reset`` is idempotent and has
+        no in-flight episode state to lose, so a *transport* drop during the
+        exchange (e.g. a concurrent periodic eval transiently stole the bridge's
+        single connection) is recoverable — the env reconnects and re-sends the
+        whole reset from scratch, up to :data:`_RESET_MAX_TRANSPORT_ATTEMPTS`
+        times, then aborts LOUDLY. The read-back-gate retry above is a separate
+        concern layered INSIDE each transport attempt; a verified-bad world
+        (``ok == False`` twice) is never retried at the transport level.
+
         Args:
             seed: Per-episode RNG seed forwarded to the bridge (spawn jitter, gear,
                 opponent choice). ``None`` becomes ``0`` on the wire (the schema
@@ -455,23 +499,66 @@ class MCPvPEnv:
             The initial observation ``np.ndarray`` of shape ``(OBS_DIM,)``.
 
         Raises:
-            BridgeError: if the bridge disconnects, sends an out-of-order/invalid
+            BridgeError: if the bridge disconnects and cannot be recovered within
+                the bounded transport retries, sends an out-of-order/invalid
                 message, or fails the read-back gate twice.
         """
         self._episode += 1
         wire_seed = 0 if seed is None else int(seed)
 
+        # Bounded transport-retry loop around the WHOLE reset exchange. Each
+        # attempt does a full reset->reset_ack (with the read-back-gate retry) plus
+        # the post-reset state read. A raw transport BridgeError here means the
+        # socket died (the eval-stole-the-connection race); reconnect and redo from
+        # scratch. A _ResetGateError (the bridge answered but refused) is NOT a
+        # transport fault — it propagates immediately and is never retried here.
+        last_transport_exc: Optional[BridgeError] = None
+        for attempt in range(self._RESET_MAX_TRANSPORT_ATTEMPTS):
+            self._in_reset_exchange = True
+            try:
+                return self._reset_protocol(wire_seed)
+            except (_ResetGateError, _ResetProtocolError):
+                # NOT a transport fault: a verified-bad world (gate refused) or a
+                # wrong/out-of-order reply. Reconnecting cannot fix either — abort.
+                raise
+            except BridgeError as exc:
+                # Transport drop mid-reset. Reconnect on a fresh socket and retry
+                # the full exchange — reset has no in-flight state to corrupt.
+                last_transport_exc = exc
+                if attempt + 1 >= self._RESET_MAX_TRANSPORT_ATTEMPTS:
+                    break
+                self._reconnect_or_abort("reset")
+            finally:
+                self._in_reset_exchange = False
+
+        raise BridgeError(
+            "bridge reset failed: the connection dropped during the reset "
+            f"exchange and {self._RESET_MAX_TRANSPORT_ATTEMPTS} reconnect+retry "
+            f"attempts did not recover (episode {self._episode}, seed={wire_seed}); "
+            "the bridge appears down. Last transport error: "
+            f"{last_transport_exc}"
+        ) from last_transport_exc
+
+    def _reset_protocol(self, wire_seed: int) -> np.ndarray:
+        """One full reset exchange: gate (with its own retry) + post-reset state.
+
+        Runs the read-back gate (send ``reset``, await ``reset_ack``; retry ONCE on
+        ``ok == False`` then raise :class:`_ResetGateError`), then reads the
+        post-reset ``state`` and packs it into the initial observation. Any raw
+        transport :class:`BridgeError` here propagates to :meth:`reset`'s bounded
+        transport-retry loop; a :class:`_ResetGateError` is NOT retried there.
+        """
         # Read-back gate with a single retry. Each attempt is a full
         # reset -> reset_ack exchange; on ok==False we try once more, then raise.
         ack: Optional[ResetAckMsg] = None
         last_readback: Dict[str, Any] = {}
-        for attempt in range(2):  # at most one retry
+        for _attempt in range(2):  # at most one retry
             ack = self._reset_exchange(wire_seed)
             last_readback = dict(ack.readback)
             if ack.ok:
                 break
         if ack is None or not ack.ok:
-            raise BridgeError(
+            raise _ResetGateError(
                 "bridge reset read-back gate failed twice for "
                 f"episode {self._episode} (seed={wire_seed}); refusing to start "
                 f"an episode from an unverified state. last readback={last_readback!r}"
@@ -621,29 +708,52 @@ class MCPvPEnv:
     # -- transport helpers (with one-reconnect resilience) ----------------
 
     def _reset_exchange(self, seed: int) -> ResetAckMsg:
-        """Send one ``reset`` and await the matching ``reset_ack`` dataclass."""
+        """Send one ``reset`` and await the matching ``reset_ack`` dataclass.
+
+        A wrong reply TYPE is a protocol violation (``_ResetProtocolError``), kept
+        distinct from a dropped socket so reset() does not waste a transport retry
+        reconnecting against a bridge that just spoke out of order.
+        """
         self._send(ResetMsg(episode=self._episode, seed=seed))
         msg = self._recv()
         if not isinstance(msg, ResetAckMsg):
-            raise BridgeError(
+            raise _ResetProtocolError(
                 f"expected a reset_ack after reset, got {type(msg).__name__}"
             )
         return msg
 
     def _recv_state(self) -> StateMsg:
-        """Await one inbound message and require it to be a ``state``."""
+        """Await one inbound message and require it to be a ``state``.
+
+        During reset() a wrong reply TYPE raises ``_ResetProtocolError`` (a
+        non-retryable protocol violation); during step() it is the plain
+        ``BridgeError`` below — both subclass ``BridgeError`` for external callers.
+        """
         msg = self._recv()
         if not isinstance(msg, StateMsg):
+            if self._in_reset_exchange:
+                raise _ResetProtocolError(
+                    f"expected a state message after reset_ack, got "
+                    f"{type(msg).__name__}"
+                )
             raise BridgeError(
                 f"expected a state message, got {type(msg).__name__}"
             )
         return msg
 
     def _send(self, message: Union[ResetMsg, StepMsg, CloseMsg]) -> None:
-        """Send an outbound dataclass, reconnecting once on a transport failure."""
+        """Send an outbound dataclass, reconnecting once on a transport failure.
+
+        During a reset exchange (``_in_reset_exchange``) a transport failure is
+        propagated RAW so reset()'s own bounded reconnect+retry loop redoes the
+        whole exchange from scratch; the in-helper single-reconnect-retry is for
+        the step path only.
+        """
         try:
             self._transport.send(message.to_dict())
         except BridgeError:
+            if self._in_reset_exchange:
+                raise
             self._reconnect_or_abort("send")
             # Retry the send exactly once on the fresh connection.
             try:
@@ -656,15 +766,23 @@ class MCPvPEnv:
     def _recv(self) -> Union[StateMsg, ResetAckMsg]:
         """Receive one inbound message, reconnecting once on a transport failure.
 
-        NOTE: a reconnect cannot recover the in-flight reply that was lost with
-        the old socket, so after a successful reconnect this still raises — the
-        caller (reset/step) aborts the run loudly rather than silently desyncing
-        the request/response stream. The reconnect exists so the NEXT episode can
-        proceed and so the failure carries a clear, actionable message.
+        STEP semantics (the default): a reconnect cannot recover the in-flight
+        reply that was lost with the old socket, so after a successful reconnect
+        this still raises — the caller (step) aborts the run loudly rather than
+        silently desyncing the request/response stream. The reconnect exists so
+        the NEXT episode can proceed and so the failure carries a clear, actionable
+        message.
+
+        RESET semantics (``_in_reset_exchange``): the raw transport error is
+        propagated WITHOUT reconnecting here, because reset() is idempotent and its
+        own bounded retry loop owns the reconnect-and-redo-from-scratch decision.
+        A lost reply mid-reset desyncs nothing — there is no in-flight episode.
         """
         try:
             return self._transport.recv()
         except BridgeError as first_exc:
+            if self._in_reset_exchange:
+                raise
             self._reconnect_or_abort("recv")
             raise BridgeError(
                 "bridge connection dropped mid-exchange; reconnected, but the "

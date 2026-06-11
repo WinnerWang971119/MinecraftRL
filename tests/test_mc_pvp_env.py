@@ -612,6 +612,195 @@ def test_reconnect_failure_aborts_loudly():
 
 
 # ---------------------------------------------------------------------------
+# Post-eval dead-socket recovery (Approach A): reset() tolerates a reconnect.
+#
+# Regression guard for the release-blocker where a periodic eval opens a SECOND
+# connection to the single-connection bridge; the bridge adopts the eval socket
+# and destroys the training socket. When training resumes, the next reset()'s
+# wire I/O hits the dead socket. reset() is idempotent (no in-flight episode), so
+# it must reconnect and re-send the WHOLE exchange from scratch — whether the dead
+# socket surfaces on the first send OR the first recv — and only step() keeps its
+# strict re-raise-on-lost-reply behavior.
+# ---------------------------------------------------------------------------
+
+
+class DeadSocketOnceBridge(ScriptedBridge):
+    """Fake bridge whose FIRST wire op fails once, then a reconnect heals it.
+
+    Models the post-eval dead training socket: the very next ``send`` (or ``recv``,
+    per ``fail_on``) raises a transport :class:`BridgeError` exactly once. A
+    :meth:`connect` call (the env's reconnect) clears the armed failure, so the
+    re-sent exchange on the "fresh socket" goes through against the scripted queue.
+
+    This is the faithful seam for the bug: the bridge dropped the old connection,
+    and a reconnect + redo-from-scratch recovers because reset is idempotent.
+    """
+
+    def __init__(self, inbound=None, *, fail_on="recv"):
+        super().__init__(inbound)
+        assert fail_on in ("send", "recv")
+        self._fail_on = fail_on
+        self._armed = True  # the dead old socket; cleared by the reconnect
+
+    def connect(self):
+        # The reconnect hands us a fresh, healthy socket.
+        self._armed = False
+        super().connect()
+
+    def send(self, obj):
+        if self._armed and self._fail_on == "send":
+            # Record nothing — the write hit the dead socket and was lost.
+            raise BridgeError("DeadSocketOnceBridge: send on dead socket")
+        super().send(obj)
+
+    def recv(self):
+        if self._armed and self._fail_on == "recv":
+            # EOF / orderly peer shutdown mid-stream, exactly like recv() b''.
+            raise BridgeError("DeadSocketOnceBridge: recv on dead socket (EOF)")
+        return super().recv()
+
+
+def test_reset_recovers_when_send_hits_dead_socket():
+    """(1) A dead socket surfacing on reset()'s SEND -> reconnect + redo -> valid obs."""
+    bridge = DeadSocketOnceBridge(
+        [_reset_ack(ok=True), _state()], fail_on="send"
+    )
+    # auto_connect=False so construction does not disarm the (already-dead) socket;
+    # this models the eval stealing the connection just before this reset, with the
+    # first write therefore hitting the dead old socket.
+    connects_before = bridge.connects
+    env = _env(bridge, auto_connect=False)
+
+    obs = env.reset(seed=11)
+
+    # Recovered: a valid initial observation, queue fully drained on the redo.
+    assert isinstance(obs, np.ndarray) and obs.shape == (OBS_DIM,)
+    validate(obs)
+    assert bridge.inbound == []  # ack + state consumed by the successful retry
+    # Exactly one reconnect happened to heal the dead socket.
+    assert bridge.connects == connects_before + 1
+    assert bridge.closes >= 1
+    # The reset was re-sent on the fresh socket (the lost first send recorded
+    # nothing; the retry's send is the only reset on the wire).
+    resets = [m for m in bridge.sent if m["type"] == "reset"]
+    assert len(resets) == 1
+    assert resets[0]["seed"] == 11
+
+
+def test_reset_recovers_when_recv_hits_dead_socket():
+    """(2) The currently-aborting case: dead socket on reset()'s RECV -> recovers.
+
+    This is the exact path that aborts the live run today (recv returns EOF ->
+    BridgeError -> re-raised by design). With Approach A, reset() reconnects and
+    re-runs the whole exchange, returning a valid initial observation.
+    """
+    bridge = DeadSocketOnceBridge(
+        [_reset_ack(ok=True), _state()], fail_on="recv"
+    )
+    # See test_reset_recovers_when_send_hits_dead_socket: keep the socket "dead"
+    # through construction so reset()'s first recv hits it.
+    connects_before = bridge.connects
+    env = _env(bridge, auto_connect=False)
+
+    obs = env.reset(seed=22)
+
+    assert isinstance(obs, np.ndarray) and obs.shape == (OBS_DIM,)
+    validate(obs)
+    assert bridge.inbound == []
+    assert bridge.connects == connects_before + 1
+    assert bridge.closes >= 1
+    # The reset was sent once on the dead socket (recorded), then re-sent on the
+    # fresh socket after the reconnect -> two reset writes on this fake.
+    resets = [m for m in bridge.sent if m["type"] == "reset"]
+    assert len(resets) == 2
+
+
+def test_reset_aborts_loudly_if_bridge_stays_down():
+    """A bridge that NEVER heals exhausts the bounded retries and aborts loudly."""
+
+    class AlwaysDeadBridge(ScriptedBridge):
+        def __init__(self):
+            super().__init__([_reset_ack(ok=True), _state()])
+
+        def recv(self):
+            # Every recv hits a dead socket; the reconnect never heals it.
+            raise BridgeError("AlwaysDeadBridge: still down")
+
+    bridge = AlwaysDeadBridge()
+    env = _env(bridge)
+
+    with pytest.raises(BridgeError, match="bridge reset failed"):
+        env.reset(seed=0)
+
+    # It tried the full bounded budget of transport attempts, not a single shot.
+    assert bridge.connects >= 2  # initial connect + at least one reconnect
+
+
+def test_step_still_aborts_on_dead_socket_recv():
+    """(3) The SAME failure during step() STILL raises — mid-episode desync is fatal.
+
+    step() must NOT inherit reset()'s reconnect-and-retry tolerance: a lost reply
+    mid-episode genuinely desyncs the request/reply stream and is unrecoverable.
+    """
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env, _ = _reset_env(bridge)
+    connects_before = bridge.connects
+
+    # The step's state reply hits a dead socket (EOF), exactly like the reset case.
+    bridge.push(ScriptedBridge.Disconnect())
+
+    with pytest.raises(BridgeError, match="in-flight reply is lost"):
+        env.step(Macro.IDLE)
+
+    # step() reconnects exactly ONCE (so the next episode can proceed) but does NOT
+    # silently retry the step — strict abort preserved.
+    assert bridge.connects == connects_before + 1
+    assert bridge.closes >= 1
+
+
+def test_step_send_failure_keeps_single_reconnect_retry_semantics():
+    """A dead socket on step()'s SEND keeps the existing one-reconnect send retry.
+
+    Distinct from reset(): step()'s _send self-recovers a failed WRITE with one
+    reconnect (the request hadn't been answered yet, so re-sending is safe), but
+    the subsequent recv is still strict. Here the fresh socket serves the reply,
+    so the step completes — proving Approach A left step()'s send path untouched.
+    """
+
+    class StepSendDeadOnceBridge(ScriptedBridge):
+        def __init__(self, inbound):
+            super().__init__(inbound)
+            self._send_armed = False
+
+        def arm_send_failure(self):
+            self._send_armed = True
+
+        def connect(self):
+            self._send_armed = False
+            super().connect()
+
+        def send(self, obj):
+            if self._send_armed:
+                raise BridgeError("StepSendDeadOnceBridge: send on dead socket")
+            super().send(obj)
+
+    bridge = StepSendDeadOnceBridge([_reset_ack(ok=True), _state()])
+    env, _ = _reset_env(bridge)
+    connects_before = bridge.connects
+
+    # The step's reply is ready on the (post-reconnect) fresh socket.
+    bridge.push(_state(tick=2))
+    bridge.arm_send_failure()
+
+    obs, reward, done, info = env.step(Macro.IDLE)
+
+    validate(obs)
+    assert done is False
+    # Exactly one reconnect to recover the failed send.
+    assert bridge.connects == connects_before + 1
+
+
+# ---------------------------------------------------------------------------
 # close().
 # ---------------------------------------------------------------------------
 
