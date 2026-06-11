@@ -409,9 +409,16 @@ class BridgeServer extends EventEmitter {
   _onConnection(socket) {
     if (this._socket !== null && !this._socket.destroyed) {
       const stale = this._socket;
-      // Detach before destroying so the stale socket's 'close' handler cannot
-      // clobber the newly adopted socket.
+      // Detach the stale socket's DATA feed before destroying it. Its 'data'
+      // handler pushes into the single shared _framer; a chunk already queued on
+      // the stale socket would otherwise prepend stale bytes into the framer we
+      // reset below for the adopted socket, mis-framing its first message. Keep
+      // the 'error' listener (a stray teardown error must stay caught, never
+      // process-fatal) and the 'close' listener (so teardown still emits the
+      // 'disconnect' visibility signal; its `this._socket === socket` guard is
+      // already false here, so it cannot clobber the adopted socket).
       this._socket = null;
+      stale.removeAllListeners('data');
       stale.destroy();
     }
 

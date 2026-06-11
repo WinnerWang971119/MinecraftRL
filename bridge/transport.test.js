@@ -536,6 +536,30 @@ test('a reconnect while the old socket is still registered ADOPTS the new one', 
   assert.deepEqual(seen, [{ type: 'step', action: 3 }]);
 });
 
+test('adopting detaches the stale DATA feed but still signals disconnect', () => {
+  const server = new BridgeServer();
+  server.on('error', () => {});
+  let disconnects = 0;
+  server.on('disconnect', () => { disconnects += 1; });
+
+  const stale = new FakeSocket();
+  server._onConnection(stale);
+  const fresh = new FakeSocket();
+  server._onConnection(fresh); // adopt the newcomer, drop the stale socket
+
+  assert.equal(disconnects, 1, 'adopt still emits the disconnect visibility signal');
+
+  const seen = [];
+  server.on('message', (m) => seen.push(m));
+  // A chunk already queued on the stale socket must be IGNORED, not pushed into
+  // the single shared _framer we reset for the adopted socket — otherwise these
+  // stale bytes prepend into the framer and mis-frame the fresh stream. Without
+  // detaching 'data', this stale line would emit a (bogus) message too.
+  stale.emit('data', Buffer.from('{"type":"step","action":1}\n'));
+  fresh.emit('data', Buffer.from('{"type":"step","action":3}\n'));
+  assert.deepEqual(seen, [{ type: 'step', action: 3 }], 'only the fresh socket is framed');
+});
+
 test('a reconnect after the old socket closed normally still connects', () => {
   const server = new BridgeServer();
   const first = new FakeSocket();
