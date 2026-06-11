@@ -918,9 +918,12 @@ def train_vs_dummy(
     def _emit(message: str) -> None:
         # Route standalone lines through the reporter when present so they clear
         # the in-place bar first (otherwise the bar and the line collide on a TTY).
+        # ALSO forward to the `log` sink: the reporter writes to its own progress
+        # stream, so a separate file/structured `log` must still receive the
+        # run-start + eval-summary lines (routing to only one dropped them).
         if reporter is not None:
             reporter.message(message)
-        elif log is not None:
+        if log is not None:
             log(message)
 
     # --- build the trainer (online/target DRQN + PER replay, seeded) --------
