@@ -1,0 +1,14 @@
+[
+  {
+    "uuid": "904ab765-0884-3b39-af00-9cdbf8d5f528",
+    "name": "learner_bot",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  },
+  {
+    "uuid": "08809ff7-fb5e-3b8d-bdd1-a867b604ded8",
+    "name": "dummy_bot",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  }
+]

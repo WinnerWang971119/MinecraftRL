@@ -1,0 +1,11 @@
+# Python dependencies for mc-pvp-dqn
+# No hard version pins here — exact pins land in agent/contract_config.py
+# after the Tv compat check confirms compatible versions.
+
+numpy>=1.26
+# torch is the heavy dependency; install separately with the correct CUDA variant:
+#   pip install torch  (CPU)
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121  (CUDA 12.1)
+# Exact pins land in T6/contract_config once compat is confirmed.
+torch>=2.1
+pytest>=8.0

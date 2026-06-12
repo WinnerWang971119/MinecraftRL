@@ -1,0 +1,7 @@
+{
+  "pack": {
+    "description": "PvP RL training arena (T8): flat arena setup, fixed spawns, stationary dummy, fully-observed MDP gamerules.",
+    "pack_format": 48,
+    "supported_formats": [48, 48]
+  }
+}

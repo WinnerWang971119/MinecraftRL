@@ -1,0 +1,1358 @@
+"""train — n-step Double-DQN training loop for the Dueling-DRQN (T16).
+
+Drives the full training cycle (training-spec §5 / §8):
+
+  per episode:  env.reset(seed) -> net.init_hidden -> rollout with per-EPISODE
+                ε-greedy ``act`` (collecting transitions + per-step hidden states)
+                -> replay.add_episode
+  per step (once ``len(replay) >= min_replay``):
+                replay.sample_sequences -> n-step Double-DQN target -> Huber
+                (smooth-L1) loss weighted by PER IS weights, on the post-burn-in
+                scored steps only -> backward -> grad-norm clip -> optimizer step
+                -> replay.update_priorities(|δ|) -> soft (Polyak) target update.
+
+Reads every hyperparameter from :class:`agent.train_config.TrainConfig`; the
+sequence/burn-in geometry and the n-step/gamma are shared with the replay buffer
+so storage and learner can never disagree.
+
+------------------------------------------------------------------------------
+The exact target (training-spec §5/§8)
+------------------------------------------------------------------------------
+For a sampled window of ``T = burn_in + seq_len`` transitions, transition ``i``
+is ``(s_i, a_i, r_i, s'_i, done_i)`` (``s'_i`` is ``next_obs[i]``, the state at
+time ``i + 1``). For each SCORED step ``i`` in ``[B, T)``:
+
+    G_i = Σ_{k=0}^{n-1} γ^k r_{i+k}        (truncated at the first done in-window)
+    a*  = argmax_a Q_online(s_{i+n}, a)    (Double-DQN: ONLINE selects the action)
+    y_i = G_i + bootstrap_i · γ^n · Q_target(s_{i+n}, a*)   (TARGET evaluates it)
+    δ_i = y_i − Q_online(s_i, a_i)
+
+``G_i`` and ``bootstrap_i`` come from :func:`agent.replay.compute_n_step_returns`
+(the network-free reward arithmetic) so the bootstrap term is dropped exactly
+where a ``done`` truncates the return or the n-step horizon runs off the window.
+
+Because the net is RECURRENT, ``Q_target(s_{i+n}, ·)`` must be evaluated with the
+LSTM hidden state that has consumed the FULL contiguous history s_0..s_{i+n}, not
+a state seeded from the wrong stream. Within an episode the window is contiguous
+(``next_obs[:, :-1] == obs[:, 1:]``), so we build the extended observation stream
+``obs_ext = concat(obs, next_obs[:, -1:])`` of length ``T+1`` — where
+``obs_ext[p] == s_p`` for ``p`` in ``[0, T]`` — and run ONE seeded forward of the
+online and target nets over it (under ``no_grad``). The bootstrap state ``s_{i+n}``
+then sits at ``obs_ext`` position ``i + n``, and its Q uses the correct recurrent
+memory by construction.
+
+The loss is the IS-weighted Huber (smooth-L1) of ``δ`` over the scored steps:
+``L = mean(w_i · Huber(δ_i))``. The scored-step Q comes from
+``DuelingDRQN.forward_with_burn_in`` so gradients flow ONLY through the
+post-burn-in steps (the burn-in prefix warms the hidden state under ``no_grad``).
+
+Owner: T16 (DQN core track)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from agent.actions import N_ACTIONS
+from agent.contract_config import MAX_EPISODE_STEPS, code_version
+from agent.dqn import DuelingDRQN
+from agent.progress import ProgressReporter, progress_metrics
+from agent.replay import PrioritizedSequenceReplay, SequenceBatch
+from agent.seeding import seed_everything
+from agent.train_config import TrainConfig
+
+__all__ = [
+    "EnvProtocol",
+    "Trainer",
+    "train",
+    "epsilon_for_episode",
+    "LearnStats",
+    "M2Result",
+    "train_vs_dummy",
+    "run_m2",
+    "main",
+]
+
+
+# ---------------------------------------------------------------------------
+# Env seam — the minimal Gym-style surface the trainer depends on.
+#
+# ``env.mc_pvp_env.MCPvPEnv`` satisfies this; so does the tiny in-test fake env
+# (no socket / no live server). Keeping it a Protocol lets the smoke test inject
+# a fake without constructing a bridge transport.
+# ---------------------------------------------------------------------------
+
+
+class EnvProtocol(Protocol):
+    """Structural Gym-style env the trainer rolls out against."""
+
+    def reset(self, seed: Optional[int] = None) -> np.ndarray:
+        """Start an episode and return the initial observation ``(OBS_DIM,)``."""
+        ...
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
+        """Advance one decision step -> ``(obs, reward, done, info)``."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Hooks — call signatures only (eval is T19, full M2 training is T20).
+# ---------------------------------------------------------------------------
+
+#: Called every ``cfg.eval_interval`` gradient steps. T19 owns the body.
+EvalHook = Callable[["Trainer", int], None]
+#: Called every ``cfg.checkpoint_interval`` gradient steps. T20 owns the body.
+CheckpointHook = Callable[["Trainer", int], None]
+#: Called every ``cfg.log_interval`` gradient steps with the latest learn stats.
+LogHook = Callable[["Trainer", int, "LearnStats"], None]
+
+
+@dataclass
+class LearnStats:
+    """Per-gradient-step learner diagnostics (handed to the log hook).
+
+    Attributes:
+        grad_step: 1-based index of this gradient step.
+        loss: Scalar IS-weighted Huber loss for the batch.
+        td_error_mean: Mean absolute TD error over the scored batch (pre-priority).
+        grad_norm: Global gradient L2 norm BEFORE clipping (clip reduces it to
+            at most ``cfg.grad_clip``).
+        epsilon: ε used for the most recently collected episode.
+        beta: Current PER importance-sampling exponent β.
+        replay_size: Stored transitions at the time of this step.
+    """
+
+    grad_step: int
+    loss: float
+    td_error_mean: float
+    grad_norm: float
+    epsilon: float
+    beta: float
+    replay_size: int
+
+
+# ---------------------------------------------------------------------------
+# ε schedule — per EPISODE (NOT per step). See agent.seeding's gotcha note.
+# ---------------------------------------------------------------------------
+
+
+def epsilon_for_episode(episode: int, cfg: TrainConfig) -> float:
+    """Return the ε-greedy exploration rate for episode index ``episode``.
+
+    Linear decay from ``cfg.eps_start`` to ``cfg.eps_end`` over the FIRST
+    ``cfg.eps_decay_episodes`` episodes, then flat at ``cfg.eps_end``. The decay
+    is per EPISODE on purpose: episodes are short (tens of decisions), so a
+    per-step decay would collapse ε in a handful of episodes and kill
+    exploration (the documented gotcha in :mod:`agent.seeding`).
+
+    Args:
+        episode: 0-based episode index (>= 0). Clamped at 0 for safety.
+        cfg: The training config holding the ε schedule.
+
+    Returns:
+        ε in ``[cfg.eps_end, cfg.eps_start]``, monotonically non-increasing in
+        ``episode`` and flat within a single episode.
+    """
+    ep = max(0, int(episode))
+    # frac goes 0 -> 1 over the first eps_decay_episodes, then saturates at 1.
+    frac = min(ep / float(cfg.eps_decay_episodes), 1.0)
+    return cfg.eps_start + (cfg.eps_end - cfg.eps_start) * frac
+
+
+# ---------------------------------------------------------------------------
+# The trainer.
+# ---------------------------------------------------------------------------
+
+
+class Trainer:
+    """n-step Double-DQN learner for the Dueling-DRQN with PER + R2D2 burn-in.
+
+    Owns the online net, the target net (a soft-tracked copy), the optimizer, and
+    the prioritized sequence replay. :meth:`collect_episode` rolls one episode and
+    stores it; :meth:`learn` performs ONE gradient step from a sampled batch;
+    :meth:`train` runs the full episode/step loop and fires the eval/checkpoint/log
+    hooks at their configured cadences.
+
+    The online and target nets are constructed identically (same architecture
+    kwargs) so a soft update is well defined parameter-for-parameter.
+
+    Args:
+        cfg: Training hyperparameters. The sequence/burn-in geometry and
+            n-step/gamma are forwarded to the replay buffer so storage and learner
+            agree.
+        device: Torch device for the nets/tensors. Defaults to CPU (the dev box
+            has a CPU-only torch wheel).
+        net_kwargs: Optional architecture overrides forwarded to BOTH
+            ``DuelingDRQN`` constructions (e.g. smaller hidden sizes for a fast
+            unit test). ``obs_dim``/``n_actions`` still assert against the frozen
+            contracts inside the net.
+        seed_global: When True (default) call :func:`agent.seeding.seed_everything`
+            with ``cfg.seed`` at construction so the whole run is reproducible.
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        *,
+        device: Optional[torch.device] = None,
+        net_kwargs: Optional[Dict[str, int]] = None,
+        seed_global: bool = True,
+    ) -> None:
+        self.cfg = cfg
+        self.device = torch.device("cpu") if device is None else torch.device(device)
+
+        # Reproducible run: seed Python/NumPy/torch before any net init draws RNG.
+        if seed_global:
+            seed_everything(cfg.seed)
+
+        net_kwargs = dict(net_kwargs or {})
+        self.online = DuelingDRQN(**net_kwargs).to(self.device)
+        self.target = DuelingDRQN(**net_kwargs).to(self.device)
+        # Target starts as an exact copy of the online net (θ_target = θ_online).
+        self.target.load_state_dict(self.online.state_dict())
+        # The target net is never optimized directly — only soft-updated. Freezing
+        # its grads avoids building a needless autograd graph through it.
+        for p in self.target.parameters():
+            p.requires_grad_(False)
+        self.target.eval()
+
+        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=cfg.lr)
+
+        # Replay geometry MUST mirror the config (seq_len == scored L, burn_in,
+        # n_step, gamma) so sampled windows match what the loss expects. Seed the
+        # buffer's sampler from cfg.seed for reproducible PER draws.
+        self.replay = PrioritizedSequenceReplay(
+            capacity=cfg.replay_capacity,
+            seq_len=cfg.seq_len,
+            burn_in=cfg.burn_in,
+            alpha=cfg.per_alpha,
+            beta0=cfg.per_beta0,
+            priority_eps=cfg.per_priority_eps,
+            n_step=cfg.n_step,
+            gamma=cfg.gamma,
+            beta_anneal_steps=cfg.per_beta_anneal_steps,
+            rng=np.random.default_rng(cfg.seed),
+        )
+
+        # Per-episode action-sampling RNG. Re-seeded deterministically each
+        # episode (seed + episode) so exploration is replayable.
+        self._action_generator = torch.Generator(device=self.device)
+
+        self.grad_step = 0  # number of completed gradient steps
+        self.episode_count = 0  # number of collected episodes
+        self.last_epsilon = cfg.eps_start  # ε of the most recent episode
+
+    # ------------------------------------------------------------------
+    # Rollout / collection
+    # ------------------------------------------------------------------
+    def collect_episode(
+        self, env: EnvProtocol, *, max_steps: Optional[int] = None
+    ) -> Tuple[int, float]:
+        """Roll ONE episode with per-episode ε-greedy and store it in replay.
+
+        Reseeds the env and the action-sampling generator deterministically from
+        ``cfg.seed + episode_index`` so the rollout is reproducible. Each decision
+        uses ``DuelingDRQN.act`` (no grad) with the episode's ε and the carried
+        LSTM hidden state; the per-step hidden state captured at COLLECTION time is
+        stored alongside the transition so the buffer can seed burn-in (R2D2).
+
+        Args:
+            env: The environment to roll out against (real or fake).
+            max_steps: Optional hard cap on decisions this episode (defence
+                against a fake env that never terminates). ``None`` relies on the
+                env's own termination.
+
+        Returns:
+            ``(n_transitions, total_reward)`` for the collected episode.
+        """
+        episode_index = self.episode_count
+        epsilon = epsilon_for_episode(episode_index, self.cfg)
+        self.last_epsilon = epsilon
+
+        # Deterministic per-episode seeds for the env reset and the ε RNG so the
+        # exploration stream is replayable (the gotcha fix: reseed on the episode
+        # boundary, not per step).
+        episode_seed = self.cfg.seed + episode_index
+        self._action_generator.manual_seed(episode_seed)
+
+        obs = env.reset(seed=episode_seed)
+        hidden = self.online.init_hidden(1, device=self.device)
+
+        transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
+        hidden_states: List[np.ndarray] = []
+
+        total_reward = 0.0
+        done = False
+        steps = 0
+        was_training = self.online.training
+        self.online.eval()  # inference mode for action selection
+        try:
+            while not done:
+                # Capture the hidden state SEEN by this step (the LSTM state that
+                # produced the action), stacked (num_layers, hidden) for burn-in
+                # seeding by the replay buffer.
+                hidden_snapshot = self._hidden_snapshot(hidden)
+
+                obs_tensor = torch.as_tensor(
+                    obs, dtype=torch.float32, device=self.device
+                )
+                action, hidden = self.online.act(
+                    obs_tensor,
+                    hidden,
+                    epsilon=epsilon,
+                    generator=self._action_generator,
+                )
+
+                next_obs, reward, done, _info = env.step(action)
+
+                transitions.append(
+                    (
+                        np.asarray(obs, dtype=np.float32),
+                        int(action),
+                        float(reward),
+                        np.asarray(next_obs, dtype=np.float32),
+                        bool(done),
+                    )
+                )
+                hidden_states.append(hidden_snapshot)
+
+                total_reward += float(reward)
+                obs = next_obs
+                steps += 1
+                if max_steps is not None and steps >= max_steps:
+                    break
+        finally:
+            if was_training:
+                self.online.train()
+
+        if transitions:
+            self.replay.add_episode(transitions, hidden_states=hidden_states)
+
+        self.episode_count += 1
+        return len(transitions), total_reward
+
+    def _hidden_snapshot(self, hidden: Tuple[torch.Tensor, torch.Tensor]) -> np.ndarray:
+        """Snapshot the LSTM ``(h, c)`` for the current single-sequence step.
+
+        Returns a contiguous ``float32`` array of shape
+        ``(2, num_layers, lstm_hidden)`` (the (h, c) pair) detached to NumPy. The
+        replay buffer stores one per transition and hands the window-start snapshot
+        back so T16 can seed burn-in instead of zeroing it.
+        """
+        h, c = hidden
+        # Drop the batch axis (== 1 during rollout) and stack h/c on a new axis 0.
+        h_np = h.detach().squeeze(1).cpu().numpy()  # (num_layers, lstm_hidden)
+        c_np = c.detach().squeeze(1).cpu().numpy()  # (num_layers, lstm_hidden)
+        return np.stack((h_np, c_np), axis=0).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Learning — one gradient step
+    # ------------------------------------------------------------------
+    def ready_to_learn(self) -> bool:
+        """True iff replay has >= ``min_replay`` transitions AND a sampleable window."""
+        return self.replay.is_ready(self.cfg.min_replay)
+
+    def learn(self) -> Optional[LearnStats]:
+        """Run ONE n-step Double-DQN gradient step from a sampled batch.
+
+        Returns ``None`` (a no-op) if the buffer is not yet ready (``len(replay)
+        < min_replay`` or no sampleable window). Otherwise:
+
+          1. sample a prioritized batch of ``B + L`` windows,
+          2. compute the IS-weighted Huber loss on the scored ``L`` steps using
+             the n-step Double-DQN target,
+          3. backward, clip the global grad norm to ``cfg.grad_clip``, step,
+          4. write the fresh |δ| back as priorities, and
+          5. soft-update the target net.
+
+        Returns:
+            A :class:`LearnStats` for this gradient step, or ``None`` if not ready.
+        """
+        if not self.ready_to_learn():
+            return None
+
+        cfg = self.cfg
+        # Anneal PER β by gradient step BEFORE sampling so this batch's IS weights
+        # use the up-to-date β.
+        self.replay.anneal_beta(self.grad_step)
+
+        batch = self.replay.sample_sequences(cfg.batch_size, L=cfg.seq_len)
+
+        loss, abs_td_per_sample, mean_abs_td = self._compute_loss(batch)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.online.parameters(), cfg.grad_clip
+        )
+        self.optimizer.step()
+
+        # Priorities: one per sampled window, from the latest |δ| (mean over the
+        # window's scored steps — a single priority per window is what the buffer
+        # stores per start index).
+        self.replay.update_priorities(batch.indices, abs_td_per_sample)
+
+        # Soft target update every step: θ_target ← τ·θ_online + (1−τ)·θ_target.
+        if cfg.target_soft:
+            self._soft_update_target()
+
+        self.grad_step += 1
+
+        return LearnStats(
+            grad_step=self.grad_step,
+            loss=float(loss.detach().cpu().item()),
+            td_error_mean=float(mean_abs_td),
+            grad_norm=float(grad_norm),
+            epsilon=self.last_epsilon,
+            beta=float(self.replay.beta),
+            replay_size=len(self.replay),
+        )
+
+    def _compute_loss(
+        self, batch: SequenceBatch
+    ) -> Tuple[torch.Tensor, np.ndarray, float]:
+        """Build the IS-weighted Huber loss for one sampled batch.
+
+        Implements the n-step Double-DQN target exactly (see the module docstring):
+        ONLINE selects the bootstrap action, TARGET evaluates it, the burn-in
+        prefix is detached, and the loss is computed on the scored ``L`` steps
+        only.
+
+        Returns:
+            ``(loss, abs_td_per_sample, mean_abs_td)`` where ``loss`` is the scalar
+            graph tensor, ``abs_td_per_sample`` is a ``(batch,)`` NumPy array of
+            per-window mean |δ| (for ``update_priorities``), and ``mean_abs_td`` is
+            the scalar batch-mean |δ| (for logging).
+        """
+        cfg = self.cfg
+        device = self.device
+        burn_in = batch.burn_in
+        # Full window length T = burn_in + seq_len (the buffer guarantees this).
+        obs = torch.as_tensor(batch.obs, dtype=torch.float32, device=device)
+        next_obs = torch.as_tensor(batch.next_obs, dtype=torch.float32, device=device)
+        actions = torch.as_tensor(batch.actions, dtype=torch.long, device=device)
+        is_weights = torch.as_tensor(
+            batch.is_weights, dtype=torch.float32, device=device
+        )
+
+        bsz, window, _ = obs.shape
+        scored = window - burn_in  # == seq_len (L)
+
+        # --- n-step discounted returns + bootstrap mask (network-free) -----
+        # Shapes (batch, window). G_i and the mask are aligned with absolute step
+        # index i in [0, window); we use only the scored slice [burn_in:].
+        returns_np, bootstrap_np = self.replay.n_step_returns(
+            batch, n=cfg.n_step, gamma=cfg.gamma
+        )
+        returns = torch.as_tensor(returns_np, dtype=torch.float32, device=device)
+        bootstrap = torch.as_tensor(
+            bootstrap_np.astype(np.float32), dtype=torch.float32, device=device
+        )
+
+        # --- seed hidden state from the stored collection-time hidden ------
+        # batch.hidden is (batch, 2, num_layers, lstm_hidden) when present (our
+        # collector stores the (h, c) pair). Seed the very first window step.
+        seed_hidden = self._seed_hidden_from_batch(batch, bsz)
+
+        # --- online Q on the scored steps (gradients flow here) ------------
+        q_scored, _, _ = self.online.forward_with_burn_in(
+            obs, burn_in, hidden=seed_hidden
+        )  # (batch, L, N_ACTIONS)
+        scored_actions = actions[:, burn_in:]  # (batch, L)
+        q_taken = q_scored.gather(-1, scored_actions.unsqueeze(-1)).squeeze(-1)
+        # (batch, L) — Q_online(s_i, a_i) for scored i.
+
+        # --- bootstrap states: a SINGLE correctly-recurrent forward --------
+        # The bootstrap state for scored step i (absolute window index i in
+        # [B, T)) is s_{i+n}. For a DRQN the bootstrap Q must be evaluated with the
+        # hidden state that incorporates the FULL contiguous history up to s_{i+n},
+        # NOT a hidden seeded from the wrong stream (the old code ran the LSTM over
+        # ``next_obs`` from the window-START hidden, which is shifted by one step
+        # and missing obs[B] — biasing every n-step target whenever memory matters).
+        #
+        # Within an episode the window is contiguous, so next_obs[:, :-1] == obs[:,
+        # 1:]. Build an EXTENDED stream obs_ext = concat(obs, next_obs[:, -1:]) of
+        # shape (b, T+1, OBS_DIM): obs_ext[p] == s_p for p in [0, T] (obs_ext[T] ==
+        # next_obs[T-1] == s_T). Running ONE seeded forward over obs_ext from the
+        # collection-time window-start hidden makes the Q at position p use the
+        # hidden that incorporates s_0..s_p — exactly the correct memory for s_p.
+        # The bootstrap (a target) carries no gradient, so the whole pass is under
+        # no_grad.
+        with torch.no_grad():
+            obs_ext = torch.cat([obs, next_obs[:, -1:, :]], dim=1)  # (b, T+1, OBS_DIM)
+            q_ext_online, _ = self.online(obs_ext, seed_hidden)  # (b, T+1, A)
+            q_ext_target, _ = self.target(obs_ext, seed_hidden)  # (b, T+1, A)
+            # Double-DQN per position: ONLINE selects a*, TARGET evaluates it.
+            next_actions = q_ext_online.argmax(dim=-1)  # (b, T+1)
+            q_ext_eval = q_ext_target.gather(
+                -1, next_actions.unsqueeze(-1)
+            ).squeeze(-1)  # (b, T+1) target value of the online-greedy action at s_p
+
+            # For scored step i the bootstrap state s_{i+n} sits at obs_ext
+            # position i + n. bootstrap_i is False whenever that horizon ran off the
+            # window or a done truncated the return, so the clamped (in-range)
+            # gather there is masked to 0.
+            boot_value = self._gather_bootstrap_values(
+                q_ext_eval, burn_in, scored, cfg.n_step
+            )  # (batch, L)
+
+            returns_scored = returns[:, burn_in:]  # (batch, L)
+            bootstrap_scored = bootstrap[:, burn_in:]  # (batch, L)
+            gamma_n = cfg.gamma ** cfg.n_step
+            target_y = returns_scored + bootstrap_scored * gamma_n * boot_value
+            # (batch, L)
+
+        # --- TD error + IS-weighted Huber loss -----------------------------
+        # Derive BOTH the priority |δ| and the Huber loss from the SAME ``td_error``
+        # tensor so the value that drives the update can never diverge from the one
+        # that drives the priority (Huber(δ) is a deterministic function of δ).
+        td_error = target_y - q_taken  # (batch, L)
+        # smooth-L1 (Huber) per scored step, no reduction, computed FROM td_error.
+        huber = F.smooth_l1_loss(
+            td_error, torch.zeros_like(td_error), reduction="none"
+        )  # (batch, L)
+        # Mean Huber per window, then weight by the window's IS weight, then mean.
+        per_window_huber = huber.mean(dim=1)  # (batch,)
+        loss = (is_weights * per_window_huber).mean()
+
+        # Per-window |δ| (mean over scored steps) drives the new priority; detach.
+        abs_td = td_error.detach().abs()  # (batch, L)
+        abs_td_per_sample = abs_td.mean(dim=1).cpu().numpy()  # (batch,)
+        mean_abs_td = float(abs_td.mean().cpu().item())
+
+        return loss, abs_td_per_sample, mean_abs_td
+
+    def _seed_hidden_from_batch(
+        self, batch: SequenceBatch, batch_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build the LSTM seed ``(h0, c0)`` from the stored window-start hidden.
+
+        The collector stores a per-step ``(2, num_layers, lstm_hidden)`` snapshot;
+        the buffer returns the window-start one as ``batch.hidden`` of shape
+        ``(batch, 2, num_layers, lstm_hidden)``. We split it back into the
+        ``(num_layers, batch, lstm_hidden)`` layout ``torch.nn.LSTM`` expects. When
+        no hidden was stored (``batch.hidden is None``) we fall back to a zero seed
+        — an acceptable burn-in fallback per the net's docstring.
+        """
+        if batch.hidden is None:
+            return self.online.init_hidden(batch_size, device=self.device)
+
+        hidden = np.asarray(batch.hidden, dtype=np.float32)
+        # Expected layout (batch, 2, num_layers, lstm_hidden). Be defensive about a
+        # collapsed num_layers axis (batch, 2, lstm_hidden) for a single-layer net.
+        if hidden.ndim == 3:
+            hidden = hidden[:, :, np.newaxis, :]  # -> (batch, 2, 1, lstm_hidden)
+        if hidden.ndim != 4 or hidden.shape[1] != 2:
+            # Unexpected snapshot shape — fall back to a zero seed rather than risk
+            # feeding a mis-shaped hidden into the LSTM.
+            return self.online.init_hidden(batch_size, device=self.device)
+
+        h = torch.as_tensor(hidden[:, 0], dtype=torch.float32, device=self.device)
+        c = torch.as_tensor(hidden[:, 1], dtype=torch.float32, device=self.device)
+        # (batch, num_layers, lstm_hidden) -> (num_layers, batch, lstm_hidden).
+        h = h.permute(1, 0, 2).contiguous()
+        c = c.permute(1, 0, 2).contiguous()
+        return h, c
+
+    @staticmethod
+    def _gather_bootstrap_values(
+        q_ext_eval: torch.Tensor, burn_in: int, scored: int, n_step: int
+    ) -> torch.Tensor:
+        """Select, per scored step ``i``, the bootstrap value at ``obs_ext`` ``i+n``.
+
+        ``q_ext_eval`` is ``(batch, T+1)`` — the target value of the online-greedy
+        action at EVERY extended-stream position (``obs_ext[p]`` == state ``s_p``).
+        For scored step ``i`` (absolute index ``burn_in + s`` for ``s`` in
+        ``[0, scored)``) the bootstrap state ``s_{i+n}`` is ``obs_ext[i + n]``. We
+        clamp that index into ``[0, T]`` and rely on the caller's ``bootstrap`` mask
+        to zero any term where the true horizon ran past the window end, so the
+        clamped (in-range) gather is never actually used there.
+
+        Returns:
+            ``(batch, scored)`` bootstrap values aligned with the scored steps.
+        """
+        bsz, ext_len = q_ext_eval.shape  # ext_len == T + 1
+        # Absolute scored indices i = burn_in + [0..scored).
+        i = torch.arange(scored, device=q_ext_eval.device) + burn_in  # (scored,)
+        boot_idx = i + n_step  # obs_ext position of s_{i+n}
+        # Non-mutating clamp into the extended stream (max valid index is T == ext_len-1).
+        boot_idx = boot_idx.clamp(max=ext_len - 1)  # keep gather in range (masked)
+        boot_idx = boot_idx.unsqueeze(0).expand(bsz, scored)  # (batch, scored)
+        return q_ext_eval.gather(1, boot_idx)
+
+    def _soft_update_target(self) -> None:
+        """Polyak soft update: ``θ_target ← τ·θ_online + (1−τ)·θ_target``.
+
+        Applied to every parameter AND buffer of the target net every gradient
+        step. Runs under ``no_grad`` (the target is never differentiated).
+        """
+        tau = self.cfg.tau
+        with torch.no_grad():
+            for tgt_p, src_p in zip(
+                self.target.parameters(), self.online.parameters()
+            ):
+                tgt_p.mul_(1.0 - tau).add_(src_p, alpha=tau)
+            # Buffers (none in this net, but future-proof) are copied verbatim so
+            # they never go stale.
+            for tgt_b, src_b in zip(self.target.buffers(), self.online.buffers()):
+                tgt_b.copy_(src_b)
+
+    # ------------------------------------------------------------------
+    # Full loop
+    # ------------------------------------------------------------------
+    def train(
+        self,
+        env: EnvProtocol,
+        num_episodes: int,
+        *,
+        updates_per_step: int = 1,
+        max_episode_steps: Optional[int] = None,
+        eval_hook: Optional[EvalHook] = None,
+        checkpoint_hook: Optional[CheckpointHook] = None,
+        log_hook: Optional[LogHook] = None,
+    ) -> None:
+        """Run the full episode/gradient loop for ``num_episodes`` episodes.
+
+        For each episode: collect it (per-EPISODE ε), then — once the buffer is
+        ready — run ``updates_per_step`` gradient steps. The eval/checkpoint/log
+        hooks fire at their configured cadences (``cfg.eval_interval`` etc.); a
+        cadence of 0 disables that hook. The hooks are call-signature stubs here:
+        T19 owns eval, T20 owns checkpoint/full training.
+
+        Args:
+            env: The environment to roll out against.
+            num_episodes: Number of episodes to collect/train on (>= 0).
+            updates_per_step: Gradient steps to run per collected episode once
+                ready (>= 0). 1 keeps the update-to-data ratio near one update per
+                episode; raise for more gradient steps per env episode.
+            max_episode_steps: Optional per-episode decision cap (for a fake env).
+            eval_hook / checkpoint_hook / log_hook: Optional callbacks; see the
+                hook type aliases. Called only when their interval is > 0 and the
+                current grad step is a multiple of it.
+
+        Raises:
+            ValueError: if ``num_episodes`` or ``updates_per_step`` is negative.
+        """
+        if num_episodes < 0:
+            raise ValueError(f"num_episodes must be >= 0, got {num_episodes}")
+        if updates_per_step < 0:
+            raise ValueError(
+                f"updates_per_step must be >= 0, got {updates_per_step}"
+            )
+
+        for _ in range(num_episodes):
+            self.collect_episode(env, max_steps=max_episode_steps)
+
+            for _ in range(updates_per_step):
+                stats = self.learn()
+                if stats is None:
+                    break  # not ready yet; skip remaining updates this episode
+                self._fire_hooks(stats, eval_hook, checkpoint_hook, log_hook)
+
+    def _fire_hooks(
+        self,
+        stats: LearnStats,
+        eval_hook: Optional[EvalHook],
+        checkpoint_hook: Optional[CheckpointHook],
+        log_hook: Optional[LogHook],
+    ) -> None:
+        """Invoke eval/checkpoint/log hooks whose interval divides the grad step."""
+        step = self.grad_step
+        if log_hook is not None and self.cfg.log_interval > 0:
+            if step % self.cfg.log_interval == 0:
+                log_hook(self, step, stats)
+        if eval_hook is not None and self.cfg.eval_interval > 0:
+            if step % self.cfg.eval_interval == 0:
+                eval_hook(self, step)
+        if checkpoint_hook is not None and self.cfg.checkpoint_interval > 0:
+            if step % self.cfg.checkpoint_interval == 0:
+                checkpoint_hook(self, step)
+
+
+# ---------------------------------------------------------------------------
+# Functional entry point.
+# ---------------------------------------------------------------------------
+
+
+def train(
+    env: EnvProtocol,
+    cfg: TrainConfig,
+    num_episodes: int,
+    *,
+    device: Optional[torch.device] = None,
+    net_kwargs: Optional[Dict[str, int]] = None,
+    updates_per_step: int = 1,
+    max_episode_steps: Optional[int] = None,
+    eval_hook: Optional[EvalHook] = None,
+    checkpoint_hook: Optional[CheckpointHook] = None,
+    log_hook: Optional[LogHook] = None,
+) -> Trainer:
+    """Construct a :class:`Trainer` and run ``num_episodes`` of the §8 loop.
+
+    Convenience wrapper for callers that just want "train this env with this
+    config". Returns the constructed :class:`Trainer` so the caller can inspect
+    the nets / replay / grad-step count afterwards (eval is T19, checkpoint T20).
+
+    Args:
+        env: The environment to roll out against (real ``MCPvPEnv`` or a fake).
+        cfg: The training hyperparameters.
+        num_episodes: Episodes to collect/train on.
+        device / net_kwargs: Forwarded to the :class:`Trainer` constructor.
+        updates_per_step / max_episode_steps / *_hook: Forwarded to
+            :meth:`Trainer.train`.
+
+    Returns:
+        The :class:`Trainer` after the loop completes.
+    """
+    trainer = Trainer(cfg, device=device, net_kwargs=net_kwargs)
+    trainer.train(
+        env,
+        num_episodes,
+        updates_per_step=updates_per_step,
+        max_episode_steps=max_episode_steps,
+        eval_hook=eval_hook,
+        checkpoint_hook=checkpoint_hook,
+        log_hook=log_hook,
+    )
+    return trainer
+
+
+# ===========================================================================
+# T20 — the M2 integration entrypoint: train the real DRQN vs the stationary
+# dummy over the real perception+reward env, with periodic greedy eval against
+# the M2 gate.
+#
+# This composes the WHOLE stack that the other tracks built:
+#
+#   seed_everything
+#     -> MCPvPEnv(transport, ...)            # real PerceptionFilter + reward
+#        over a StationaryDummy opponent     # served by the bridge/server
+#     -> Trainer(cfg)                        # online/target DuelingDRQN +
+#                                            # PrioritizedSequenceReplay
+#     -> per-episode loop (per-EPISODE ε)    # Trainer.collect + Trainer.learn
+#        with periodic evaluate(...)         # greedy ε=0, the M2 gate (AC6)
+#        logging EACH reward component       # via MetricsLogger
+#        + checkpoint hooks
+#     -> stop at the M2 gate (passed_m2)     # win_rate>=0.95 AND
+#        OR a max-step / max-episode budget. #   aim_while_invisible==0 AND
+#                                            #   mean_len < cap
+#
+# The transport is INJECTABLE (``transport_factory``) so this exact loop runs
+# OFFLINE against a fake/scripted bridge in tests — the offline end-to-end proof.
+# The live M2 run wires the real ``TcpBridgeClient`` via ``main()`` below.
+#
+# WHAT THIS DOES NOT DO (the documented human follow-up):
+#   AC6/TC13 proper — "greedy DRQN >= 95% over 100 eval eps vs the LIVE
+#   stationary dummy" — needs the live Paper server + Node bridge and a real
+#   training budget. That is the human M2 run on the laptop+Paper stack; see
+#   server/README.md ("Live follow-up") and server/compat_check.md for the
+#   live-handshake follow-ups. This task delivers the full integration WIRING
+#   plus the offline end-to-end proof (tests/test_integration_m2.py).
+# ===========================================================================
+
+
+#: Factory that returns a fresh bridge transport (the env owns its lifecycle).
+#: The real one is ``lambda: TcpBridgeClient(host, port)``; tests inject one that
+#: returns a scripted fake bridge. A factory (not an instance) is taken so the M2
+#: entrypoint stays symmetric with the live CLI, which constructs the transport
+#: lazily, and so a future reconnect could rebuild it.
+TransportFactory = Callable[[], "Any"]
+
+
+@dataclass
+class M2Result:
+    """Outcome of an :func:`train_vs_dummy` / :func:`run_m2` integration run.
+
+    Attributes:
+        trainer: The :class:`Trainer` after the loop (online/target nets, replay,
+            grad-step count — inspectable by the caller / a checkpoint).
+        passed_m2: ``True`` iff the most recent eval cleared the full M2 gate
+            (``win_rate >= 0.95`` AND ``aim_while_invisible == 0`` AND
+            ``mean_episode_length < timeout_cap``). ``False`` if the budget ran
+            out first or no eval ran.
+        episodes_run: Number of episodes actually collected before stopping.
+        grad_steps: Number of gradient steps completed.
+        last_report: The most recent eval :class:`~eval.evaluate.EvalReport`
+            (``None`` if no eval ran — e.g. ``eval_every_episodes == 0``).
+        reports: Every eval report produced, in order (for plotting the win-rate
+            curve over training).
+        stop_reason: One of ``"passed_m2"`` / ``"max_episodes"`` / ``"max_steps"``
+            — why the loop stopped.
+        is_live: ``True`` for a real-bridge run, ``False`` for the offline proof.
+    """
+
+    trainer: "Trainer"
+    passed_m2: bool
+    episodes_run: int
+    grad_steps: int
+    last_report: Optional[Any] = None
+    reports: List[Any] = None  # type: ignore[assignment]  # set in __post_init__
+    stop_reason: str = "max_episodes"
+    is_live: bool = False
+
+    def __post_init__(self) -> None:
+        if self.reports is None:
+            self.reports = []
+
+
+def train_vs_dummy(
+    cfg: TrainConfig,
+    *,
+    transport_factory: TransportFactory,
+    max_episodes: int = 10_000,
+    max_grad_steps: Optional[int] = None,
+    updates_per_step: int = 1,
+    eval_every_episodes: int = 50,
+    eval_episodes: int = 100,
+    timeout_cap: int = MAX_EPISODE_STEPS,
+    env_max_episode_steps: int = MAX_EPISODE_STEPS,
+    rollout_step_cap: Optional[int] = None,
+    stop_on_pass: bool = True,
+    device: Optional[torch.device] = None,
+    net_kwargs: Optional[Dict[str, int]] = None,
+    logger: Optional[Any] = None,
+    checkpoint_hook: Optional[CheckpointHook] = None,
+    is_live: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+    show_progress: bool = True,
+    progress_log_interval: float = 30.0,
+    progress_stream: Optional[Any] = None,
+    progress_reporter: Optional[ProgressReporter] = None,
+) -> M2Result:
+    """Train the DRQN vs the stationary dummy until the M2 gate or a budget.
+
+    The full M2 composition (see the section banner above). One ``Trainer`` owns
+    the online/target :class:`~agent.dqn.DuelingDRQN` and the
+    :class:`~agent.replay.PrioritizedSequenceReplay`; this function drives the
+    episode loop, runs a GREEDY :func:`~eval.evaluate.evaluate` against the dummy
+    every ``eval_every_episodes`` episodes (logging EACH reward component via the
+    ``logger``), fires the ``checkpoint_hook``, and STOPS the moment an eval clears
+    the gate (``report.passed_m2``) — or when the episode / gradient-step budget is
+    exhausted.
+
+    The agent and the eval BOTH face the same stage-0 opponent: the
+    :class:`~opponents.dummy.StationaryDummy`. The dummy is served by the bridge /
+    Paper server (its idle policy + immunity flags are enforced server-side), so
+    this loop never steps an opponent policy in Python — it just talks to the env.
+
+    Determinism: ``Trainer`` seeds Python/NumPy/torch from ``cfg.seed`` at
+    construction (``seed_everything``), and per-episode env resets + ε RNG are
+    reseeded from ``cfg.seed + episode_index`` inside ``collect_episode`` — so the
+    whole run is replayable.
+
+    Args:
+        cfg: Training hyperparameters (net/replay geometry, ε schedule, PER, etc.).
+        transport_factory: Zero-arg callable returning a fresh bridge transport
+            (a real :class:`~env.mc_pvp_env.TcpBridgeClient` live; a scripted fake
+            offline). The env owns the returned transport's lifecycle.
+        max_episodes: Hard cap on episodes collected (the episode budget).
+        max_grad_steps: Optional hard cap on gradient steps (the compute budget);
+            ``None`` relies on ``max_episodes`` alone.
+        updates_per_step: Gradient steps per collected episode once the replay is
+            warm (forwarded to the learner).
+        eval_every_episodes: Run a greedy eval after every this-many episodes
+            (``0`` disables periodic eval — then the gate is never checked and the
+            loop runs the full episode budget).
+        eval_episodes: Episodes per greedy eval. AC6 uses 100; tests use a few.
+        timeout_cap: The episode-length horizon a timeout hits, passed to
+            ``evaluate`` (its run-away guard requires ``mean_len < timeout_cap``).
+        env_max_episode_steps: Per-episode decision cap enforced by the env itself.
+        rollout_step_cap: Optional belt-and-suspenders per-episode decision cap for
+            COLLECTION (defends against a fake env that never sets ``done``);
+            ``None`` relies on the env's own ``max_episode_steps``.
+        stop_on_pass: When True (default) stop as soon as an eval clears the M2
+            gate. Set False to run the whole budget regardless (e.g. to collect the
+            full win-rate curve).
+        device / net_kwargs: Forwarded to the :class:`Trainer` constructor.
+        logger: Optional :class:`~eval.logging.MetricsLogger`. Per-episode training
+            stats AND every periodic eval's per-component breakdown are logged
+            through it. ``None`` disables logging (the report is still computed).
+        checkpoint_hook: Optional ``(trainer, grad_step) -> None`` called after the
+            loop ends and after each eval that improves the win rate, so the caller
+            can persist the net + ``code_version``. (The cadence-driven
+            ``Trainer``-internal checkpoint hook is separate; this is the M2-level
+            "save best / save final" hook.)
+        is_live: Marks the produced reports/result as a live (vs offline) run.
+        log: Optional ``str -> None`` progress sink (``None`` silences it). When a
+            progress reporter is active the loop's own eval-summary lines are
+            routed through it instead (so they never garble the in-place bar).
+        show_progress: When True (default) attach a
+            :class:`~agent.progress.ProgressReporter` — a live status bar (on a
+            TTY) plus a periodic progress LINE with throughput and a budget ETA.
+            Ignored when ``progress_reporter`` is supplied.
+        progress_log_interval: Seconds between persistent progress lines / metrics
+            rows (the bar itself redraws faster on a TTY).
+        progress_stream: Where the bar/lines are drawn (defaults to the reporter's
+            own default, ``sys.stderr``). Ignored when ``progress_reporter`` is set.
+        progress_reporter: Inject a pre-built reporter (mainly for tests); when
+            given it overrides ``show_progress`` / the stream / the interval.
+
+    Returns:
+        An :class:`M2Result` with the trainer, the gate verdict, the episode /
+        gradient-step counts, every eval report, and the stop reason.
+
+    Raises:
+        ValueError: on a non-positive ``max_episodes`` / ``eval_episodes`` or a
+            negative ``eval_every_episodes``.
+    """
+    # Local import to keep the eval dependency at the call boundary (and to avoid
+    # any import cycle between agent.train and eval.evaluate).
+    from eval.evaluate import DRQNGreedyPolicy, evaluate
+
+    from env.mc_pvp_env import MCPvPEnv
+
+    if max_episodes <= 0:
+        raise ValueError(f"max_episodes must be > 0, got {max_episodes}")
+    if eval_episodes <= 0:
+        raise ValueError(f"eval_episodes must be > 0, got {eval_episodes}")
+    if eval_every_episodes < 0:
+        raise ValueError(
+            f"eval_every_episodes must be >= 0, got {eval_every_episodes}"
+        )
+
+    def _emit(message: str) -> None:
+        # Route standalone lines through the reporter when present so they clear
+        # the in-place bar first (otherwise the bar and the line collide on a TTY).
+        # ALSO forward to the `log` sink: the reporter writes to its own progress
+        # stream, so a separate file/structured `log` must still receive the
+        # run-start + eval-summary lines (routing to only one dropped them).
+        if reporter is not None:
+            reporter.message(message)
+        if log is not None:
+            log(message)
+
+    # --- build the trainer (online/target DRQN + PER replay, seeded) --------
+    trainer = Trainer(cfg, device=device, net_kwargs=net_kwargs)
+
+    # --- build the real env over the injected transport ---------------------
+    # MCPvPEnv applies the real PerceptionFilter (FOV+LoS+memory gating) and the
+    # canonical reward (single-source-of-truth components) — exactly what the
+    # learner sees in production. The opponent is the stationary dummy, served by
+    # the bridge; the env owns the transport lifecycle.
+    transport = transport_factory()
+    env = MCPvPEnv(transport=transport, max_episode_steps=env_max_episode_steps)
+
+    reports: List[Any] = []
+    last_report: Optional[Any] = None
+    best_win_rate = -1.0
+    passed = False
+    stop_reason = "max_episodes"
+    episodes_run = 0
+    total_steps = 0  # env transitions collected across episodes (for throughput)
+
+    # --- live progress reporter (status bar + throughput/ETA log) -----------
+    reporter = progress_reporter
+    if reporter is None and show_progress:
+        reporter = ProgressReporter(
+            total_episodes=max_episodes,
+            stream=progress_stream,
+            log_interval=progress_log_interval,
+            # On a TTY, tick the bar ~1/s so it doesn't look frozen across the
+            # slow (~90 s) live episodes. Auto-disabled when output is redirected.
+            heartbeat_interval=1.0,
+        )
+    if reporter is not None:
+        # Immediate, redirect-safe confirmation the run is up — the first
+        # throughput/ETA numbers can't appear until episode 1 finishes (~90 s live).
+        eval_note = (
+            f"eval every {eval_every_episodes} eps" if eval_every_episodes > 0
+            else "eval disabled"
+        )
+        _emit(
+            f"[m2] training started - budget {max_episodes} episodes, {eval_note}. "
+            f"Throughput + ETA appear after episode 1 completes (~90 s live)."
+        )
+        reporter.start(epsilon=trainer.last_epsilon)
+
+    def _log_training(_trainer: "Trainer", _step: int, stats: LearnStats) -> None:
+        if logger is not None:
+            logger.log(
+                {
+                    "train/loss": stats.loss,
+                    "train/td_error_mean": stats.td_error_mean,
+                    "train/grad_norm": stats.grad_norm,
+                    "train/epsilon": stats.epsilon,
+                    "train/beta": stats.beta,
+                    "train/replay_size": stats.replay_size,
+                },
+                step=stats.grad_step,
+            )
+
+    try:
+        for episode_index in range(max_episodes):
+            # --- collect ONE episode (per-EPISODE ε, deterministic reseed) ---
+            n_transitions, _ = trainer.collect_episode(env, max_steps=rollout_step_cap)
+            episodes_run += 1
+            total_steps += n_transitions
+
+            # --- gradient steps once the replay is warm ----------------------
+            for _ in range(updates_per_step):
+                stats = trainer.learn()
+                if stats is None:
+                    break  # not ready yet; skip remaining updates this episode
+                _log_training(trainer, stats.grad_step, stats)
+
+            # --- live progress: status bar + periodic throughput/ETA line ----
+            if reporter is not None:
+                snap = reporter.update(
+                    episodes_run=episodes_run,
+                    steps_collected=total_steps,
+                    grad_step=trainer.grad_step,
+                    epsilon=trainer.last_epsilon,
+                    last_win_rate=(
+                        last_report.win_rate if last_report is not None else None
+                    ),
+                )
+                if snap is not None and logger is not None:
+                    logger.log(progress_metrics(snap), step=trainer.grad_step)
+
+            # --- periodic GREEDY eval against the M2 gate --------------------
+            do_eval = (
+                eval_every_episodes > 0
+                and (episode_index + 1) % eval_every_episodes == 0
+            )
+            if do_eval:
+                if reporter is not None:
+                    reporter.clear()  # drop the bar before the (long) eval output
+                # Eval BORROWS the training env's (now idle) transport instead of
+                # opening a second connection — the bridge serves exactly one
+                # connection, so a fresh eval socket would steal the stream out from
+                # under training and abort the run. See _eval_against_dummy.
+                report = _eval_against_dummy(
+                    trainer=trainer,
+                    evaluate=evaluate,
+                    policy_cls=DRQNGreedyPolicy,
+                    shared_transport=transport,
+                    n_episodes=eval_episodes,
+                    timeout_cap=timeout_cap,
+                    env_max_episode_steps=env_max_episode_steps,
+                    eval_step_cap=rollout_step_cap,
+                    logger=logger,
+                    is_live=is_live,
+                    base_seed=cfg.seed,
+                    log=log,
+                )
+                reports.append(report)
+                last_report = report
+
+                # Save-best hook: checkpoint whenever the win rate improves.
+                if report.win_rate > best_win_rate:
+                    best_win_rate = report.win_rate
+                    if checkpoint_hook is not None:
+                        checkpoint_hook(trainer, trainer.grad_step)
+
+                _emit(
+                    f"[m2 ep {episode_index + 1}] grad_step={trainer.grad_step} "
+                    f"win_rate={report.win_rate:.3f} "
+                    f"mean_len={report.mean_episode_length:.1f} "
+                    f"aim_invisible={report.aim_while_invisible:.3f} "
+                    f"passed_m2={report.passed_m2}"
+                )
+
+                if report.passed_m2 and stop_on_pass:
+                    passed = True
+                    stop_reason = "passed_m2"
+                    break
+
+            # --- gradient-step budget ---------------------------------------
+            if max_grad_steps is not None and trainer.grad_step >= max_grad_steps:
+                stop_reason = "max_steps"
+                break
+        else:
+            stop_reason = "max_episodes"
+    finally:
+        _close_quietly(env)
+        if reporter is not None:
+            final_snap = reporter.close()
+            if final_snap is not None and logger is not None:
+                logger.log(progress_metrics(final_snap), step=trainer.grad_step)
+
+    # A final save (best/final) so the caller always has a persistable net.
+    if checkpoint_hook is not None:
+        checkpoint_hook(trainer, trainer.grad_step)
+
+    return M2Result(
+        trainer=trainer,
+        passed_m2=passed,
+        episodes_run=episodes_run,
+        grad_steps=trainer.grad_step,
+        last_report=last_report,
+        reports=reports,
+        stop_reason=stop_reason,
+        is_live=bool(is_live),
+    )
+
+
+#: Alias — the plan offers ``train_vs_dummy`` OR ``run_m2`` as the entrypoint
+#: name; expose both so either reads naturally at the call site.
+run_m2 = train_vs_dummy
+
+
+def _eval_against_dummy(
+    *,
+    trainer: "Trainer",
+    evaluate: Callable[..., Any],
+    policy_cls: Callable[..., Any],
+    shared_transport: Any,  # the training env's bridge transport (BridgeTransport)
+    n_episodes: int,
+    timeout_cap: int,
+    env_max_episode_steps: int,
+    eval_step_cap: Optional[int],
+    logger: Optional[Any],
+    is_live: bool,
+    base_seed: int,
+    log: Optional[Callable[[str], None]],
+) -> Any:
+    """Run ONE greedy (ε=0) eval of the current online net vs the dummy.
+
+    The bridge serves EXACTLY ONE connection, so eval must not open a second one:
+    a fresh eval socket adopts the stream and the bridge destroys the training
+    socket, which then aborts the run on the next ``reset``. Eval therefore BORROWS
+    the training env's ``shared_transport`` — safe because at the eval boundary the
+    training env is genuinely idle: ``collect_episode`` has finished (its last
+    ``step`` already got its ``state`` reply) and the gradient steps touch no
+    socket, so no reply is in flight on the shared connection.
+
+    The eval :class:`~env.mc_pvp_env.MCPvPEnv` is a SEPARATE instance built with
+    ``auto_connect=False`` over that transport, so it has its OWN per-episode state
+    (``_episode`` / PerceptionFilter / ``_prev_obs`` / ``_done``) and cannot corrupt
+    the training env's. It does NOT own the socket: the training env opened it and
+    closes it once in ``train_vs_dummy``'s ``finally``. Eval never sends ``close``
+    or closes the transport (that would kill the live bridge mid-run); it leaves the
+    connection idle for training to resume. (Honoring the design intent: eval still
+    does not consume the training env's IN-FLIGHT stream — there is none in flight at
+    the boundary — it just shares the one idle connection.)
+
+    Wraps the online net in a greedy :class:`~eval.evaluate.DRQNGreedyPolicy`, runs
+    :func:`~eval.evaluate.evaluate`, and returns its
+    :class:`~eval.evaluate.EvalReport`.
+    """
+    from env.mc_pvp_env import MCPvPEnv
+
+    policy = policy_cls(trainer.online, device=trainer.device)
+    # auto_connect=False: the shared transport is already connected by the training
+    # env; reconnecting would re-handshake the live bridge mid-run.
+    eval_env = MCPvPEnv(
+        transport=shared_transport,
+        max_episode_steps=env_max_episode_steps,
+        auto_connect=False,
+    )
+    # Switch back to train mode afterward: DRQNGreedyPolicy flips the net to eval()
+    # for inference; the next collection/learn step expects train mode.
+    was_training = trainer.online.training
+    try:
+        report = evaluate(
+            eval_env,
+            policy,
+            n_episodes=n_episodes,
+            logger=logger,
+            timeout_cap=timeout_cap,
+            base_seed=base_seed,
+            is_live=is_live,
+            max_episode_steps=eval_step_cap,
+            log=log,
+        )
+    finally:
+        # Do NOT close eval_env: it borrows training's socket and must not send
+        # `close` or tear down the shared transport. The training env owns and
+        # closes that socket exactly once in train_vs_dummy's finally.
+        if was_training:
+            trainer.online.train()
+    return report
+
+
+def _close_quietly(env: Any) -> None:
+    """Close ``env`` if it exposes a ``close()``; ignore its absence/errors.
+
+    The trainer's :class:`EnvProtocol` only requires ``reset`` / ``step``; the
+    real :class:`~env.mc_pvp_env.MCPvPEnv` also owns a transport and MUST be
+    closed, but a lightweight fake env may not implement ``close``. Teardown must
+    never mask the loop's own result or error, so a missing/raising ``close`` is
+    swallowed here.
+    """
+    close = getattr(env, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        # Teardown is best-effort; the connection is going away regardless.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# CLI — the LIVE M2 training run (AC6/TC13 prep), part of T20.
+#
+# Wires the REAL ``TcpBridgeClient`` transport to the started Node bridge / Paper
+# server (which serves the stationary dummy), runs ``train_vs_dummy`` to the M2
+# gate or the budget, logs through a ``MetricsLogger``, optionally writes a final
+# checkpoint, and exits 0 iff the gate passed. The OFFLINE end-to-end logic is
+# proved by tests/test_integration_m2.py; this entry point is the LIVE run.
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> "Any":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="train",
+        description=(
+            "T20 M2 integration: train the Dueling-DRQN vs the stationary dummy "
+            "over the real perception+reward env, with periodic greedy eval "
+            "against the M2 gate (win_rate>=95%, aim-while-invisible==0, mean "
+            "length<cap). Connects to a started Node bridge / Paper server. The "
+            "offline end-to-end wiring is proved by tests/test_integration_m2.py; "
+            "this entry point is the LIVE M2 run (AC6/TC13) - see server/README.md."
+        ),
+    )
+    parser.add_argument(
+        "--max-episodes", type=int, default=10_000,
+        help="episode budget (default: 10000).",
+    )
+    parser.add_argument(
+        "--max-grad-steps", type=int, default=None,
+        help="optional gradient-step budget (default: none - episodes only).",
+    )
+    parser.add_argument(
+        "--eval-every-episodes", type=int, default=50,
+        help="run a greedy eval every N episodes (default: 50; 0 disables).",
+    )
+    parser.add_argument(
+        "--eval-episodes", type=int, default=100,
+        help="episodes per greedy eval (default: 100, per AC6).",
+    )
+    parser.add_argument(
+        "--host", type=str, default="127.0.0.1",
+        help="bridge host for the live run (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port", type=int, default=5555,
+        help="bridge TCP port for the live run (default: 5555).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="base RNG seed (overrides TrainConfig.seed) (default: 0).",
+    )
+    parser.add_argument(
+        "--run-name", type=str, default="m2_train",
+        help="logger run name (default: m2_train).",
+    )
+    parser.add_argument(
+        "--log-backend", type=str, default="auto",
+        help="metrics backend: auto|wandb|tensorboard|jsonl (default: auto).",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="optional path to write the final DRQN checkpoint (state_dict).",
+    )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="disable the live status bar / progress log (default: enabled).",
+    )
+    parser.add_argument(
+        "--progress-interval", type=float, default=30.0,
+        help="seconds between persistent progress lines / metrics rows "
+        "(the on-TTY bar redraws faster) (default: 30).",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point for the LIVE M2 training run (AC6/TC13), part of T20.
+
+    Wires a real :class:`~env.mc_pvp_env.TcpBridgeClient` to the bridge, runs
+    :func:`train_vs_dummy` to the M2 gate or the budget, logs through a
+    :class:`~eval.logging.MetricsLogger`, optionally writes a final checkpoint
+    (with the ``code_version`` stamp), and EXITS 0 iff the M2 gate passed.
+
+    Args:
+        argv: Argument vector (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 == passed the M2 gate).
+    """
+    import dataclasses
+    import sys
+
+    from eval.logging import MetricsLogger
+
+    from env.mc_pvp_env import TcpBridgeClient
+
+    args = _build_parser().parse_args(argv)
+
+    # Honor the CLI seed by replacing it on the frozen config.
+    cfg = dataclasses.replace(TrainConfig(), seed=int(args.seed))
+
+    logger = MetricsLogger(
+        run_name=args.run_name,
+        backend=args.log_backend,
+        config={
+            "host": args.host,
+            "port": args.port,
+            "seed": args.seed,
+            "max_episodes": args.max_episodes,
+            "eval_episodes": args.eval_episodes,
+            "code_version": code_version(),
+        },
+    )
+
+    checkpoint_path = args.checkpoint
+
+    def _save_checkpoint(trainer: "Trainer", grad_step: int) -> None:
+        if checkpoint_path is None:
+            return
+        torch.save(
+            {
+                "model": trainer.online.state_dict(),
+                "grad_step": grad_step,
+                "code_version": code_version(),
+            },
+            checkpoint_path,
+        )
+
+    def _transport_factory() -> Any:
+        return TcpBridgeClient(host=args.host, port=args.port)
+
+    try:
+        result = train_vs_dummy(
+            cfg,
+            transport_factory=_transport_factory,
+            max_episodes=args.max_episodes,
+            max_grad_steps=args.max_grad_steps,
+            eval_every_episodes=args.eval_every_episodes,
+            eval_episodes=args.eval_episodes,
+            logger=logger,
+            checkpoint_hook=_save_checkpoint if checkpoint_path else None,
+            is_live=True,
+            log=lambda m: print(m, file=sys.stderr),
+            show_progress=not args.no_progress,
+            progress_log_interval=args.progress_interval,
+            progress_stream=sys.stderr,
+        )
+    finally:
+        logger.close()
+
+    report = result.last_report
+    print(
+        f"[m2 done] reason={result.stop_reason} episodes={result.episodes_run} "
+        f"grad_steps={result.grad_steps} passed_m2={result.passed_m2}",
+        file=sys.stderr,
+    )
+    if report is not None:
+        print(
+            f"  last eval: win_rate={report.win_rate:.3f} "
+            f"mean_len={report.mean_episode_length:.1f} "
+            f"aim_invisible={report.aim_while_invisible:.3f}",
+            file=sys.stderr,
+        )
+
+    return 0 if result.passed_m2 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

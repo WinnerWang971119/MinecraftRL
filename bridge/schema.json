@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mc-pvp-dqn/bridge/schema.json",
+  "title": "Node<->Python bridge wire schema",
+  "description": "FROZEN CONTRACT (AC1). Newline-delimited JSON over a raw TCP socket, one connection per arena. This is the canonical machine-readable contract; both bridge/messages.py (Python) and the Node transport (T7a) validate against it. Altering it requires a PR visible to all tracks. opponent.health is RAW privileged true health: it is on the wire for FUTURE stages and the reward may read it, but it MUST NEVER reach the observation (gated out by the PerceptionFilter, T12).",
+  "oneOf": [
+    {
+      "title": "reset (Python -> Node)",
+      "description": "Request a new episode: stop bots, teleport both agents to fixed spawns, restore full health and identical gear, clear PerceptionFilter memory. Node replies with reset_ack after the read-back gate.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reset" },
+        "episode": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic episode counter; lets Node correlate the reset_ack with this request."
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Per-episode RNG seed (spawn jitter, gear, opponent choice). Logged for reproducibility."
+        }
+      },
+      "required": ["type", "episode", "seed"],
+      "additionalProperties": false
+    },
+    {
+      "title": "step (Python -> Node)",
+      "description": "Execute one discrete action macro for the ACTION_REPEAT decision interval. Node aggregates events over the interval and replies with one state message.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "step" },
+        "action": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7,
+          "description": "Discrete action index in [0, 7], matching the 8 frozen action macros in agent/actions.py."
+        }
+      },
+      "required": ["type", "action"],
+      "additionalProperties": false
+    },
+    {
+      "title": "close (Python -> Node)",
+      "description": "Tear down the arena: disconnect bots and close this connection. No reply expected.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "close" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    {
+      "title": "state (Node -> Python)",
+      "description": "RAW aggregated state after one step's decision interval. Python owns fairness/reward/learning; Node emits raw state only.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "state" },
+        "self": {
+          "type": "object",
+          "description": "Learner-bot raw state (FULL; always real, never gated).",
+          "properties": {
+            "pos": { "$ref": "#/definitions/vec3" },
+            "yaw": { "type": "number", "description": "Yaw in radians." },
+            "pitch": { "type": "number", "description": "Pitch in radians." },
+            "velocity": { "$ref": "#/definitions/vec3" },
+            "on_ground": { "type": "boolean" },
+            "health": { "type": "number", "description": "Self current health (0..MAX_HEALTH). Self health is allowed in the observation." },
+            "held_item": { "type": "string", "description": "Held-item identifier (e.g. \"iron_sword\" or \"minecraft:iron_sword\"); resolved to a vocab id by observation_spec." },
+            "attack_cooldown": { "type": "number", "description": "Bridge-computed swing progress in [0, 1] (1.0 == ready)." }
+          },
+          "required": ["pos", "yaw", "pitch", "velocity", "on_ground", "health", "held_item", "attack_cooldown"],
+          "additionalProperties": false
+        },
+        "opponent": {
+          "type": "object",
+          "description": "Opponent RAW true state. PRIVILEGED: opponent.health is true health carried for FUTURE stages; the reward may read it but it MUST NEVER reach the observation (gated out by the PerceptionFilter). Position/facing/velocity are also gated upstream before they reach the obs.",
+          "properties": {
+            "pos": { "$ref": "#/definitions/vec3" },
+            "yaw": { "type": "number", "description": "Opponent yaw in radians." },
+            "pitch": { "type": "number", "description": "Opponent pitch in radians." },
+            "velocity": { "$ref": "#/definitions/vec3" },
+            "health": { "type": "number", "description": "RAW true opponent health. PRIVILEGED -> reward only, NEVER the observation." }
+          },
+          "required": ["pos", "yaw", "pitch", "velocity", "health"],
+          "additionalProperties": false
+        },
+        "events": {
+          "type": "object",
+          "description": "Damage/death events aggregated over the decision interval. Source of the reward's damage anchors.",
+          "properties": {
+            "damage_dealt": { "type": "number", "minimum": 0, "description": "Total damage dealt to the opponent this interval." },
+            "damage_taken": { "type": "number", "minimum": 0, "description": "Total damage taken this interval." },
+            "i_died": { "type": "boolean", "description": "True if the learner bot died this interval." },
+            "opponent_died": { "type": "boolean", "description": "True if the opponent died this interval." }
+          },
+          "required": ["damage_dealt", "damage_taken", "i_died", "opponent_died"],
+          "additionalProperties": false
+        },
+        "arena": {
+          "type": "object",
+          "description": "Arena geometry sensed this interval.",
+          "properties": {
+            "wall_distances": {
+              "type": "array",
+              "items": { "type": "number" },
+              "description": "Distances from the learner to surrounding arena walls (raycast probe order is fixed by the bridge)."
+            }
+          },
+          "required": ["wall_distances"],
+          "additionalProperties": false
+        },
+        "tick": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Server game tick at which this state was sampled (end of the interval)."
+        },
+        "code_version": {
+          "type": "string",
+          "description": "Env+filter code-version stamp (git SHA + config hash). Kickoff only LOGS a mismatch; the distributed future REJECTS mismatched batches."
+        }
+      },
+      "required": ["type", "self", "opponent", "events", "arena", "tick", "code_version"],
+      "additionalProperties": false
+    },
+    {
+      "title": "reset_ack (Node -> Python)",
+      "description": "Acknowledges a reset after the post-reset read-back gate. ok=false signals a read-back timeout (the gate did not confirm in time); the env must treat that episode as failed-to-start.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reset_ack" },
+        "ok": { "type": "boolean", "description": "True if the read-back gate confirmed; false on read-back timeout." },
+        "readback": {
+          "type": "object",
+          "description": "Post-reset read-back snapshot used to verify spawn/health/gear gates. Free-form by design (gate fields evolve)."
+        }
+      },
+      "required": ["type", "ok", "readback"],
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "vec3": {
+      "type": "array",
+      "description": "[x, y, z] world-frame triple.",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    }
+  }
+}
