@@ -120,6 +120,9 @@ python -m pytest tests/test_dqn.py -k "memory or burn_in or recurr" -v
 
 ## Step 6 — M2 learning (AC6 / TC13)
 
+### Important!!!
+Don't run this until parrel arena is finished or it will take you too ling to finish.
+
 Train the Dueling-DRQN vs the stationary dummy until the greedy (ε=0) eval clears
 the gate: **win-rate ≥95% over 100 eps, aim-bonus-while-invisible == 0, mean
 episode length < timeout cap**. The process exits `0` iff the gate passes.
