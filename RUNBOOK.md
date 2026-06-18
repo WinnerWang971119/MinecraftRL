@@ -108,6 +108,128 @@ lower-bound smoke number, not fleet capacity. Expect ~2–4 stable arenas, not 8
 
 ---
 
+## Step 4b — AC4 multi-arena live run (issue #4, ~10 min)
+
+This step confirms `distributed/` is wired correctly and measures peak throughput
+under N concurrent arenas. It is a follow-up to Step 4, run after the single-arena
+benchmark already passes.
+
+**NOTE on `--arenas` flags.** Two different commands have an `--arenas` flag that
+means different things. `eval.benchmark --arenas N` (Step 4 above) measures
+throughput from N arenas as a **benchmark** (it does not train). The
+`agent.train --arenas N` flag below runs **training** from N concurrent arenas.
+Do not confuse them.
+
+### Caveats (read before starting a long run)
+
+- **Windows Update auto-reboots this box at ~03:30** with no warning and no
+  checkpoint save. Pause Windows Update (Start → Windows Update → Advanced options →
+  Pause, or set Active Hours to cover your run window) before any run expected to
+  last more than a few hours. Prefer launching in the morning so Active Hours carry
+  you through.
+
+- **First boot of N fresh Paper worlds is slow.** World generation, plugin load,
+  bot re-op, and re-teleport each take tens of seconds per arena. The first reset per
+  arena will be noticeably slower than steady-state; let it settle before judging
+  throughput. Relaunch of a dead arena (fault recovery) is similarly slow (30–60 s+).
+
+- **Cores and thermals bind before RAM** on this 8c/8t / 32 GB box. Around 2–4
+  arenas is the realistic range; 8 is not achievable. The throughput goal is
+  ≥19 TPS sustained across all running arenas.
+
+### Launch procedure
+
+**1. Dry-run first** to print the full plan and sanity-check ports, usernames, and
+arena roots before anything goes live:
+
+```powershell
+pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -DryRun
+```
+
+Check the output: each arena should show distinct MC ports (25565, 25566, ...),
+distinct bridge ports (5555, 5556, ...), distinct learner/dummy usernames
+(`learner_0`/`dummy_0`, `learner_1`/`dummy_1`, ...), and separate server roots
+under `server/arenas/arena-N`.
+
+You can also verify the Python-side plan without touching any process:
+
+```powershell
+python -m distributed.launcher --arenas 2 --dry-run
+```
+
+**2. Run `setup.ps1` once** (idempotent; downloads the Paper jar into the canonical
+root that `start-arenas.ps1` copies from):
+
+```powershell
+pwsh -NoProfile -File server/setup/setup.ps1
+```
+
+**3. Start N arenas** (Paper servers + bridges). This blocks and keeps all processes
+alive until Ctrl-C:
+
+```powershell
+pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2
+```
+
+Wait for each bridge to print `listening on 127.0.0.1:555N` before proceeding. First boot is
+slow; give it a minute per arena. If a bridge fails to connect, the script will
+show the process exit; Paper was not ready. Stop everything (Ctrl-C), wait for the
+JVMs to finish world-gen, and re-run.
+
+**4. Confirm each bridge is listening** (from a second terminal, while
+`start-arenas.ps1` is still running):
+
+```powershell
+# Arena 0 (bridge port 5555)
+python -c "import socket; s=socket.create_connection(('127.0.0.1',5555),2); s.close(); print('5555 up')"
+# Arena 1 (bridge port 5556)
+python -c "import socket; s=socket.create_connection(('127.0.0.1',5556),2); s.close(); print('5556 up')"
+```
+
+**5. Sweep `--arenas` to find the max** (in a third terminal). The goal is the
+highest N where all arenas sustain ≥19 TPS. Start small and step up:
+
+```powershell
+python -m eval.benchmark --duration 600 --arenas 1
+python -m eval.benchmark --duration 600 --arenas 2
+python -m eval.benchmark --duration 600 --arenas 3
+python -m eval.benchmark --duration 600 --arenas 4
+```
+
+Record aggregate transitions/s and per-arena TPS for each run. The real AC4
+number is measured live here; it could not be measured in-session.
+
+**6. Run multi-arena training** with the winning N (once you know it from step 5).
+Keep `start-arenas.ps1` running (or relaunch it), then in a separate terminal:
+
+```powershell
+python -m agent.train --arenas 2 --max-episodes 10000 `
+  --eval-every-grad-steps 1000 --eval-episodes 100 `
+  --checkpoint runs/m2_multi.pt --run-name m2_multi
+```
+
+The `--arenas N` flag on `agent.train` (not on `eval.benchmark`) is what engages
+the multi-arena `ActorPool` + decoupled learner. Arena `i` connects to bridge port
+`--port + i` (default base 5555, so arena 0 → 5555, arena 1 → 5556, ...). The
+N bridges must already be listening before this command runs.
+
+**Stopping.** Ctrl-C on `agent.train` cleanly stops the collector threads. The
+multi-arena path writes a checkpoint during the run whenever a greedy eval
+improves the win-rate (not on exit), so the latest best-eval checkpoint is
+already on disk. Then Ctrl-C on `start-arenas.ps1` tears down all Paper servers
+and bridges.
+
+**Fast relaunch** (if you need to restart training without re-generating worlds):
+
+```powershell
+pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -SkipSetup
+```
+
+`-SkipSetup` skips the per-arena `setup.ps1` call, so existing worlds and
+`ops.json` files are reused. Relaunch is still 30–60 s+ per arena for JVM startup.
+
+---
+
 ## Step 5 — gate recurrence BEFORE trusting M2 (TC8b)
 
 M2's dummy is stationary and always visible, so a green M2 says **nothing** about
@@ -120,8 +242,12 @@ python -m pytest tests/test_dqn.py -k "memory or burn_in or recurr" -v
 
 ## Step 6 — M2 learning (AC6 / TC13)
 
-### Important!!!
-Don't run this until parrel arena is finished or it will take you too ling to finish.
+### Before you run this
+
+Multi-arena training (`distributed/`, issue #4) is now built. Run Step 4b first
+to find the max stable N on this machine, then pass `--arenas N` here for faster
+throughput. If you are short on time or skipping 4b, the single-arena path below
+works as-is.
 
 Train the Dueling-DRQN vs the stationary dummy until the greedy (ε=0) eval clears
 the gate: **win-rate ≥95% over 100 eps, aim-bonus-while-invisible == 0, mean
@@ -159,9 +285,10 @@ If Q diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
 |-----------|---------|----------------|-----|
 | M1 plumbing | `eval.run_random --episodes 100` | ≥100 eps, 0 crashes, RSS < 200 MB | AC3 |
 | M1 number | `eval.benchmark --duration 600` | transitions/s, p99, damage-exact, max-arenas@19TPS | AC4 |
+| Multi-arena live run | `start-arenas.ps1 -Arenas N` + `eval.benchmark --arenas N` | max N sustaining ≥19 TPS (live-measured); `agent.train --arenas N` runs training | AC4 follow-up |
 | Recurrence | `pytest tests/test_dqn.py -k memory` | memory fixture green, ablation fails | TC8b |
 | M2 learning | `agent.train --checkpoint runs/m2.pt` | win ≥95%, aim-while-invisible == 0, len < cap | AC6 |
 
-After M2 passes, the deferred dirs (`distributed/`, `deploy/`, `study/`) and the
-M3/M4 ladder (scripted bot → self-play/PFSP/Elo) are the next horizon — all
-explicitly out of kickoff scope.
+After M2 passes, the M3/M4 ladder (scripted bot → self-play/PFSP/Elo) is the
+next horizon. `distributed/` is now built (issue #4); `deploy/` and `study/`
+remain skeleton-only and out of kickoff scope.

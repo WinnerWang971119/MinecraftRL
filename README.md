@@ -104,7 +104,7 @@ contract + hand-authored fixtures.
 | [`opponents/`](opponents/) | Reward/opponent | Stationary dummy + the `Opponent` interface future opponents implement |
 | [`eval/`](eval/) | Eval/infra | Random tracer (M1), benchmark (the number), eval harness (M2), logging |
 | [`server/`](server/) | Environment/bridge | Paper setup scripts, flat arena datapack, ops, `server.properties` rationale |
-| [`distributed/`](distributed/) | *(deferred)* | Transport seam stub only — do not build out |
+| [`distributed/`](distributed/) | Multi-arena (issue #4) | N-arena collection into one learner: `Episode`+serialization, `LocalTransport`, `WeightStore`, `LearnerLoop`, `ActorPool`, `SubprocessArenaLauncher`; wired into `agent.train --arenas N` |
 | [`deploy/`](deploy/) | *(deferred)* | Booth skeleton only |
 | [`study/`](study/) | *(deferred)* | Study skeleton only |
 | [`tests/`](tests/) | all | Unit + integration tests (one per component) |
@@ -170,8 +170,9 @@ the kickoff stack only logs it so train/serve skew stays visible.
 | Boot Paper | `pwsh -NoProfile -File server/setup/setup.ps1` then `start.ps1` | `setup` is idempotent; bash equivalents in [`server/setup/`](server/setup/) |
 | Start the bridge | `cd bridge && npm start` | Start Paper **first** — bots connect before the port opens |
 | M1 slice | `python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555` | ≥100 eps, zero crashes |
-| M1 benchmark | `python -m eval.benchmark --duration 600 --arenas 1` | Sweep `--arenas 2,3,4` for the max |
-| M2 training | `python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
+| M1 benchmark | `python -m eval.benchmark --duration 600 --arenas 1` | Sweep `--arenas 2,3,4` for the max; this is the AC4 **measurement** flag on `eval.benchmark` |
+| M2 training (single arena) | `python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
+| Multi-arena training | `pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas N` then `python -m agent.train --arenas N --max-episodes 10000 --checkpoint runs/m2.pt --run-name m2_multi` | `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
 
 **Run order for anything live: Paper → bridge → Python driver.** Full ordered
 procedure, pass conditions, and what to watch (reward components, Q divergence) are
@@ -190,6 +191,6 @@ in [`RUNBOOK.md`](RUNBOOK.md).
 | Each `*/README.md` | Your workstream's specifics + per-file ownership. |
 | [`server/compat_check.md`](server/compat_check.md) | Authority for version pins and the live-handshake follow-up. |
 
-After M2 passes, the deferred dirs (`distributed/`, `deploy/`, `study/`) and the
-M3/M4 ladder (scripted bot → self-play / PFSP / Elo) are the next horizon — all
-explicitly out of kickoff scope.
+After M2 passes, the M3/M4 ladder (scripted bot → self-play / PFSP / Elo) is the
+next horizon. `distributed/` is now built (issue #4); `deploy/` and `study/`
+remain skeleton-only and out of kickoff scope.
