@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import (
@@ -99,6 +100,7 @@ __all__ = [
     # Offline fixtures (the injectable fake bridge + clock)
     "FakeClock",
     "FakeBridge",
+    "SleepingFakeBridge",
     # Resource sampling
     "ResourceSampler",
     # Runner + report
@@ -317,19 +319,28 @@ class FakeClock:
     ``step``/``recv`` pair, and :class:`FakeBridge` advances it by the scripted
     latency inside ``recv``, so the measured round-trip is exactly the injected
     value — making the percentile math assertable against known inputs.
+
+    Thread-safe: the concurrent thread-per-arena driver shares ONE clock across
+    arena threads, so the read/advance pair is guarded by a lock. Without it the
+    ``_now += seconds`` read-add-store could interleave across threads and silently
+    drop an advance, which would make the summed wall-elapsed (and therefore the
+    throughput numbers asserted by the offline tests) nondeterministic.
     """
 
     def __init__(self, start: float = 0.0) -> None:
         self._now = float(start)
+        self._lock = threading.Lock()
 
     def __call__(self) -> float:
-        return self._now
+        with self._lock:
+            return self._now
 
     def advance(self, seconds: float) -> None:
         """Advance the clock by ``seconds`` (must be >= 0)."""
         if seconds < 0.0:
             raise ValueError(f"cannot advance the clock by a negative amount: {seconds}")
-        self._now += float(seconds)
+        with self._lock:
+            self._now += float(seconds)
 
 
 class FakeBridge:
@@ -381,6 +392,19 @@ class FakeBridge:
     def send(self, obj: Mapping[str, Any]) -> None:
         self.sent.append(dict(obj))
 
+    def _next_state_latency(self) -> float:
+        """Pop the next scripted round-trip latency for a ``state`` reply.
+
+        Consumed in order; returns ``0.0`` once the scripted list is exhausted.
+        Only state replies have a round-trip cost (a ``reset_ack`` has none), so
+        the caller invokes this only when the popped message is a ``state``.
+        """
+        if self._lat_idx < len(self._latencies):
+            latency = self._latencies[self._lat_idx]
+            self._lat_idx += 1
+            return latency
+        return 0.0
+
     def recv(self) -> Union[StateMsg, ResetAckMsg]:
         if not self.inbound:
             raise BridgeError("FakeBridge.recv() called with an empty queue")
@@ -388,17 +412,79 @@ class FakeBridge:
         # Charge the scripted round-trip latency only for state replies (the
         # step -> state round-trip the benchmark measures).
         if isinstance(msg, StateMsg):
-            if self._lat_idx < len(self._latencies):
-                latency = self._latencies[self._lat_idx]
-                self._lat_idx += 1
-            else:
-                latency = 0.0
-            self._clock.advance(latency)
+            self._clock.advance(self._next_state_latency())
         return msg
 
     def close(self) -> None:
         self.closes += 1
         self.is_open = False
+
+
+class SleepingFakeBridge(FakeBridge):
+    """A :class:`FakeBridge` whose ``recv()`` does a REAL :func:`time.sleep`.
+
+    The plain :class:`FakeBridge` advances a manual :class:`FakeClock` with no
+    real wall-time cost, so it proves the metric MATH but cannot prove thread
+    OVERLAP — there is nothing for the GIL to release on. This sibling blocks the
+    calling thread on a real ``time.sleep(latency)`` inside ``recv()`` to model the
+    bridge aggregating over the ``ACTION_REPEAT`` window before it replies: that
+    blocking sleep releases the GIL, so the concurrent thread-per-arena driver
+    overlaps the sleeps of N arenas and the aggregate transitions/s rises with N.
+    This is the fixture behind the offline overlap evidence (AC8 / TC12).
+
+    The sleep models the SERVER side of the round-trip. To prove threads still
+    overlap when there is real CPU (Python/torch) work BETWEEN the sleeps — i.e.
+    that the design is I/O-bound, not GIL-bound — the driver runs a per-step work
+    hook (e.g. a real ``DuelingDRQN.act`` forward); see ``run_benchmark``'s
+    ``step_work`` parameter. The hook lives in the driver, not here, so this
+    bridge stays a pure transport.
+
+    The measured round-trip the benchmark records is the REAL elapsed wall time of
+    the sleep (read off the real ``clock`` passed to ``run_benchmark``), so the
+    latency percentiles reflect the injected sleep duration. A :class:`FakeClock`
+    is still required by the base constructor; it is advanced by ``latency`` as in
+    the base class, but for a real-clock run the benchmark reads its own wall clock
+    and the :class:`FakeClock` is incidental.
+
+    Args:
+        inbound: Same scripted inbound messages as :class:`FakeBridge`.
+        latency_s: A SINGLE real sleep duration (seconds) charged on every
+            ``state`` ``recv`` — the simulated server-tick blocking window
+            (~0.200 s live). A scalar, not a list, because a real-clock overlap
+            test wants one steady per-step blocking cost.
+        clock: A :class:`FakeClock` for the base contract (advanced by ``latency``;
+            incidental on a real-clock run).
+    """
+
+    def __init__(
+        self,
+        inbound: Sequence[Union[StateMsg, ResetAckMsg]],
+        latency_s: float,
+        clock: FakeClock,
+    ) -> None:
+        if latency_s < 0.0:
+            raise ValueError(f"latency_s must be >= 0, got {latency_s}")
+        # The base consumes a per-state latency LIST; feed it the single sleep
+        # value broadcast across every scripted state so FakeClock advancement
+        # stays consistent with the base contract.
+        super().__init__(
+            inbound=inbound,
+            latencies_s=[float(latency_s)] * len(inbound),
+            clock=clock,
+        )
+        self._sleep_s = float(latency_s)
+
+    def recv(self) -> Union[StateMsg, ResetAckMsg]:
+        if not self.inbound:
+            raise BridgeError("SleepingFakeBridge.recv() called with an empty queue")
+        msg = self.inbound.pop(0)
+        if isinstance(msg, StateMsg):
+            # Advance the FakeClock for base-contract consistency, then BLOCK the
+            # calling thread on a real sleep. The real sleep is what releases the
+            # GIL so concurrent arena threads overlap their server-tick windows.
+            self._clock.advance(self._next_state_latency())
+            time.sleep(self._sleep_s)
+        return msg
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +628,14 @@ class BenchmarkReport:
         duration_actual_s: The measured wall-clock duration in seconds.
         n_arenas: Number of arenas driven in this run.
         transitions: Total ``step`` decisions completed across all arenas.
-        transitions_per_s_per_arena: Throughput per arena (decisions/wall-second).
+        transitions_per_s_aggregate: TOTAL throughput across all arenas
+            (total decisions / wall-elapsed). This is the figure that rises with
+            arena count when the concurrent driver overlaps the per-arena
+            server-tick waits; the per-arena field below is invariant to overlap
+            and cannot show the speedup.
+        transitions_per_s_per_arena: Throughput per arena (the aggregate divided by
+            ``n_arenas``). Kept exactly as defined before the concurrent driver so
+            live-AC4 / log consumers are unbroken.
         latency_ms: p50/p95/p99 (+ min/max/mean/count) round-trip latency, in ms.
         damage_boundary: Damage-event boundary cross-check
             (``hit_events`` / ``total_damage`` / ``windows`` / ``expected_hits`` /
@@ -564,6 +657,7 @@ class BenchmarkReport:
     duration_actual_s: float = 0.0
     n_arenas: int = 0
     transitions: int = 0
+    transitions_per_s_aggregate: float = 0.0
     transitions_per_s_per_arena: float = 0.0
     latency_ms: Dict[str, float] = field(default_factory=dict)
     damage_boundary: Dict[str, Any] = field(default_factory=dict)
@@ -581,6 +675,7 @@ class BenchmarkReport:
             "duration_actual_s": self.duration_actual_s,
             "n_arenas": self.n_arenas,
             "transitions": self.transitions,
+            "transitions_per_s_aggregate": self.transitions_per_s_aggregate,
             "transitions_per_s_per_arena": self.transitions_per_s_per_arena,
             "latency_ms": dict(self.latency_ms),
             "damage_boundary": dict(self.damage_boundary),
@@ -616,25 +711,40 @@ def run_benchmark(
     resource_sampler: Optional[ResourceSampler] = None,
     is_live: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    step_work: Optional[Callable[[int, StateMsg], None]] = None,
 ) -> BenchmarkReport:
-    """Drive ``n_arenas`` through the bridge and return a measured report.
+    """Drive ``n_arenas`` through the bridge CONCURRENTLY and return a report.
 
-    Each arena is driven round-robin: a ``step`` is sent, the matching ``state``
-    is awaited, and the round-trip latency (``clock`` after recv minus ``clock``
-    before send) is recorded. The loop runs until ``max_decisions`` total
-    decisions have completed (offline: a fixed budget) OR ``clock`` shows
-    ``duration_s`` has elapsed (live: the ≥10-minute sustained run), whichever
-    comes first; at least one decision per arena always runs.
+    Each arena runs in its OWN thread, executing the same raw
+    ``send(step)``/``recv()`` per-step loop the live bridge uses. The ``recv()``
+    blocks the calling thread for the full ~200 ms server-tick decision window
+    (the bridge aggregates over the ``ACTION_REPEAT`` window THEN replies), and a
+    blocking socket wait / ``time.sleep`` releases the GIL, so N arena threads
+    overlap their waits. That overlap is the whole point: the round-robin this
+    replaced sent then blocking-recv'd one arena at a time, so the per-arena waits
+    serialized and the aggregate transitions/s never rose with arena count.
 
-    Per-arena server TPS is read from each ``state`` via ``tps_provider`` (which
-    derives TPS from the ``tick`` deltas / a bridge-reported field); the offline
-    fake feeds a constant so the sustained-TPS detector can be asserted. Damage
-    events are tallied across the run for the boundary cross-check.
+    The round-trip latency (``clock`` after recv minus ``clock`` before send) is
+    recorded per step. Server TPS is read from each ``state`` via ``tps_provider``
+    (per arena, so a :class:`TickDeltaTpsProvider`'s per-arena baseline stays
+    correct). Damage events are tallied across all threads for the boundary
+    cross-check. The run stops when ``max_decisions`` TOTAL decisions have
+    completed across all arenas (offline: a fixed budget) OR ``clock`` shows
+    ``duration_s`` has elapsed (live: the ≥10-minute sustained run).
+
+    The global decision budget is split fairly: with ``max_decisions`` set, each
+    arena thread takes at most ``ceil(max_decisions / n_arenas)`` decisions, and a
+    shared atomic counter caps the TOTAL at exactly ``max_decisions`` — so the
+    summed wall-elapsed on a :class:`FakeClock` equals ``max_decisions`` charges
+    regardless of how the threads interleave, keeping the offline numbers
+    deterministic. In duration mode (``max_decisions is None``) each thread loops
+    until the wall-clock deadline.
 
     Args:
         transport_factory: ``arena_index -> BridgeTransport``. The benchmark calls
-            ``connect()`` on each transport and ``close()`` at the end.
-        n_arenas: Number of arenas to drive concurrently round-robin (>= 1).
+            ``connect()`` on each transport (in its arena thread) and ``close()``
+            at the end.
+        n_arenas: Number of arenas to drive concurrently, one thread each (>= 1).
         max_decisions: Total decisions to run across all arenas before stopping
             (``None`` runs until ``duration_s`` elapses — the live mode).
         duration_s: Wall-clock budget in seconds (the ≥10-min live run uses
@@ -650,11 +760,17 @@ def run_benchmark(
         expected_hits: Ground-truth N for the damage-boundary cross-check. When
             given, ``report.damage_boundary["ok"]`` asserts ``hit_events == N``.
         logger: Optional :class:`~eval.logging.MetricsLogger`; per-decision and
-            summary metrics are logged through it when provided.
+            summary metrics are logged through it when provided. Logger calls are
+            serialized under a lock since the logger is not thread-safe.
         resource_sampler: Optional :class:`ResourceSampler`; sampled once per
-            arena round. Defaults to a fresh one.
+            completed decision (under the lock). Defaults to a fresh one.
         is_live: Marks the report as a live (vs offline) run.
         log: Optional ``str -> None`` progress sink (``None`` silences it).
+        step_work: Optional ``(arena_index, state) -> None`` hook run per step
+            AFTER a valid ``state`` recv and OUTSIDE the shared lock, so injected
+            CPU work (e.g. a real :meth:`~agent.dqn.DuelingDRQN.act` forward)
+            contends for the GIL exactly as the live collector loop would. The
+            default (``None``) leaves the per-step path unchanged.
 
     Returns:
         A populated :class:`BenchmarkReport`.
@@ -662,6 +778,8 @@ def run_benchmark(
     Raises:
         ValueError: if ``n_arenas`` < 1, ``duration_s`` <= 0, or both
             ``max_decisions`` and a finite ``duration_s`` are non-positive.
+        BridgeError: if any arena thread receives a non-``state`` reply to a
+            ``step`` (re-raised in the calling thread after all threads join).
     """
     if n_arenas < 1:
         raise ValueError(f"n_arenas must be >= 1, got {n_arenas}")
@@ -679,37 +797,66 @@ def run_benchmark(
     if resource_sampler is None:
         resource_sampler = ResourceSampler()
 
-    # Build + connect one transport per arena. Each arena keeps its own decision
-    # action cycling deterministically through the macro indices so the run is
-    # reproducible and never sticks on a single macro.
-    transports: List[BridgeTransport] = []
-    for arena in range(n_arenas):
-        transport = transport_factory(arena)
-        transport.connect()
-        transports.append(transport)
-
-    states_seen: List[StateMsg] = []
-    latencies_s: List[float] = []
-    tps_samples: List[float] = []
-    transitions = 0
-    action_cycle = 0
-
     start = clock()
     deadline = start + duration_s
 
-    try:
-        while True:
-            # Stop conditions: hit the decision budget, or pass the wall-clock
-            # deadline. At least one full arena round always runs (checked at the
-            # bottom so the first round is never skipped).
-            if max_decisions is not None and transitions >= max_decisions:
-                break
+    # Per-arena fair share of the global decision budget. With max_decisions set,
+    # ceil(M/N) is the most any single arena ever ran under the old round-robin,
+    # and N*ceil(M/N) >= M always, so the shared counter (not the per-arena cap) is
+    # what binds the total to exactly M. In duration mode there is no per-arena cap;
+    # the wall-clock deadline stops each thread.
+    if max_decisions is not None:
+        per_arena_cap: Optional[int] = -(-int(max_decisions) // n_arenas)  # ceil
+    else:
+        per_arena_cap = None
 
-            for arena_idx, transport in enumerate(transports):
+    # Shared, lock-guarded state across the arena threads.
+    lock = threading.Lock()
+    claimed = 0  # total decisions claimed across all arenas (the global budget)
+    logged_step = 0  # monotonic per-decision logging index (logger is single-writer)
+
+    # Per-arena result slots. Each thread writes ONLY into its own slot, so the
+    # per-arena lists need no lock; they are combined after every thread joins.
+    arena_states: List[List[StateMsg]] = [[] for _ in range(n_arenas)]
+    arena_latencies: List[List[float]] = [[] for _ in range(n_arenas)]
+    arena_tps: List[List[float]] = [[] for _ in range(n_arenas)]
+    arena_errors: List[Optional[BaseException]] = [None for _ in range(n_arenas)]
+
+    def _claim_decision() -> bool:
+        """Atomically claim one slot of the global budget. True iff one was taken."""
+        nonlocal claimed
+        with lock:
+            if max_decisions is not None and claimed >= max_decisions:
+                return False
+            claimed += 1
+            return True
+
+    def _drive_arena(arena_idx: int, transport: BridgeTransport) -> None:
+        nonlocal logged_step
+        local_count = 0
+        action_cycle = arena_idx  # stagger the starting macro per arena
+        states = arena_states[arena_idx]
+        latencies = arena_latencies[arena_idx]
+        tps = arena_tps[arena_idx]
+        try:
+            transport.connect()
+            while True:
+                # Stop on the wall-clock deadline (covers duration mode and a
+                # budgeted run that must not overrun the duration cap).
+                if clock() >= deadline:
+                    break
+                # Stop once this arena has taken its fair per-arena share.
+                if per_arena_cap is not None and local_count >= per_arena_cap:
+                    break
+                # Claim a slot of the GLOBAL budget; stop if it is exhausted.
+                if not _claim_decision():
+                    break
+
                 action = action_cycle % 8  # cycle 0..7 over the 8 frozen macros
                 action_cycle += 1
 
-                # Measure the step -> state round-trip across the injected clock.
+                # Measure the step -> state round-trip OUTSIDE the lock so the
+                # blocking recv windows of the N arenas overlap.
                 t0 = clock()
                 transport.send({"type": "step", "action": action})
                 msg = transport.recv()
@@ -721,39 +868,71 @@ def run_benchmark(
                         f"{type(msg).__name__}"
                     )
 
+                # Injected per-step CPU work (a real act() forward in TC12). Run
+                # outside the lock so it contends for the GIL like the live loop.
+                if step_work is not None:
+                    step_work(arena_idx, msg)
+
                 latency = t1 - t0
-                latencies_s.append(latency)
-                states_seen.append(msg)
-                tps_samples.append(float(tps_provider(msg, arena=arena_idx)))
-                transitions += 1
+                latencies.append(latency)
+                states.append(msg)
+                # tps_provider keeps per-arena state; pass this arena's index.
+                arena_tps_value = float(tps_provider(msg, arena=arena_idx))
+                tps.append(arena_tps_value)
+                local_count += 1
 
-                if logger is not None:
-                    logger.log(
-                        {
-                            "round_trip_ms": latency * 1000.0,
-                            "server_tps": tps_samples[-1],
-                        },
-                        step=transitions,
-                    )
-
-                if max_decisions is not None and transitions >= max_decisions:
-                    break
-
-            resource_sampler.sample()
-
-            # Guard the wall-clock deadline. This covers both the live mode
-            # (max_decisions is None) and a budgeted run that must not overrun the
-            # duration cap, so one unconditional check suffices.
-            if clock() >= deadline:
-                break
-    finally:
-        for transport in transports:
+                # Logger + resource sampler are single-writer / not thread-safe, so
+                # serialize their use. Fast (no blocking), so overlap is unaffected.
+                with lock:
+                    logged_step += 1
+                    if logger is not None:
+                        logger.log(
+                            {
+                                "round_trip_ms": latency * 1000.0,
+                                "server_tps": arena_tps_value,
+                                "arena": arena_idx,
+                            },
+                            step=logged_step,
+                        )
+                    resource_sampler.sample()
+        except BaseException as exc:  # capture; re-raised in the main thread
+            arena_errors[arena_idx] = exc
+        finally:
             try:
                 transport.close()
             except (BridgeError, OSError):
                 pass
 
+    # One transport + one daemon thread per arena. Threads connect their own
+    # transport so connect()/recv()/close() never cross thread boundaries.
+    transports = [transport_factory(arena) for arena in range(n_arenas)]
+    threads = [
+        threading.Thread(
+            target=_drive_arena,
+            args=(arena_idx, transports[arena_idx]),
+            name=f"bench-arena-{arena_idx}",
+            daemon=True,
+        )
+        for arena_idx in range(n_arenas)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Surface the first worker error (if any) now that all threads have stopped.
+    for exc in arena_errors:
+        if exc is not None:
+            raise exc
+
     elapsed = max(clock() - start, 1e-9)  # guard divide-by-zero on a zero-cost fake
+
+    # Combine the per-arena slots. Order does not matter for the percentile /
+    # tally / min-TPS metrics, which are all order-independent aggregations.
+    states_seen: List[StateMsg] = [s for slot in arena_states for s in slot]
+    latencies_s: List[float] = [x for slot in arena_latencies for x in slot]
+    tps_samples: List[float] = [x for slot in arena_tps for x in slot]
+    transitions = len(states_seen)
 
     # --- assemble the report ------------------------------------------------
     report = BenchmarkReport(
@@ -764,11 +943,16 @@ def run_benchmark(
         is_live=bool(is_live),
     )
 
-    # transitions/s PER ARENA: total throughput divided by the arena count. Kept
-    # as a true float so a non-even arena division (e.g. 7 decisions / 3 arenas)
-    # reports the exact per-arena rate instead of a rounded one.
+    # transitions/s AGGREGATE: total decisions across ALL arenas over the wall
+    # elapsed. This is the figure that rises with arena count once the concurrent
+    # driver overlaps the per-arena server-tick waits (AC8).
+    report.transitions_per_s_aggregate = transitions_per_second(transitions, elapsed)
+
+    # transitions/s PER ARENA: the aggregate divided by the arena count. Kept as a
+    # true float (exact for a non-even division like 7 / 3) and defined EXACTLY as
+    # before the concurrent driver, so live-AC4 / log consumers are unbroken.
     report.transitions_per_s_per_arena = (
-        transitions_per_second(transitions, elapsed) / n_arenas
+        report.transitions_per_s_aggregate / n_arenas
     )
 
     report.latency_ms = latency_percentiles(latencies_s)
@@ -797,6 +981,7 @@ def run_benchmark(
         logger.summary(
             {
                 "transitions": report.transitions,
+                "transitions_per_s_aggregate": report.transitions_per_s_aggregate,
                 "transitions_per_s_per_arena": report.transitions_per_s_per_arena,
                 "p50_ms": report.latency_ms.get("p50_ms", 0.0),
                 "p95_ms": report.latency_ms.get("p95_ms", 0.0),
@@ -811,6 +996,7 @@ def run_benchmark(
 
     _emit(
         f"[bench] arenas={n_arenas} transitions={transitions} "
+        f"tps_agg={report.transitions_per_s_aggregate:.2f} "
         f"tps/arena={report.transitions_per_s_per_arena:.2f} "
         f"p99={report.latency_ms.get('p99_ms', 0.0):.1f}ms "
         f"min_tps={report.sustained_tps_min:.1f} "
