@@ -80,6 +80,8 @@ __all__ = [
     "M2Result",
     "train_vs_dummy",
     "run_m2",
+    "MultiArenaResult",
+    "train_multi_arena",
     "main",
 ]
 
@@ -1441,6 +1443,519 @@ def _close_quietly(env: Any) -> None:
         pass
 
 
+# ===========================================================================
+# T8 — the MULTI-ARENA training entrypoint (issue #4, Route 1 / Ape-X-lite).
+#
+# Engaged only when ``--arenas N`` with N > 1; N == 1 stays on today's exact
+# ``train_vs_dummy`` single-env path (byte-identical, AC1/TC15). This wires the
+# stack the other distributed tasks built:
+#
+#   one learner-side Trainer (its replay is the SINGLE shared buffer)
+#     + a WeightStore (learner publishes cloned snapshots; collectors read)
+#     + a LocalTransport (collectors push Episodes up; the learner drains them)
+#     + N SnapshotPolicy collectors, one per arena, each over its own MCPvPEnv
+#       on bridge port base+i (the N bridges/servers are started by the human;
+#       T8 only connects clients)
+#     + an ActorPool supervising the N collector daemons (relaunch via launcher)
+#     + a LearnerLoop on a background thread (the SOLE replay mutator)
+#
+# Periodic GREEDY eval runs on ONE designated arena (arena 0) via the collector
+# pause/handoff protocol: pause the designated collector at its episode boundary,
+# wait for it to park idle, BORROW its (idle) env/transport, run eval reusing the
+# single-connection ``_eval_against_dummy`` borrow, then resume. Eval opens NO new
+# connection on ANY arena — the bridge serves exactly one connection per arena (a
+# recorded gotcha that aborted a live run before).
+#
+# The orchestration is factored so a test can drive it with FAKE envs / a fake
+# transport / a fake launcher WITHOUT a live server: every collaborator is
+# injectable. The live CLI path (``main`` below) constructs the real components.
+# ===========================================================================
+
+
+@dataclass
+class MultiArenaResult:
+    """Outcome of a :func:`train_multi_arena` run (the N>1 sibling of M2Result).
+
+    Attributes:
+        trainer: The learner-side :class:`Trainer` after the run (online/target
+            nets, the single shared replay, grad-step count).
+        passed_m2: ``True`` iff the most recent designated-arena eval cleared the
+            full M2 gate (``win_rate >= 0.95`` AND ``aim_while_invisible == 0`` AND
+            ``mean_episode_length < timeout_cap``). ``False`` if no eval cleared it.
+        grad_steps: Gradient steps the learner completed before stopping.
+        episodes_received: Episodes the learner drained off the transport.
+        last_report: The most recent eval report (``None`` if no eval ran).
+        reports: Every eval report produced, in order.
+        stop_reason: One of ``"passed_m2"`` / ``"max_grad_steps"`` /
+            ``"max_episodes"`` / ``"learner_error"`` / ``"pool_aborted"``.
+        is_live: ``True`` for a real-bridge run, ``False`` for the offline proof.
+    """
+
+    trainer: "Trainer"
+    passed_m2: bool
+    grad_steps: int
+    episodes_received: int
+    last_report: Optional[Any] = None
+    reports: List[Any] = None  # type: ignore[assignment]  # set in __post_init__
+    stop_reason: str = "max_grad_steps"
+    is_live: bool = False
+
+    def __post_init__(self) -> None:
+        if self.reports is None:
+            self.reports = []
+
+
+#: ``arena_id -> (zero-arg env builder)``. The builder must return a FRESH,
+#: connected env bound to that arena's bridge (so a relaunch can rebuild a fresh
+#: client to the same single-connection bridge). The live path builds an
+#: ``MCPvPEnv`` over a ``TcpBridgeClient(host, base_port + arena_id)``; tests inject
+#: a factory returning a fake env.
+EnvFactoryFor = Callable[[int], Callable[[], "EnvProtocol"]]
+
+
+def _eval_via_designated_arena(
+    *,
+    trainer: "Trainer",
+    pool: Any,
+    designated_arena: int,
+    evaluate: Callable[..., Any],
+    policy_cls: Callable[..., Any],
+    n_episodes: int,
+    timeout_cap: int,
+    env_max_episode_steps: int,
+    eval_step_cap: Optional[int],
+    logger: Optional[Any],
+    is_live: bool,
+    base_seed: int,
+    log: Optional[Callable[[str], None]],
+    pause_timeout: float,
+) -> Optional[Any]:
+    """Run ONE greedy eval on the designated arena via the pause/handoff protocol.
+
+    Pauses the designated arena's collector at its next EPISODE BOUNDARY, waits for
+    it to confirm paused-and-idle (no reply in flight on its single bridge
+    connection), BORROWS its idle env's transport, runs the eval through
+    :func:`_eval_against_dummy` (which builds a separate ``MCPvPEnv`` with
+    ``auto_connect=False`` over that shared transport — never a second connection),
+    then resumes the collector. Eval opens NO connection on any OTHER arena; they
+    keep collecting throughout.
+
+    Returns the eval report, or ``None`` if the designated collector could not be
+    brought to an idle boundary within ``pause_timeout`` (e.g. it is mid-relaunch),
+    in which case eval is SKIPPED this cycle rather than risking a second connection.
+    """
+    collector = pool.collector_for(designated_arena)
+    if collector is None:
+        return None
+
+    collector.pause()
+    try:
+        # Block until the collector parks between episodes with its connection idle.
+        # If it cannot (mid-relaunch / dead), skip eval this cycle: borrowing a
+        # non-idle connection would race a reply, and opening a fresh one would steal
+        # the bridge's single connection.
+        if not collector.wait_until_idle(timeout=pause_timeout):
+            if log is not None:
+                log(
+                    f"[multi] eval skipped: designated arena {designated_arena} did "
+                    f"not reach an idle boundary within {pause_timeout:.1f}s"
+                )
+            return None
+
+        shared_env = collector.current_env()
+        if shared_env is None:
+            return None
+        shared_transport = getattr(shared_env, "_transport", None)
+        if shared_transport is None:
+            return None
+
+        return _eval_against_dummy(
+            trainer=trainer,
+            evaluate=evaluate,
+            policy_cls=policy_cls,
+            shared_transport=shared_transport,
+            n_episodes=n_episodes,
+            timeout_cap=timeout_cap,
+            env_max_episode_steps=env_max_episode_steps,
+            eval_step_cap=eval_step_cap,
+            logger=logger,
+            is_live=is_live,
+            base_seed=base_seed,
+            log=log,
+        )
+    finally:
+        # Always resume the collector, even if eval raised, so a single arena is
+        # never left parked forever.
+        collector.resume()
+
+
+def train_multi_arena(
+    cfg: TrainConfig,
+    *,
+    env_factory_for: EnvFactoryFor,
+    launcher: Optional[Any] = None,
+    transport: Optional[Any] = None,
+    weight_store: Optional[Any] = None,
+    counter: Optional[Any] = None,
+    max_episodes: Optional[int] = None,
+    max_grad_steps: Optional[int] = None,
+    eval_every_grad_steps: int = 1_000,
+    eval_episodes: int = 100,
+    designated_arena: int = 0,
+    timeout_cap: int = MAX_EPISODE_STEPS,
+    env_max_episode_steps: int = MAX_EPISODE_STEPS,
+    rollout_step_cap: Optional[int] = None,
+    stop_on_pass: bool = True,
+    device: Optional[torch.device] = None,
+    net_kwargs: Optional[Dict[str, int]] = None,
+    logger: Optional[Any] = None,
+    checkpoint_hook: Optional[CheckpointHook] = None,
+    is_live: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+    poll_interval: float = 0.05,
+    eval_pause_timeout: float = 120.0,
+    relaunch_backoff_seconds: Optional[float] = None,
+    relaunch_backoff_max_seconds: Optional[float] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    watchdog: Optional[Any] = None,
+) -> MultiArenaResult:
+    """Train one learner from ``cfg.arenas`` concurrent collectors (Ape-X-lite).
+
+    The N>1 path. One :class:`Trainer` owns the single shared replay (mutated ONLY
+    by the background :class:`~distributed.learner.LearnerLoop`); N
+    :class:`~distributed.weights.SnapshotPolicy` collectors act on periodically
+    synced weight snapshots and push whole :class:`~distributed.serialization.Episode`
+    objects onto a :class:`~distributed.transport.LocalTransport`. An
+    :class:`~distributed.actor.ActorPool` supervises the collector daemons (relaunch
+    via the injected ``launcher``); this function runs the learner on a background
+    thread and JOINS on the episode/grad-step budget or the M2 win-rate gate, then
+    stops everything cleanly. A LearnerLoop error or a pool abort surfaces loudly.
+
+    Everything external is INJECTABLE so the whole orchestration is offline-testable
+    with fakes (env factory, launcher, transport, store, counter, sleep, watchdog).
+    The live CLI path constructs the real components.
+
+    Determinism: each arena's per-episode seed is ``arena_episode_seed(cfg,
+    arena_id, local_ep)`` (its own ``torch.Generator`` inside the SnapshotPolicy);
+    the ε schedule advances off the GLOBAL episode counter (in the Collector); PER β
+    anneals off the learner's ``grad_step`` (inside ``trainer.learn()``). The MEAN ε
+    across arenas is logged (each arena carries its own ε under the global schedule).
+
+    Args:
+        cfg: Training hyperparameters. ``cfg.arenas`` (> 1) sets the collector count;
+            ``cfg.weight_sync_every_k_steps`` the publish cadence;
+            ``cfg.collector_queue_max`` the transport bound (0 == unbounded);
+            ``cfg.fault_relaunch`` / ``cfg.fault_min_live_arenas`` the fault policy.
+        env_factory_for: ``arena_id -> (zero-arg env builder)``; the builder returns a
+            fresh connected env on that arena's bridge (see :data:`EnvFactoryFor`).
+        launcher: The :class:`~distributed.actor.ArenaLauncher` the pool relaunches a
+            dead arena through. The live path lazily imports
+            :class:`~distributed.launcher.SubprocessArenaLauncher`; a test injects a
+            fake. Required (relaunch cannot be wired without it).
+        transport / weight_store / counter: Optional injected collaborators; the real
+            ones (``LocalTransport`` / ``WeightStore`` / ``GlobalEpisodeCounter``) are
+            built here when omitted.
+        max_episodes: Optional cap on episodes the LEARNER drains before stopping
+            (the episode budget); ``None`` relies on ``max_grad_steps``.
+        max_grad_steps: Optional cap on learner gradient steps (the compute budget);
+            ``None`` relies on ``max_episodes``. At least one budget should be set or
+            the run stops only on the gate / an abort.
+        eval_every_grad_steps: Run a designated-arena greedy eval each time the
+            learner crosses this many grad steps (``0`` disables periodic eval).
+            Indexed off the learner's grad step (not episodes) because the learner is
+            the single clock under N collectors.
+        eval_episodes: Episodes per greedy eval. AC6 uses 100; tests use a few.
+        designated_arena: The single arena eval pauses/borrows (default 0). Eval never
+            fans out across arenas.
+        timeout_cap / env_max_episode_steps / rollout_step_cap: Episode-length knobs,
+            forwarded to eval / the collectors (see ``train_vs_dummy``).
+        stop_on_pass: Stop as soon as an eval clears the M2 gate (default True).
+        device / net_kwargs: Forwarded to the learner :class:`Trainer` AND used to
+            build each collector's snapshot net (same architecture as the learner).
+        logger: Optional metrics logger (per-eval components + throughput).
+        checkpoint_hook: Optional ``(trainer, grad_step) -> None`` (save-best / final).
+        is_live: Marks reports/result as live vs offline.
+        log: Optional ASCII-only ``str -> None`` sink (Windows cp1252-safe).
+        poll_interval: Seconds between the driver's budget/health polls.
+        eval_pause_timeout: Max seconds to wait for the designated collector to park
+            idle before SKIPPING an eval cycle (an arena may be mid-relaunch).
+        relaunch_backoff_seconds / relaunch_backoff_max_seconds / sleep: Forwarded to
+            the ``ActorPool`` collectors (tests pass tiny / no-op values so no real
+            sleeping; ``None`` uses the actor module defaults).
+        watchdog: Optional :class:`~distributed.learner.LearnerWatchdog` for the
+            learner loop; ``None`` uses a default watchdog so a wedged learner aborts.
+
+    Returns:
+        A :class:`MultiArenaResult` with the trainer, the gate verdict, the grad-step
+        / received-episode counts, every eval report, and the stop reason.
+
+    Raises:
+        ValueError: if ``cfg.arenas`` < 2 (use ``train_vs_dummy`` for N=1), or
+            ``designated_arena`` is out of range, or ``eval_episodes`` <= 0.
+        LearnerError: if the background learner thread aborts (re-raised loudly).
+        PoolAbortedError: if live arenas drop below ``cfg.fault_min_live_arenas``.
+    """
+    import threading as _threading
+    import time
+
+    # Local imports keep the distributed stack off agent.train's import path until
+    # the N>1 branch actually runs (distributed.actor imports FROM agent.train, so a
+    # top-level import here would be a cycle).
+    from distributed.actor import ActorPool, GlobalEpisodeCounter, PoolAbortedError
+    from distributed.learner import LearnerLoop, LearnerWatchdog
+    from distributed.transport import LocalTransport
+    from distributed.weights import SnapshotPolicy, WeightStore
+
+    from agent.contract_config import code_version as _code_version
+    from agent.dqn import DuelingDRQN
+
+    if cfg.arenas < 2:
+        raise ValueError(
+            f"train_multi_arena requires cfg.arenas >= 2, got {cfg.arenas}; "
+            "use train_vs_dummy for the single-arena (N=1) path."
+        )
+    if not (0 <= designated_arena < cfg.arenas):
+        raise ValueError(
+            f"designated_arena {designated_arena} out of range [0, {cfg.arenas})"
+        )
+    if eval_episodes <= 0:
+        raise ValueError(f"eval_episodes must be > 0, got {eval_episodes}")
+    if eval_every_grad_steps < 0:
+        raise ValueError(
+            f"eval_every_grad_steps must be >= 0, got {eval_every_grad_steps}"
+        )
+
+    def _emit(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    # --- the single learner-side trainer (its replay is THE shared buffer) ---
+    net_kwargs = dict(net_kwargs or {})
+    trainer = Trainer(cfg, device=device, net_kwargs=net_kwargs)
+
+    # --- shared collaborators (build the real ones when not injected) --------
+    if transport is None:
+        # Bounded iff a positive cap is configured; else unbounded (today's behavior).
+        maxsize = cfg.collector_queue_max if cfg.collector_queue_max > 0 else 0
+        transport = LocalTransport(maxsize=maxsize)
+    if weight_store is None:
+        weight_store = WeightStore()
+    if counter is None:
+        counter = GlobalEpisodeCounter()
+    if launcher is None:
+        raise ValueError(
+            "train_multi_arena needs an ArenaLauncher (the pool relaunches a dead "
+            "arena through it). Pass launcher=SubprocessArenaLauncher(...) for the "
+            "live run, or a fake launcher in tests."
+        )
+
+    # --- per-arena snapshot policies (same net architecture as the learner) --
+    # Each collector owns its own net clone (built from the SAME net_kwargs so the
+    # learner's published state_dict load_state_dicts cleanly) and its own RNG seeded
+    # off the per-arena seed band, plus the arena/code-version stamp for the Episode.
+    code_ver = _code_version()
+
+    def _net_factory() -> Any:
+        return DuelingDRQN(**net_kwargs)
+
+    policies: Dict[int, Any] = {}
+
+    def _policy_for(arena_id: int) -> Any:
+        policy = policies.get(arena_id)
+        if policy is None:
+            policy = SnapshotPolicy(
+                _net_factory,
+                # The generator seed is the arena's local-episode-0 seed; the policy
+                # re-seeds per episode anyway, so this is just a distinct, reproducible
+                # starting point per arena.
+                generator_seed=arena_episode_seed(cfg, arena_id, 0),
+                arena_id=arena_id,
+                code_version=code_ver,
+            )
+            policies[arena_id] = policy
+        return policy
+
+    # --- the actor pool (N daemon collectors over the shared store/transport)
+    actor_kwargs: Dict[str, Any] = dict(
+        cfg=cfg,
+        env_factory_for=env_factory_for,
+        policy_for=_policy_for,
+        transport=transport,
+        weight_store=weight_store,
+        launcher=launcher,
+        counter=counter,
+        max_episode_steps=rollout_step_cap,
+    )
+    if relaunch_backoff_seconds is not None:
+        actor_kwargs["relaunch_backoff_seconds"] = relaunch_backoff_seconds
+    if relaunch_backoff_max_seconds is not None:
+        actor_kwargs["relaunch_backoff_max_seconds"] = relaunch_backoff_max_seconds
+    if sleep is not None:
+        actor_kwargs["sleep"] = sleep
+    pool = ActorPool.build(**actor_kwargs)
+
+    # --- the decoupled learner loop (the SOLE replay mutator) ----------------
+    if watchdog is None:
+        watchdog = LearnerWatchdog()
+    learner = LearnerLoop(
+        trainer,
+        transport,
+        weight_store,
+        cfg,
+        watchdog=watchdog,
+        log=log,
+    )
+    learner_thread = _threading.Thread(
+        target=learner.run, name="learner-loop", daemon=True
+    )
+
+    # --- eval wiring (lazy: keep the eval dependency at the call boundary) ----
+    reports: List[Any] = []
+    last_report: Optional[Any] = None
+    best_win_rate = -1.0
+    passed = False
+    stop_reason = "max_grad_steps"
+    do_eval = eval_every_grad_steps > 0
+    if do_eval:
+        from eval.evaluate import DRQNGreedyPolicy, evaluate
+    next_eval_at = eval_every_grad_steps  # first eval boundary (grad steps)
+
+    def _maybe_log_mean_epsilon(grad_step: int) -> None:
+        # The logged epsilon is per-arena under N collectors; log the MEAN across the
+        # arenas' current schedule positions (computed from the GLOBAL counter so it
+        # reflects the combined stream the schedule actually advanced over).
+        if logger is None:
+            return
+        # All arenas share the global episode counter, so they sit at (nearly) the
+        # same schedule point; the mean over the counter's value is the representative
+        # ε. We sample the schedule at the current global episode count.
+        global_eps = epsilon_for_episode(max(0, counter.value - 1), cfg)
+        logger.log({"train/epsilon_mean": float(global_eps)}, step=int(grad_step))
+
+    _emit(
+        f"[multi] starting {cfg.arenas} arenas - "
+        f"weight_sync_every_k={cfg.weight_sync_every_k_steps}, "
+        f"queue_max={cfg.collector_queue_max}, "
+        f"fault_min_live={cfg.fault_min_live_arenas}, "
+        + (
+            f"eval every {eval_every_grad_steps} grad steps on arena {designated_arena}"
+            if do_eval
+            else "eval disabled"
+        )
+    )
+
+    pool.start()
+    learner_thread.start()
+
+    try:
+        while True:
+            # --- learner liveness: a dead learner or a pool abort stops loudly ---
+            if learner.error is not None:
+                stop_reason = "learner_error"
+                break
+            if pool.aborted():
+                stop_reason = "pool_aborted"
+                break
+            if learner.stopped:
+                # The learner ended on its own (transport closed/drained or stop()).
+                stop_reason = "learner_stopped"
+                break
+
+            grad_step = int(trainer.grad_step)
+            received = int(learner.received)
+
+            # --- budget checks (the learner is the single clock) ----------------
+            if max_grad_steps is not None and grad_step >= max_grad_steps:
+                stop_reason = "max_grad_steps"
+                break
+            if max_episodes is not None and received >= max_episodes:
+                stop_reason = "max_episodes"
+                break
+
+            # --- periodic designated-arena eval via pause/handoff ---------------
+            if do_eval and grad_step >= next_eval_at:
+                _maybe_log_mean_epsilon(grad_step)
+                report = _eval_via_designated_arena(
+                    trainer=trainer,
+                    pool=pool,
+                    designated_arena=designated_arena,
+                    evaluate=evaluate,
+                    policy_cls=DRQNGreedyPolicy,
+                    n_episodes=eval_episodes,
+                    timeout_cap=timeout_cap,
+                    env_max_episode_steps=env_max_episode_steps,
+                    eval_step_cap=rollout_step_cap,
+                    logger=logger,
+                    is_live=is_live,
+                    base_seed=cfg.seed,
+                    log=log,
+                    pause_timeout=eval_pause_timeout,
+                )
+                # Advance the boundary past the CURRENT grad step so a long eval (the
+                # learner kept stepping during the borrow) does not immediately re-fire.
+                next_eval_at = int(trainer.grad_step) + eval_every_grad_steps
+
+                if report is not None:
+                    reports.append(report)
+                    last_report = report
+                    if report.win_rate > best_win_rate:
+                        best_win_rate = report.win_rate
+                        if checkpoint_hook is not None:
+                            checkpoint_hook(trainer, int(trainer.grad_step))
+                    _emit(
+                        f"[multi grad_step {int(trainer.grad_step)}] "
+                        f"win_rate={report.win_rate:.3f} "
+                        f"mean_len={report.mean_episode_length:.1f} "
+                        f"aim_invisible={report.aim_while_invisible:.3f} "
+                        f"passed_m2={report.passed_m2}"
+                    )
+                    if report.passed_m2 and stop_on_pass:
+                        passed = True
+                        stop_reason = "passed_m2"
+                        break
+
+            # Park briefly; the learner and collectors run on their own threads.
+            time.sleep(poll_interval)
+    finally:
+        # --- clean shutdown: stop collectors, close the channel, join learner ---
+        # Close the transport FIRST so the learner's blocking recv() wakes and the
+        # loop exits cleanly; then stop the pool (collectors wind down at their next
+        # boundary) and join the learner thread.
+        learner.stop()
+        try:
+            transport.close()
+        except Exception:  # noqa: BLE001 - teardown best-effort
+            pass
+        pool_abort_error: Optional[BaseException] = None
+        try:
+            pool.stop()
+        except PoolAbortedError as exc:
+            pool_abort_error = exc
+        learner_thread.join(timeout=5.0)
+
+    # --- surface a learner error or a pool abort LOUDLY ----------------------
+    if learner.error is not None:
+        # The learner stores and re-raises the ORIGINAL exception (a WatchdogError on
+        # a stalled drain, or any trainer/transport failure), so re-raise it verbatim
+        # rather than wrap it — the run must fail loudly, never train into the void.
+        _emit(f"[multi] learner aborted: {learner.error}")
+        raise learner.error
+    if pool_abort_error is not None:
+        _emit(f"[multi] pool aborted: {pool_abort_error}")
+        raise pool_abort_error
+
+    return MultiArenaResult(
+        trainer=trainer,
+        passed_m2=passed,
+        grad_steps=int(trainer.grad_step),
+        episodes_received=int(learner.received),
+        last_report=last_report,
+        reports=reports,
+        stop_reason=stop_reason,
+        is_live=bool(is_live),
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI — the LIVE M2 training run (AC6/TC13 prep), part of T20.
 #
@@ -1476,7 +1991,15 @@ def _build_parser() -> "Any":
     )
     parser.add_argument(
         "--eval-every-episodes", type=int, default=50,
-        help="run a greedy eval every N episodes (default: 50; 0 disables).",
+        help="single-arena (--arenas 1) only: run a greedy eval every N episodes "
+        "(default: 50; 0 disables).",
+    )
+    parser.add_argument(
+        "--eval-every-grad-steps", type=int, default=1_000,
+        help="multi-arena (--arenas >1) only: run a designated-arena greedy eval "
+        "every N learner gradient steps (default: 1000; 0 disables). The learner "
+        "is the single clock under N collectors, so eval is paced by grad steps "
+        "rather than episodes.",
     )
     parser.add_argument(
         "--eval-episodes", type=int, default=100,
@@ -1488,7 +2011,17 @@ def _build_parser() -> "Any":
     )
     parser.add_argument(
         "--port", type=int, default=5555,
-        help="bridge TCP port for the live run (default: 5555).",
+        help="bridge TCP port for the live run (default: 5555). For --arenas N "
+        "this is the BASE port: arena i connects to port + i.",
+    )
+    parser.add_argument(
+        "--arenas", type=int, default=1,
+        help="number of parallel Minecraft arenas to train from (default: 1). "
+        "1 == today's exact single-env path (no threading, no weight sync). "
+        ">1 engages the multi-arena ActorPool + decoupled learner: arena i "
+        "connects to bridge port (--port)+i. The N bridges/servers must already "
+        "be started (server/setup/start-arenas.ps1). This is the agent.train "
+        "TRAINING flag, distinct from eval.benchmark's measurement --arenas.",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -1519,12 +2052,17 @@ def _build_parser() -> "Any":
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point for the LIVE M2 training run (AC6/TC13), part of T20.
+    """CLI entry point for the LIVE training run (T20 single-arena / T8 multi-arena).
 
     Wires a real :class:`~env.mc_pvp_env.TcpBridgeClient` to the bridge, runs
     :func:`train_vs_dummy` to the M2 gate or the budget, logs through a
     :class:`~eval.logging.MetricsLogger`, optionally writes a final checkpoint
     (with the ``code_version`` stamp), and EXITS 0 iff the M2 gate passed.
+
+    Dispatch on ``--arenas``: ``1`` (the default) runs today's EXACT single-arena
+    path unchanged (byte-identical, AC1); ``> 1`` engages the multi-arena
+    :func:`train_multi_arena` stack (issue #4) over N bridge connections on
+    ``--port + i`` (the N bridges/servers must already be started by the human).
 
     Args:
         argv: Argument vector (defaults to ``sys.argv[1:]``).
@@ -1541,8 +2079,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = _build_parser().parse_args(argv)
 
-    # Honor the CLI seed by replacing it on the frozen config.
-    cfg = dataclasses.replace(TrainConfig(), seed=int(args.seed))
+    # Honor the CLI seed by replacing it on the frozen config. For N>1 also stamp the
+    # arena count onto the (frozen) config so the multi-arena stack reads it.
+    cfg = dataclasses.replace(
+        TrainConfig(), seed=int(args.seed), arenas=int(args.arenas)
+    )
 
     logger = MetricsLogger(
         run_name=args.run_name,
@@ -1550,6 +2091,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         config={
             "host": args.host,
             "port": args.port,
+            "arenas": args.arenas,
             "seed": args.seed,
             "max_episodes": args.max_episodes,
             "eval_episodes": args.eval_episodes,
@@ -1570,6 +2112,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             },
             checkpoint_path,
         )
+
+    # N>1 dispatches to the multi-arena live run; N=1 falls through to TODAY'S EXACT
+    # single-arena path below (untouched so M2/TC8b cannot regress, AC1/TC15).
+    if int(args.arenas) > 1:
+        try:
+            return _main_multi_arena(
+                args,
+                cfg,
+                logger=logger,
+                checkpoint_hook=_save_checkpoint if checkpoint_path else None,
+            )
+        finally:
+            logger.close()
 
     def _transport_factory() -> Any:
         return TcpBridgeClient(host=args.host, port=args.port)
@@ -1607,6 +2162,102 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    return 0 if result.passed_m2 else 1
+
+
+def _main_multi_arena(
+    args: Any,
+    cfg: TrainConfig,
+    *,
+    logger: Any,
+    checkpoint_hook: Optional[CheckpointHook],
+) -> int:
+    """Live multi-arena (N>1) run: wire real clients + the subprocess launcher.
+
+    Constructs, per arena ``i``, an env factory that opens a
+    :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port ``--port + i`` and wraps
+    it in an :class:`~env.mc_pvp_env.MCPvPEnv`, then runs :func:`train_multi_arena`.
+    The N bridges/servers must ALREADY be started by the human
+    (``server/setup/start-arenas.ps1``); T8 only connects clients. The
+    :class:`~distributed.launcher.SubprocessArenaLauncher` is imported lazily here so
+    the import is paid only on the N>1 path; if it is unavailable the run fails with a
+    clear message (the launcher is needed only to RELAUNCH a dead arena).
+
+    Returns the process exit code (0 == passed the M2 gate).
+    """
+    import sys
+
+    from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
+
+    base_port = int(args.port)
+    host = str(args.host)
+
+    def _env_factory_for(arena_id: int) -> Callable[[], Any]:
+        port = base_port + arena_id
+
+        def _build() -> Any:
+            # auto_connect=True (default): the collector treats a successful return as
+            # a working connection; a connect failure raises BridgeError into its
+            # recovery path. One TCP connection per arena (the wire has no arena id).
+            transport = TcpBridgeClient(host=host, port=port)
+            return MCPvPEnv(
+                transport=transport,
+                max_episode_steps=MAX_EPISODE_STEPS,
+            )
+
+        return _build
+
+    # The launcher is the only piece that cannot be exercised offline. Import it
+    # lazily and fail loudly (not silently) if it is missing — it is required to
+    # RELAUNCH a dead arena, which the pool may need mid-run.
+    try:
+        from distributed.launcher import SubprocessArenaLauncher
+    except Exception as exc:  # noqa: BLE001 - surface a missing launcher clearly.
+        print(
+            "[multi] FATAL: could not import distributed.launcher."
+            "SubprocessArenaLauncher "
+            f"({type(exc).__name__}: {exc}); it is required to relaunch a dead arena "
+            "in a multi-arena run. Aborting.",
+            file=sys.stderr,
+        )
+        return 1
+
+    launcher = SubprocessArenaLauncher(
+        bridge_base_port=base_port,
+    )
+
+    def _log(message: str) -> None:
+        # ASCII-only (Windows cp1252): escape any stray non-ASCII rather than risk a
+        # console encode crash mid-run (recorded gotcha).
+        safe = message.encode("ascii", "backslashreplace").decode("ascii")
+        print(safe, file=sys.stderr, flush=True)
+
+    result = train_multi_arena(
+        cfg,
+        env_factory_for=_env_factory_for,
+        launcher=launcher,
+        max_episodes=args.max_episodes,
+        max_grad_steps=args.max_grad_steps,
+        eval_every_grad_steps=args.eval_every_grad_steps,
+        eval_episodes=args.eval_episodes,
+        logger=logger,
+        checkpoint_hook=checkpoint_hook,
+        is_live=True,
+        log=_log,
+    )
+
+    report = result.last_report
+    _log(
+        f"[multi done] reason={result.stop_reason} "
+        f"episodes={result.episodes_received} grad_steps={result.grad_steps} "
+        f"passed_m2={result.passed_m2}"
+    )
+    if report is not None:
+        _log(
+            f"  last eval: win_rate={report.win_rate:.3f} "
+            f"mean_len={report.mean_episode_length:.1f} "
+            f"aim_invisible={report.aim_while_invisible:.3f}"
+        )
     return 0 if result.passed_m2 else 1
 
 

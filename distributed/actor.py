@@ -260,6 +260,19 @@ class Collector:
         self._alive: bool = True
         self._stop = threading.Event()
 
+        # Eval pause/handoff (T8). The DESIGNATED-arena collector parks at an EPISODE
+        # BOUNDARY when `_pause` is set so a periodic eval can BORROW its idle env /
+        # connection (the bridge serves exactly ONE connection — eval must never open
+        # a second one). `_paused_idle` is set by the collector ONLY once it has
+        # finished its current episode and is parked at the boundary (no reply in
+        # flight on the shared connection), so the eval routine can wait on it and
+        # then safely reuse `current_env()`. Clearing `_pause` (via :meth:`resume`)
+        # un-parks the loop. The pause is checked at the boundary, NEVER mid-episode,
+        # so an in-flight episode is never abandoned. All additive: a collector whose
+        # pause flag is never set behaves exactly as before.
+        self._pause = threading.Event()
+        self._paused_idle = threading.Event()
+
         # This arena's own episode index. LOCAL (not global): it drives the per-arena
         # deterministic seed so each arena's stream is independent and reproducible.
         self._local_ep: int = 0
@@ -310,6 +323,80 @@ class Collector:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    # -- eval pause / handoff (T8) -----------------------------------------
+    #
+    # A periodic eval in multi-arena mode runs on exactly ONE designated arena and
+    # must never open a second connection on ANY arena (the bridge serves one). The
+    # protocol: the eval driver calls :meth:`pause`, then :meth:`wait_until_idle` to
+    # block until this collector has finished its current episode and parked at the
+    # boundary (``paused_idle`` set, so nothing is in flight on the shared socket),
+    # then BORROWS :meth:`current_env`'s transport (an ``MCPvPEnv`` built with
+    # ``auto_connect=False`` over it — the same idle-connection borrow the single-
+    # arena ``_eval_against_dummy`` uses), runs the greedy eval, and finally calls
+    # :meth:`resume`. Other arenas keep collecting throughout.
+
+    def pause(self) -> None:
+        """Request this collector park at the next EPISODE BOUNDARY (idempotent).
+
+        Does NOT interrupt an in-flight episode: the loop checks the flag only
+        between episodes, so a paused-and-idle collector has no reply in flight on
+        its single bridge connection and the eval can safely borrow it.
+        """
+        self._paused_idle.clear()
+        self._pause.set()
+
+    def resume(self) -> None:
+        """Clear the pause so the collector resumes its rollout loop (idempotent)."""
+        self._paused_idle.clear()
+        self._pause.clear()
+
+    def wait_until_idle(self, timeout: Optional[float] = None) -> bool:
+        """Block until the collector confirms it is paused-and-idle at a boundary.
+
+        Returns ``True`` once the collector has parked between episodes with its
+        connection idle (so :meth:`current_env` is safe to borrow), or ``False`` if
+        ``timeout`` elapsed first. Call only after :meth:`pause`.
+        """
+        return self._paused_idle.wait(timeout=timeout)
+
+    @property
+    def paused_idle(self) -> bool:
+        """True while the collector is parked at a boundary with an idle connection."""
+        return self._paused_idle.is_set()
+
+    def current_env(self) -> Optional[EnvProtocol]:
+        """Return the collector's live env (or ``None`` if it holds none yet).
+
+        Used by the eval driver to BORROW the idle env's shared transport while this
+        collector is paused-and-idle. The borrower must NOT close it or send
+        ``close`` (the collector still owns the connection and resumes on it).
+        """
+        return self._env
+
+    def _wait_while_paused(self) -> None:
+        """Park at the episode boundary while pause is requested (stop-interruptible).
+
+        Marks the collector paused-and-idle (so :meth:`wait_until_idle` unblocks the
+        eval driver), then waits on the pause flag clearing or a stop. The connection
+        is genuinely idle here: the previous episode's last ``step`` already received
+        its ``state`` reply and no new wire I/O happens while parked, so the eval can
+        borrow the transport without racing a reply. Clears the idle flag on the way
+        out so a later borrow can never reuse a stale confirmation.
+        """
+        if not self._pause.is_set():
+            return
+        # Confirm parked-and-idle for the eval driver, then wait for resume()/stop.
+        self._paused_idle.set()
+        try:
+            while self._pause.is_set() and not self._stop.is_set():
+                # Short, interruptible wait so resume()/stop() wake us promptly without
+                # busy-spinning.
+                self._stop.wait(timeout=0.01)
+        finally:
+            # Once unpaused (or stopping) we are about to do wire I/O again, so we are
+            # no longer idle-for-borrow. Clear before the next episode.
+            self._paused_idle.clear()
+
     # -- the rollout loop --------------------------------------------------
 
     def run(self) -> None:
@@ -332,6 +419,13 @@ class Collector:
                 return
 
         while not self._stop.is_set():
+            # Eval pause/handoff boundary (T8): if a periodic eval has requested this
+            # (designated) arena pause, park HERE — between episodes — so the eval can
+            # borrow the idle env/connection. Checked only at the boundary, so an
+            # in-flight episode is never abandoned. A no-op when pause is never set.
+            self._wait_while_paused()
+            if self._stop.is_set():
+                return
             try:
                 self._collect_one()
             except BridgeError:
@@ -624,6 +718,18 @@ class ActorPool:
         """Number of arenas currently holding a working connection."""
         with self._lock:
             return sum(1 for alive in self._live.values() if alive)
+
+    def collector_for(self, arena_id: int) -> Optional[Collector]:
+        """Return the supervised :class:`Collector` for ``arena_id`` (or ``None``).
+
+        Used by the eval pause/handoff driver (T8) to pause exactly ONE designated
+        arena and borrow its idle env/transport for a greedy eval. Read-only access
+        to a supervised collector; does not alter pool state.
+        """
+        for collector in self._collectors:
+            if collector.arena_id == arena_id:
+                return collector
+        return None
 
     # -- lifecycle ---------------------------------------------------------
 
