@@ -146,6 +146,18 @@ class SnapshotPolicy:
     invokes it at EPISODE BOUNDARIES so a whole episode's LSTM trajectory comes from
     one coherent weight set (protects the learner's R2D2 recurrence gate, TC8b).
 
+    RolloutPolicy reconciliation (T7): the free ``agent.train.collect_episode`` rolls
+    against the ``RolloutPolicy`` protocol, which needs more than :meth:`act` — it
+    needs :meth:`reseed` and :meth:`init_hidden` plus three Episode-stamp attributes
+    (``arena_id``, ``policy_version``, ``code_version``). Those are provided here so a
+    single :class:`SnapshotPolicy` is the distributed collector's policy AND a
+    structural ``RolloutPolicy``. The stamp matters because a collected
+    :class:`~distributed.serialization.Episode` records WHICH snapshot it acted under:
+    ``policy_version`` tracks the :class:`WeightStore` version currently loaded (it is
+    updated alongside ``version`` inside :meth:`maybe_refresh`), so an episode is
+    stamped with the exact snapshot generation that produced it — the learner can then
+    reason about off-policy staleness.
+
     Args:
         net_factory: Zero-arg callable returning a fresh net (the clone the policy
             owns). Must return a net with the ``DuelingDRQN`` inference surface:
@@ -154,14 +166,31 @@ class SnapshotPolicy:
         generator_seed: Seed for this policy's private ``torch.Generator`` (the
             per-arena ε-greedy stream). The caller picks a per-collector seed so
             arenas explore differently yet reproducibly.
+        arena_id: 0-based index of the arena this policy collects for. Stamped onto
+            every collected Episode; defaults to ``0`` for the single-arena case.
+        code_version: Train/serve build stamp copied onto every collected Episode so
+            the learner can guard against actor/learner skew. Defaults to ``""`` (no
+            skew guard); production passes :func:`agent.contract_config.code_version`.
 
     Attributes:
         net: The owned net clone (CPU, ``.eval()``).
         version: The :class:`WeightStore` version currently loaded into the clone;
             ``-1`` until the first successful :meth:`maybe_refresh`.
+        arena_id: The arena index stamped onto collected episodes.
+        policy_version: Alias of ``version`` for the ``RolloutPolicy`` protocol — the
+            snapshot generation episodes are stamped with; ``-1`` until the first
+            successful :meth:`maybe_refresh`.
+        code_version: The build stamp copied onto collected episodes.
     """
 
-    def __init__(self, net_factory: NetFactory, generator_seed: int) -> None:
+    def __init__(
+        self,
+        net_factory: NetFactory,
+        generator_seed: int,
+        *,
+        arena_id: int = 0,
+        code_version: str = "",
+    ) -> None:
         # CPU only: the dev box has a CPU-only torch wheel and the learner publishes
         # CPU clones, so the clone, its generator, and every obs tensor stay on CPU.
         self._device = torch.device("cpu")
@@ -178,6 +207,14 @@ class SnapshotPolicy:
 
         # No snapshot loaded yet; the first store version (>= 0) always advances.
         self.version: int = -1
+
+        # RolloutPolicy Episode-stamp metadata. arena_id/code_version are fixed at
+        # construction; policy_version mirrors ``version`` (the loaded snapshot
+        # generation) and is updated in maybe_refresh so a stamped Episode names the
+        # exact snapshot it acted under.
+        self.arena_id: int = int(arena_id)
+        self.code_version: str = str(code_version)
+        self.policy_version: int = -1
 
     def maybe_refresh(self, store: WeightStore) -> None:
         """Reload the clone from ``store`` iff a newer version was published.
@@ -204,6 +241,40 @@ class SnapshotPolicy:
         # untouched. Strict=True catches any architecture mismatch loudly.
         self.net.load_state_dict(state_dict)
         self.version = version
+        # Keep the RolloutPolicy stamp in lockstep with the loaded snapshot so an
+        # Episode collected after this refresh is stamped with the version it acted
+        # under. This is purely additive — the reload gating above is unchanged.
+        self.policy_version = version
+
+    def reseed(self, episode_seed: int) -> None:
+        """Re-seed the private ε-greedy generator for the start of an episode.
+
+        The ``RolloutPolicy`` contract: ``collect_episode`` calls this once at the
+        episode boundary so the exploration stream is deterministic and replayable
+        per ``(arena, episode)`` seed. Reseeding the policy's OWN generator (never a
+        shared one) keeps the rollout hot path lock-free, and seeding on the episode
+        boundary — not per step — is the documented ε-decay gotcha (a per-step reseed
+        would freeze exploration). The clone's weights are untouched here; only the
+        action RNG is reset.
+
+        Args:
+            episode_seed: The per-episode seed (the caller derives it via
+                ``agent.train.arena_episode_seed`` from this policy's ``arena_id``).
+        """
+        self._generator.manual_seed(int(episode_seed))
+
+    def init_hidden(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the clone's zeroed single-sequence LSTM hidden ``(h0, c0)``.
+
+        The ``RolloutPolicy`` contract: ``collect_episode`` seeds the carried LSTM
+        state from this at the start of each episode. Batch is fixed at 1 (one
+        sequence per rollout) and the state lands on the policy's CPU device so it
+        matches the clone's weights.
+
+        Returns:
+            The ``(h0, c0)`` pair, each of shape ``(lstm_layers, 1, lstm_hidden)``.
+        """
+        return self.net.init_hidden(1, device=self._device)
 
     @torch.no_grad()
     def act(
