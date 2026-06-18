@@ -65,12 +65,17 @@ from agent.progress import ProgressReporter, progress_metrics
 from agent.replay import PrioritizedSequenceReplay, SequenceBatch
 from agent.seeding import seed_everything
 from agent.train_config import TrainConfig
+from distributed.serialization import Episode
 
 __all__ = [
     "EnvProtocol",
+    "RolloutPolicy",
     "Trainer",
     "train",
     "epsilon_for_episode",
+    "arena_episode_seed",
+    "collect_episode",
+    "hidden_snapshot",
     "LearnStats",
     "M2Result",
     "train_vs_dummy",
@@ -165,8 +170,283 @@ def epsilon_for_episode(episode: int, cfg: TrainConfig) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Per-arena seed scheme — deterministic and collision-free across arenas.
+# ---------------------------------------------------------------------------
+
+
+def arena_episode_seed(cfg: TrainConfig, arena_id: int, local_ep: int) -> int:
+    """Return the deterministic per-episode seed for one arena's local episode.
+
+    The scheme is ``cfg.seed + arena_id * cfg.seed_stride + local_ep``. Each arena
+    owns a contiguous block of ``cfg.seed_stride`` seeds (the stride is large
+    enough that no two arenas ever collide for any realistic episode count), so
+    distinct arenas draw statistically independent episode streams while a given
+    ``(arena_id, local_ep)`` always reproduces the same env reset and action RNG.
+
+    For the single-arena path (``arena_id == 0``, ``local_ep == episode_index``)
+    this reduces to ``cfg.seed + episode_index`` — exactly the seed the original
+    single-arena rollout used, so N=1 stays byte-identical.
+
+    Args:
+        cfg: The training config (supplies ``seed`` and ``seed_stride``).
+        arena_id: 0-based arena index.
+        local_ep: 0-based episode index local to that arena.
+
+    Returns:
+        The integer seed to hand to both ``env.reset`` and the action RNG.
+    """
+    return int(cfg.seed) + int(arena_id) * int(cfg.seed_stride) + int(local_ep)
+
+
+# ---------------------------------------------------------------------------
+# Reentrant rollout — the actor-side collection path (shared by N=1 and N>1).
+#
+# ``collect_episode`` below is a FREE function with NO writes to any shared
+# learner state: ε and the per-episode seed are passed in, and it returns an
+# immutable :class:`~distributed.serialization.Episode` instead of touching a
+# replay buffer or an episode counter. The single-arena ``Trainer.collect_episode``
+# wrapper derives the same ε/seed the original loop did and re-adds the replay
+# write, so its observable behavior is unchanged.
+# ---------------------------------------------------------------------------
+
+
+class RolloutPolicy(Protocol):
+    """The minimal acting surface :func:`collect_episode` rolls out against.
+
+    Both the one-shot adapter the single-arena wrapper builds around
+    ``Trainer.online`` and the distributed ``SnapshotPolicy`` (T7 reconciles the
+    latter to this contract) satisfy it. The free rollout depends ONLY on this
+    surface, never on any concrete net or trainer attribute.
+
+    The three Episode-stamp attributes describe the snapshot the policy is acting
+    under; ``collect_episode`` copies them verbatim onto the returned Episode.
+
+    Attributes:
+        arena_id: Which arena this policy collects for (0-based).
+        policy_version: Weight-snapshot version the policy is acting under.
+        code_version: Train/serve build stamp for the actor/learner skew guard.
+    """
+
+    arena_id: int
+    policy_version: int
+    code_version: str
+
+    def reseed(self, episode_seed: int) -> None:
+        """Re-seed the policy's action RNG for the start of this episode."""
+        ...
+
+    def init_hidden(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the initial LSTM ``(h, c)`` hidden state for a single sequence."""
+        ...
+
+    def act(
+        self,
+        obs: torch.Tensor,
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+        epsilon: float,
+    ) -> Tuple[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """Select one action (no grad) and return ``(action, new_hidden)``."""
+        ...
+
+
+def hidden_snapshot(hidden: Tuple[torch.Tensor, torch.Tensor]) -> np.ndarray:
+    """Snapshot an LSTM ``(h, c)`` pair for the current single-sequence step.
+
+    Returns a contiguous ``float32`` array of shape
+    ``(2, num_layers, lstm_hidden)`` (the (h, c) pair) detached to NumPy. The
+    batch axis (== 1 during rollout) is squeezed and h/c are stacked on a new
+    leading axis. This is net-agnostic — it only reshapes the carried state — so
+    the free rollout can snapshot without going back through the policy. It is the
+    exact arithmetic ``Trainer._hidden_snapshot`` performs.
+
+    Args:
+        hidden: The current LSTM ``(h, c)`` tuple, each ``(num_layers, 1, hidden)``.
+
+    Returns:
+        ``float32`` array of shape ``(2, num_layers, lstm_hidden)``.
+    """
+    h, c = hidden
+    # Drop the batch axis (== 1 during rollout) and stack h/c on a new axis 0.
+    h_np = h.detach().squeeze(1).cpu().numpy()  # (num_layers, lstm_hidden)
+    c_np = c.detach().squeeze(1).cpu().numpy()  # (num_layers, lstm_hidden)
+    return np.stack((h_np, c_np), axis=0).astype(np.float32)
+
+
+def collect_episode(
+    env: EnvProtocol,
+    policy: RolloutPolicy,
+    *,
+    max_steps: Optional[int],
+    episode_index: int,
+    epsilon: float,
+    episode_seed: int,
+) -> Episode:
+    """Roll ONE episode against ``env`` with ``policy`` and return it as an Episode.
+
+    Reentrant and side-effect-free with respect to any shared learner state: it
+    writes nothing to a replay buffer, bumps no episode counter, and records no ε.
+    ε and the per-episode seed are PASSED IN (so the caller owns the schedule and
+    the per-arena seed scheme), and the collected episode is returned by value for
+    the caller / learner to enqueue or store. The Episode's ``arena_id`` /
+    ``policy_version`` / ``code_version`` are copied from ``policy``.
+
+    The rollout mirrors the original single-arena loop exactly: reseed the action
+    RNG and the env from ``episode_seed``, init the LSTM hidden, then for each
+    decision snapshot the hidden state SEEN by this step (for R2D2 burn-in
+    seeding), pick an action under ε with the policy's own RNG, step the env, and
+    append the ``(obs, action, reward, next_obs, done)`` 5-tuple plus the snapshot.
+
+    Putting the net into eval mode for the rollout (and restoring its prior mode)
+    is the POLICY's responsibility, not this function's: the single-arena wrapper
+    toggles ``self.online.eval()`` / ``train()`` around the call so the action
+    stream stays byte-identical, and the distributed snapshot policy is always in
+    eval mode.
+
+    Args:
+        env: The environment to roll out against (real or fake).
+        policy: The acting surface (see :class:`RolloutPolicy`).
+        max_steps: Optional hard cap on decisions this episode (defence against a
+            fake env that never terminates). ``None`` relies on the env's own
+            termination.
+        episode_index: The episode index used to reset the env (forwarded to
+            ``env.reset(seed=episode_seed)`` semantics; kept explicit so the caller
+            owns numbering). Currently informational for callers / logging.
+        epsilon: The ε-greedy rate to act under for the whole episode (flat within
+            an episode, per the per-EPISODE schedule).
+        episode_seed: Deterministic seed for BOTH the env reset and the policy's
+            action RNG, so the exploration stream is replayable.
+
+    Returns:
+        An immutable :class:`~distributed.serialization.Episode` whose
+        ``transitions`` / ``hidden_states`` are built exactly as the original loop
+        built them (same dtypes, shapes, and tuple structure) and whose
+        ``total_reward`` is the summed per-step reward.
+    """
+    # ``episode_index`` is accepted to keep episode numbering an explicit caller
+    # responsibility (and for future per-arena logging); the deterministic stream
+    # is fully pinned by ``episode_seed``, which the caller derives from it.
+    del episode_index
+
+    # Deterministic per-episode seeds: reseed the env reset and the policy's action
+    # RNG so the exploration stream is replayable (reseed on the episode boundary,
+    # not per step — the documented gotcha).
+    policy.reseed(episode_seed)
+    obs = env.reset(seed=episode_seed)
+    hidden = policy.init_hidden()
+
+    transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
+    hidden_states: List[np.ndarray] = []
+
+    total_reward = 0.0
+    done = False
+    steps = 0
+    while not done:
+        # Capture the hidden state SEEN by this step (the LSTM state that produced
+        # the action), stacked (num_layers, hidden) for burn-in seeding by the
+        # replay buffer.
+        snapshot = hidden_snapshot(hidden)
+
+        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=_policy_device(hidden))
+        action, hidden = policy.act(obs_tensor, hidden, epsilon)
+
+        next_obs, reward, done, _info = env.step(action)
+
+        transitions.append(
+            (
+                np.asarray(obs, dtype=np.float32),
+                int(action),
+                float(reward),
+                np.asarray(next_obs, dtype=np.float32),
+                bool(done),
+            )
+        )
+        hidden_states.append(snapshot)
+
+        total_reward += float(reward)
+        obs = next_obs
+        steps += 1
+        if max_steps is not None and steps >= max_steps:
+            break
+
+    return Episode(
+        transitions=transitions,
+        hidden_states=hidden_states,
+        arena_id=int(policy.arena_id),
+        policy_version=int(policy.policy_version),
+        code_version=str(policy.code_version),
+        total_reward=total_reward,
+    )
+
+
+def _policy_device(hidden: Tuple[torch.Tensor, torch.Tensor]) -> torch.device:
+    """Device the observation tensor should live on for a rollout step.
+
+    Read off the carried LSTM hidden state so the free rollout never needs to know
+    the policy's device directly. The original loop built ``obs_tensor`` on the
+    trainer's device, which is the same device ``init_hidden`` placed the hidden
+    state on, so this is byte-identical for the single-arena path.
+    """
+    return hidden[0].device
+
+
+# ---------------------------------------------------------------------------
 # The trainer.
 # ---------------------------------------------------------------------------
+
+
+class _TrainerOnlinePolicy:
+    """One-shot :class:`RolloutPolicy` adapter over a Trainer's online net.
+
+    Binds the free :func:`collect_episode` to a single ``DuelingDRQN`` and the
+    trainer's per-episode action ``torch.Generator``. It is intentionally inert on
+    the Episode-stamp metadata: for the single-arena path the arena id, policy
+    version, and code version do not affect what lands in the replay buffer (the
+    learner reads ``transitions`` / ``hidden_states`` only), so they are pinned to
+    neutral constants and never participate in N=1 reproduction.
+
+    The eval/train mode toggle around the rollout lives in the caller
+    (:meth:`Trainer.collect_episode`), not here, so this adapter does not change
+    the net's mode itself.
+    """
+
+    #: N=1 has a single arena; the stamp is inert for replay storage.
+    arena_id: int = 0
+    #: N=1 has no weight-snapshot versioning; inert for replay storage.
+    policy_version: int = 0
+    #: N=1 never crosses an actor/learner build boundary; inert for replay storage.
+    code_version: str = ""
+
+    def __init__(
+        self,
+        net: DuelingDRQN,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> None:
+        self._net = net
+        self._generator = generator
+        self._device = device
+
+    def reseed(self, episode_seed: int) -> None:
+        """Re-seed the shared action generator for this episode."""
+        self._generator.manual_seed(int(episode_seed))
+
+    def init_hidden(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the online net's zeroed single-sequence LSTM hidden state."""
+        return self._net.init_hidden(1, device=self._device)
+
+    def act(
+        self,
+        obs: torch.Tensor,
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+        epsilon: float,
+    ) -> Tuple[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """Select one action via the online net using the shared action RNG."""
+        return self._net.act(
+            obs,
+            hidden,
+            epsilon=epsilon,
+            generator=self._generator,
+        )
 
 
 class Trainer:
@@ -274,67 +554,43 @@ class Trainer:
         epsilon = epsilon_for_episode(episode_index, self.cfg)
         self.last_epsilon = epsilon
 
-        # Deterministic per-episode seeds for the env reset and the ε RNG so the
-        # exploration stream is replayable (the gotcha fix: reseed on the episode
-        # boundary, not per step).
-        episode_seed = self.cfg.seed + episode_index
-        self._action_generator.manual_seed(episode_seed)
+        # Deterministic per-episode seed for the env reset and the action RNG so
+        # the exploration stream is replayable (the gotcha fix: reseed on the
+        # episode boundary, not per step). For N=1 (arena 0, local_ep ==
+        # episode_index) this is exactly ``cfg.seed + episode_index``.
+        episode_seed = arena_episode_seed(self.cfg, arena_id=0, local_ep=episode_index)
 
-        obs = env.reset(seed=episode_seed)
-        hidden = self.online.init_hidden(1, device=self.device)
+        # One-shot adapter binding the free rollout to this trainer's online net
+        # and its per-episode action generator. The eval-mode toggle stays HERE so
+        # the inference-mode action stream is byte-identical to the original loop:
+        # ``self.online.act`` short-circuits the RNG when ε == 0, so both the
+        # generator reseed and the eval/train mode must match exactly.
+        adapter = _TrainerOnlinePolicy(self.online, self._action_generator, self.device)
 
-        transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
-        hidden_states: List[np.ndarray] = []
-
-        total_reward = 0.0
-        done = False
-        steps = 0
         was_training = self.online.training
         self.online.eval()  # inference mode for action selection
         try:
-            while not done:
-                # Capture the hidden state SEEN by this step (the LSTM state that
-                # produced the action), stacked (num_layers, hidden) for burn-in
-                # seeding by the replay buffer.
-                hidden_snapshot = self._hidden_snapshot(hidden)
-
-                obs_tensor = torch.as_tensor(
-                    obs, dtype=torch.float32, device=self.device
-                )
-                action, hidden = self.online.act(
-                    obs_tensor,
-                    hidden,
-                    epsilon=epsilon,
-                    generator=self._action_generator,
-                )
-
-                next_obs, reward, done, _info = env.step(action)
-
-                transitions.append(
-                    (
-                        np.asarray(obs, dtype=np.float32),
-                        int(action),
-                        float(reward),
-                        np.asarray(next_obs, dtype=np.float32),
-                        bool(done),
-                    )
-                )
-                hidden_states.append(hidden_snapshot)
-
-                total_reward += float(reward)
-                obs = next_obs
-                steps += 1
-                if max_steps is not None and steps >= max_steps:
-                    break
+            episode = collect_episode(
+                env,
+                adapter,
+                max_steps=max_steps,
+                episode_index=episode_index,
+                epsilon=epsilon,
+                episode_seed=episode_seed,
+            )
         finally:
             if was_training:
                 self.online.train()
 
-        if transitions:
-            self.replay.add_episode(transitions, hidden_states=hidden_states)
+        # Re-add the original direct replay write (the free rollout deliberately
+        # leaves storage to the caller). Guard on a non-empty episode as before.
+        if episode.transitions:
+            self.replay.add_episode(
+                episode.transitions, hidden_states=episode.hidden_states
+            )
 
         self.episode_count += 1
-        return len(transitions), total_reward
+        return len(episode.transitions), episode.total_reward
 
     def _hidden_snapshot(self, hidden: Tuple[torch.Tensor, torch.Tensor]) -> np.ndarray:
         """Snapshot the LSTM ``(h, c)`` for the current single-sequence step.
