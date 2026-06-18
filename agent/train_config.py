@@ -178,6 +178,43 @@ class TrainConfig:
     #: TUNE — gradient steps between log hook invocations. 0 disables.
     log_interval: int = 100
 
+    # -- multi-arena / distributed (issue #4) --------------------------------
+    #: Number of parallel Minecraft arena processes. 1 == today's single-env
+    #: path (no threading, no weight sync, no fault handling — all overhead
+    #: below is a no-op at this value). Set > 1 to engage the ActorPool (T7).
+    arenas: int = 1
+
+    #: Learner grad steps between weight-snapshot pushes to the collectors.
+    #: A snapshot is a cheap state-dict copy; 50 steps keeps collectors within
+    #: ~50 updates of the learner without hammering serialization. Only read
+    #: when ``arenas > 1``; ignored in single-arena mode. TUNE 20–100.
+    weight_sync_every_k_steps: int = 50
+
+    #: When True, the ActorPool attempts a background relaunch of an arena
+    #: process that died mid-run (network drop, JVM crash, etc.). Only read
+    #: when ``arenas > 1``. Set False to surface arena failures immediately
+    #: instead of masking them with retries.
+    fault_relaunch: bool = True
+
+    #: Minimum number of live arenas required to keep the run going. If live
+    #: arenas drop below this floor (after relaunch attempts are exhausted),
+    #: the training loop aborts. 1 means the run continues as long as at least
+    #: one arena is alive. Only read when ``arenas > 1``.
+    fault_min_live_arenas: int = 1
+
+    #: Max items in the inter-thread experience queue that collectors push to
+    #: and the learner pops from. 0 == unbounded ``queue.Queue`` (no
+    #: backpressure). A positive value caps memory and applies backpressure to
+    #: fast collectors, at the cost of potential collector stalls. Only read
+    #: when ``arenas > 1``; ignored in single-arena mode. TUNE 0–1000.
+    collector_queue_max: int = 0
+
+    #: Per-arena RNG seed offset. Arena ``i`` receives seed ``seed + i *
+    #: seed_stride``, keeping episodes across arenas statistically independent
+    #: even when ``seed`` is small. 1_000_000 gives each arena a
+    #: million-episode independent band. Only read when ``arenas > 1``.
+    seed_stride: int = 1_000_000
+
     def __post_init__(self) -> None:
         """Validate the hyperparameters so a misconfigured run fails loudly.
 
@@ -246,3 +283,20 @@ class TrainConfig:
             )
         if self.log_interval < 0:
             raise ValueError(f"log_interval must be >= 0, got {self.log_interval}")
+        if self.arenas < 1:
+            raise ValueError(f"arenas must be >= 1, got {self.arenas}")
+        if self.weight_sync_every_k_steps < 1:
+            raise ValueError(
+                f"weight_sync_every_k_steps must be >= 1, got "
+                f"{self.weight_sync_every_k_steps}"
+            )
+        if self.fault_min_live_arenas < 1:
+            raise ValueError(
+                f"fault_min_live_arenas must be >= 1, got {self.fault_min_live_arenas}"
+            )
+        if self.collector_queue_max < 0:
+            raise ValueError(
+                f"collector_queue_max must be >= 0, got {self.collector_queue_max}"
+            )
+        if self.seed_stride < 1:
+            raise ValueError(f"seed_stride must be >= 1, got {self.seed_stride}")
