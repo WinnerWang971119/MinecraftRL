@@ -252,6 +252,19 @@ def test_velocity_normalized_by_max_speed():
     np.testing.assert_allclose(vec[s], [1.0, 0.0, -1.0], atol=1e-6)
 
 
+def test_velocity_clamped_when_exceeding_max_speed():
+    # Falling velocity routinely exceeds MAX_SPEED on the vertical axis. It must
+    # saturate at the [-1, 1] bound instead of overshooting and tripping validate
+    # (the live multi-arena crash: vel_local[1] == -1.19 raised ObservationError).
+    vel = (3.0 * MAX_SPEED, -1.19 * MAX_SPEED, -3.0 * MAX_SPEED)
+    self_state = _make_self(vel_local=vel)
+    opp_state = _make_opp(vel_local=vel, visible=True)
+    vec = _build(self_state=self_state, opponent_state=opp_state)
+    np.testing.assert_allclose(vec[FIELD_SLICES["vel_local"]], [1.0, -1.0, -1.0])
+    np.testing.assert_allclose(vec[FIELD_SLICES["opp_vel_local"]], [1.0, -1.0, -1.0])
+    validate(vec)  # must not raise
+
+
 def test_opponent_position_normalized_by_pos_scale():
     pos = (POS_SCALE, 0.0, -POS_SCALE)
     vec = _build(opponent_state=_make_opp(pos_local=pos))

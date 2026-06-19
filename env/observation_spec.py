@@ -120,9 +120,11 @@ OBS_DTYPE = np.float32
 #: is normalized as ``health / MAX_HEALTH`` -> [0, 1].
 MAX_HEALTH: float = 20.0
 
-#: Velocity normalization scale (blocks/tick). Sprint-jump peaks well under this;
-#: per-axis velocity is divided by MAX_SPEED and may be clamped by ``validate``'s
-#: tolerance. ``TUNE`` — re-freeze here if the action model changes.
+#: Velocity normalization scale (blocks/tick). Tuned for horizontal sprint, which
+#: peaks well under this. Per-axis velocity is divided by MAX_SPEED and then
+#: clamped to [-1, 1] in ``build_observation`` — the vertical (falling) axis
+#: regularly exceeds MAX_SPEED, so it saturates rather than overshooting the
+#: frozen obs range. ``TUNE`` — re-freeze here if the action model changes.
 MAX_SPEED: float = 1.0
 
 #: Position normalization scale (blocks). Opponent local-frame position is
@@ -395,6 +397,7 @@ def build_observation(
 
     Packs already-gated inputs into the frozen layout. Responsibilities:
       - normalize raw magnitudes by the module-level constants,
+      - clamp normalized velocity (self + opponent) to [-1, 1],
       - encode angles as ``(sin, cos)``,
       - clamp ``time_since_seen`` into [0, 1],
       - resolve ``held_item`` to its normalized vocabulary id.
@@ -425,8 +428,8 @@ def build_observation(
     vec[FIELD_SLICES["pitch_sin"]] = np.sin(pitch)
     vec[FIELD_SLICES["pitch_cos"]] = np.cos(pitch)
 
-    vec[FIELD_SLICES["vel_local"]] = (
-        _as_vec3(self_state.vel_local, "self_state.vel_local") / MAX_SPEED
+    vec[FIELD_SLICES["vel_local"]] = np.clip(
+        _as_vec3(self_state.vel_local, "self_state.vel_local") / MAX_SPEED, -1.0, 1.0
     )
     vec[FIELD_SLICES["on_ground"]] = 1.0 if self_state.on_ground else 0.0
     vec[FIELD_SLICES["held_item"]] = (
@@ -441,8 +444,8 @@ def build_observation(
     opp_yaw = float(opponent_state.facing_yaw)
     vec[FIELD_SLICES["opp_facing_sin"]] = np.sin(opp_yaw)
     vec[FIELD_SLICES["opp_facing_cos"]] = np.cos(opp_yaw)
-    vec[FIELD_SLICES["opp_vel_local"]] = (
-        _as_vec3(opponent_state.vel_local, "opponent_state.vel_local") / MAX_SPEED
+    vec[FIELD_SLICES["opp_vel_local"]] = np.clip(
+        _as_vec3(opponent_state.vel_local, "opponent_state.vel_local") / MAX_SPEED, -1.0, 1.0
     )
     vec[FIELD_SLICES["visible"]] = 1.0 if opponent_state.visible else 0.0
 
