@@ -137,6 +137,13 @@ Do not confuse them.
   arenas is the realistic range; 8 is not achievable. The throughput goal is
   ≥19 TPS sustained across all running arenas.
 
+- **Do not shrink the JVM heap to fit more arenas.** RAM is not the ceiling here:
+  4 arenas at the default `-Xms2G -Xmx2G` is ~10–12 GB of 32 GB. The single-threaded
+  Paper tick runs out of cores first, and cutting heap only invites GC pauses that
+  burn CPU and *drop* TPS — the opposite of what you want. Leave heap at 2G. Only
+  touch `-Xms/-Xmx` (both, kept equal) if a GC log shows real pressure, and then
+  *raise* it, never lower it.
+
 ### Launch procedure
 
 **1. Dry-run first** to print the full plan and sanity-check ports, usernames, and
@@ -186,18 +193,40 @@ python -c "import socket; s=socket.create_connection(('127.0.0.1',5555),2); s.cl
 python -c "import socket; s=socket.create_connection(('127.0.0.1',5556),2); s.close(); print('5556 up')"
 ```
 
-**5. Sweep `--arenas` to find the max** (in a third terminal). The goal is the
-highest N where all arenas sustain ≥19 TPS. Start small and step up:
+**5. Sweep `--arenas` to find the max** (in a third terminal). The ceiling is set
+by cores + thermal, not RAM, so this is the measurement that actually finds it.
+The answer is the highest N where **every** arena holds ≥19 TPS for the **full**
+10 min *and* aggregate transitions/s is still rising. Because the live benchmark
+opens one real `TcpBridgeClient` on `port + i` per arena, N real servers must be
+up first — relaunch `start-arenas.ps1 -Arenas N` (step 3) to match before each run:
 
 ```powershell
 python -m eval.benchmark --duration 600 --arenas 1
 python -m eval.benchmark --duration 600 --arenas 2
 python -m eval.benchmark --duration 600 --arenas 3
 python -m eval.benchmark --duration 600 --arenas 4
+# keep stepping (5, 6, ...) until the stop rule below trips
 ```
 
-Record aggregate transitions/s and per-arena TPS for each run. The real AC4
-number is measured live here; it could not be measured in-session.
+**Watch thermals for the whole run, not just the start.** A thin-and-light
+throttles minutes in, so an N that looks fine at second 30 can fall under 19 TPS
+by minute 8. Keep CPU package power / core temps (HWiNFO or Task Manager) in view
+next to the per-arena TPS the benchmark prints.
+
+**Stop rule — back off one when either trips at N:**
+- any arena's sustained TPS drops below 19 across the 10-min window, or
+- aggregate transitions/s stops rising (or falls) versus N−1.
+
+The max usable arena count is the last N *before* the trip. Record each run:
+
+| N | aggregate transitions/s | min sustained per-arena TPS | peak pkg power / temp | verdict |
+|---|-------------------------|-----------------------------|-----------------------|---------|
+| 1 |                         |                             |                       | base    |
+| 2 |                         |                             |                       |         |
+| 3 |                         |                             |                       |         |
+| 4 |                         |                             |                       |         |
+
+The real AC4 number is measured live here; it could not be measured in-session.
 
 **6. Run multi-arena training** with the winning N (once you know it from step 5).
 Keep `start-arenas.ps1` running (or relaunch it), then in a separate terminal:
