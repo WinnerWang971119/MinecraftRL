@@ -59,6 +59,11 @@ server/config/
 server/version_history.json
 server/whitelist.json
 
+# Multi-arena runtime: start-arenas.ps1 materializes server/arenas/arena-<i>,
+# each a full Paper runtime. All generated; source of truth is the setup script
+# + the committed arena datapack.
+server/arenas/
+
 # ---- Logs / scratch ----
 *.log
 scratch/
