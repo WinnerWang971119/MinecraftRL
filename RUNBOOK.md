@@ -106,6 +106,17 @@ python -m eval.benchmark --duration 600 --arenas 1   # then sweep --arenas 2,3,4
 Record CPU package power / thermals alongside — the Core Ultra 7 figure is a
 lower-bound smoke number, not fleet capacity. Expect ~2–4 stable arenas, not 8.
 
+> **What "TPS" measures here.** The benchmark's server TPS is the REAL server
+> tick rate, read from the learner bot's world age (`bot.time.age`, set only by
+> the server's `update_time` packet) and averaged over a rolling 5 s window
+> (Paper's own `/tps` is likewise a rolling average). It is decoupled from the
+> client-side Mineflayer `physicsTick` timer, so a healthy ~20 TPS server reads
+> ~20 even though `update_time` arrives only ~once per second. Raw collection
+> throughput (transitions/s) is a SEPARATE number and is still capped on Windows
+> by Mineflayer's `setInterval(50ms)` physics loop firing at ~60ms under the
+> ~15.6ms system timer resolution; raise it later with `timeBeginPeriod(1)` or by
+> running the bridge on Linux/WSL.
+
 ---
 
 ## Step 4b — AC4 multi-arena live run (issue #4, ~10 min)

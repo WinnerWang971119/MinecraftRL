@@ -21,7 +21,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ArenaBots, MAX_HEALTH } = require('./bot');
+const { ArenaBots, MAX_HEALTH, ACTION_REPEAT } = require('./bot');
 const { validateOutbound } = require('./transport');
 
 /** A minimal chat-capturing mock bot the regear/reset path can drive. */
@@ -201,4 +201,94 @@ test('handleReset skips the reply (no bridge error) when the client disconnects 
   );
   assert.deepEqual(sent, [], 'nothing reaches a disconnected client');
   assert.deepEqual(errors, [], 'a disconnect during the gate is not a bridge error');
+});
+
+// ===========================================================================
+// state.tick source: the OUTBOUND tick is the learner's SERVER world age
+// (bot.time.age), which Mineflayer sets only from the update_time packet, so it
+// tracks the real server tick rate rather than the client physicsTick counter.
+// It falls back to the internal per-step counter before the first update_time
+// packet (and for fake bots with no `time`). The step path is driven via an
+// injected _waitTicksImpl, matching the handleStep harness in actions.test.js.
+// ===========================================================================
+
+/** A minimal learner/dummy the step path can snapshot (no live server). */
+function stepBot(username, { age } = {}) {
+  const bot = {
+    username,
+    health: MAX_HEALTH,
+    heldItem: { name: 'iron_sword' },
+    entity: {
+      username,
+      position: { x: 0.5, y: 64, z: 0.5 },
+      velocity: { x: 0, y: 0, z: 0 },
+      yaw: 0,
+      pitch: 0,
+      onGround: true,
+    },
+    on() {},
+    off() {},
+    once() {},
+    setControlState() {},
+    clearControlStates() {},
+    attack() {},
+    lookAt() {},
+    chat() {},
+  };
+  // The server-authoritative world age, present only once an update_time packet
+  // has arrived. Left off (bot.time undefined) to model the pre-packet window.
+  if (age !== undefined) {
+    bot.time = { age };
+  }
+  return bot;
+}
+
+test('handleStep stamps state.tick from the learner server world-age when it is set', async () => {
+  const sent = [];
+  const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  arena.learner = stepBot('learner_bot', { age: 777 });
+  arena.dummy = stepBot('dummy_bot');
+  arena._waitTicksImpl = async () => {};
+
+  await arena.handleStep({ type: 'step', action: 0 });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, 'state');
+  assert.doesNotThrow(() => validateOutbound(sent[0]));
+  // The wire tick is the real server world age, NOT the internal per-step counter
+  // (which would have advanced to ACTION_REPEAT for this window).
+  assert.equal(sent[0].tick, 777);
+});
+
+test('handleStep falls back to the internal tick counter when the learner has no world-age yet', async () => {
+  const sent = [];
+  const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  // No `time` on the fake learner: models the window before the first
+  // update_time packet arrives (and the unit-test fake with no clock).
+  arena.learner = stepBot('learner_bot');
+  arena.dummy = stepBot('dummy_bot');
+  arena._waitTicksImpl = async () => {};
+
+  await arena.handleStep({ type: 'step', action: 0 });
+
+  assert.equal(sent.length, 1);
+  assert.doesNotThrow(() => validateOutbound(sent[0]));
+  // Falls back to the monotonic per-step counter advanced to the window boundary.
+  assert.equal(sent[0].tick, ACTION_REPEAT);
+});
+
+test('handleReset stamps the post-reset state.tick from the learner world-age when set', async () => {
+  const sent = [];
+  const bots = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  bots.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  bots.dummy = mockBot('dummy_bot');
+  // Server world age from an update_time packet; the post-reset first observation
+  // must carry it, not the just-reset internal counter (which is 0).
+  bots.learner.time = { age: 4242 };
+
+  await bots.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].type, 'state');
+  assert.equal(sent[1].tick, 4242);
 });

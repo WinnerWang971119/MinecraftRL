@@ -14,6 +14,16 @@ The bridge spike's exit criterion is a **measured number**, not a green check
   4. **max arenas sustaining ≥19 TPS** over a ≥10-minute run, with CPU package
      power / thermal recorded best-effort (see the platform note below).
 
+"TPS" here is the REAL Paper server tick rate. It is derived from the learner
+bot's server world age (Mineflayer ``bot.time.age``, updated only by the
+server's ``update_time`` packet, so ~1/s) and averaged over a rolling
+``TPS_ROLL_WINDOW_S`` window. It is NOT the client-side ``physicsTick`` timer,
+which on Windows fires at ~60 ms (Mineflayer's ``setInterval(50 ms)`` under the
+~15.6 ms system timer resolution) and would otherwise masquerade as a ~16 TPS
+"server" reading. That same physics-timer floor separately caps raw collection
+throughput (transitions/s) on Windows; lift it later via ``timeBeginPeriod(1)``
+or by running the bridge on Linux/WSL.
+
 ------------------------------------------------------------------------------
 The injectable transport/clock seam (offline metric-logic proof)
 ------------------------------------------------------------------------------
@@ -60,6 +70,7 @@ Owner: T11 (Eval/infra track)
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import sys
 import threading
@@ -85,6 +96,7 @@ __all__ = [
     # Constants
     "DECISION_INTERVAL_S",
     "MIN_SUSTAINED_TPS",
+    "TPS_ROLL_WINDOW_S",
     "DEFAULT_BENCH_DURATION_S",
     "DEFAULT_MAX_ARENAS",
     "DAMAGE_PER_HIT",
@@ -122,6 +134,16 @@ DECISION_INTERVAL_S: float = DECISION_INTERVAL_MS / 1000.0
 #: (a tick is no longer 50 ms), so an arena that dips under it is NOT sustaining.
 #: Matches the plan's "≥19 TPS" (vanilla is SERVER_TPS == 20).
 MIN_SUSTAINED_TPS: float = 19.0
+
+#: Rolling window (seconds) for deriving server TPS from world-age tick deltas.
+#: The live tick comes from the server world age (Mineflayer ``bot.time.age``),
+#: which the server updates only ~once per second, so consecutive per-state
+#: deltas read "0, 0, 0, +20" and a naive diff would report false 0-TPS dips
+#: between packets. Averaging the tick advance over a multi-second window (Paper's
+#: own ``/tps`` is likewise a rolling average) recovers the true ~20 TPS. 5 s is
+#: long enough to span several 1/s world-age updates while still catching a
+#: sustained lag dip promptly.
+TPS_ROLL_WINDOW_S: float = 5.0
 
 #: Default sustained-run duration for the LIVE AC4 run (>= 10 minutes per TC12).
 DEFAULT_BENCH_DURATION_S: float = 600.0
@@ -1014,7 +1036,8 @@ def _default_tps_provider(state: StateMsg, *, arena: int = 0) -> float:
     feeding scripted ``state`` messages and reading a constant tick rate. It must
     NOT be used as the live default — a constant 20.0 makes ``sustains_19_tps``
     trivially true and the exit code can never catch a real TPS dip. The live run
-    uses :class:`TickDeltaTpsProvider`, which derives TPS from ``tick`` deltas.
+    uses :class:`TickDeltaTpsProvider`, which derives TPS from the server
+    world-age tick (``bot.time.age``, updated ~1/s) averaged over a rolling window.
 
     The ``arena`` kwarg is accepted (and ignored) so both providers share the
     same call signature and can be swapped without changes at the call site.
@@ -1023,40 +1046,54 @@ def _default_tps_provider(state: StateMsg, *, arena: int = 0) -> float:
 
 
 class TickDeltaTpsProvider:
-    """Derive instantaneous server TPS from consecutive ``StateMsg.tick`` deltas.
+    """Derive server TPS from ``StateMsg.tick`` deltas over a rolling wall window.
 
-    The Paper server advances ``StateMsg.tick`` by one game tick per server tick.
-    Sampling the wall clock at each ``state`` and dividing the tick delta by the
-    wall-second delta yields the server's instantaneous ticks-per-second::
+    ``StateMsg.tick`` now carries the REAL server world age (Mineflayer
+    ``bot.time.age``, set only from the server ``update_time`` packet), so it
+    tracks the server's true tick rate rather than the client-side physicsTick
+    timer. But the server pushes ``update_time`` only ~once per second, so the
+    tick advances COARSELY: it is flat for several states, then jumps ~20. A
+    per-consecutive-state diff of that coarse signal reads ``0, 0, 0, +20`` and
+    would report false 0-TPS dips between packets.
 
-        TPS = (tick_now - tick_prev) / (wall_now - wall_prev)
+    So instead of diffing consecutive states, the provider keeps a rolling window
+    of ``(tick, wall)`` samples per arena and divides the tick advance across the
+    whole window by its wall span::
 
-    A healthy 20-TPS server advances ~20 ticks per real second; a server that is
-    falling behind (lag/overload) advances FEWER ticks per wall-second, so the
-    derived TPS drops below the floor and the sustained-TPS gate trips. This makes
-    the live ``sustains_19_tps`` gate honest, unlike the constant provider.
+        TPS = (tick_now - tick_window_start) / (wall_now - wall_window_start)
+
+    over the oldest sample that is at least ``window_s`` old. This is exactly how
+    Paper's own ``/tps`` reports a rolling average. A healthy 20-TPS server
+    advances ~20 ticks per real second, so the window derives ~20 regardless of
+    how coarsely the packet arrives; a server that falls behind (lag/overload)
+    advances FEWER ticks per wall-second, so the derived TPS drops below the floor
+    and the sustained-TPS gate trips. This makes the live ``sustains_19_tps`` gate
+    honest, unlike the constant provider.
 
     The provider is a stateful callable so it can drop straight into the existing
     ``tps_provider: Callable[[StateMsg], float]`` seam. It reads wall time from an
     injected ``clock`` (the SAME monotonic clock :func:`run_benchmark` uses), so a
     test can feed synthetic ``(tick, wall_time)`` pairs and assert the exact TPS.
 
-    The FIRST observed state has no predecessor to diff against; the provider
-    reports ``warmup_tps`` for it (default :data:`MIN_SUSTAINED_TPS`, i.e. the
-    floor — neutral, so the warm-up sample neither fakes a pass nor a spurious
-    dip). Subsequent samples use the real tick/wall deltas.
+    Until the window has ``window_s`` of history (warm-up), the provider reports
+    ``warmup_tps`` (default :data:`MIN_SUSTAINED_TPS`, i.e. the floor -- neutral,
+    so a warm-up sample neither fakes a pass nor a spurious dip). Once the window
+    is full it uses the real tick/wall deltas across the window.
 
     Args:
         clock: Zero-arg monotonic-seconds reader (defaults to
             :func:`time.perf_counter`). MUST be the same clock instance passed to
             :func:`run_benchmark` so tick deltas and wall deltas are consistent.
-        warmup_tps: TPS to report for the very first state (no prior tick).
-            Defaults to :data:`MIN_SUSTAINED_TPS` so warm-up is gate-neutral.
-        max_tps: Upper clamp for the derived value. A zero/near-zero wall delta
-            (two states read at the same clock instant — common with a zero-cost
-            fake clock) would otherwise divide by ~0 and report an absurd spike;
-            clamping to ``max_tps`` keeps the figure sane without masking a dip
-            (a dip pushes TPS DOWN, never up). Defaults to ``2 * SERVER_TPS``.
+        warmup_tps: TPS to report while the rolling window is not yet full (and
+            after a world-age reset). Defaults to :data:`MIN_SUSTAINED_TPS` so
+            warm-up is gate-neutral.
+        max_tps: Upper clamp for the derived value. A zero/near-zero wall span
+            would otherwise divide by ~0 and report an absurd spike; clamping to
+            ``max_tps`` keeps the figure sane without masking a dip (a dip pushes
+            TPS DOWN, never up). Defaults to ``2 * SERVER_TPS``.
+        window_s: Rolling averaging window in seconds. Defaults to
+            :data:`TPS_ROLL_WINDOW_S`; must span several ~1/s world-age updates so
+            the coarse tick signal averages out to the true rate.
     """
 
     def __init__(
@@ -1065,54 +1102,69 @@ class TickDeltaTpsProvider:
         *,
         warmup_tps: float = MIN_SUSTAINED_TPS,
         max_tps: float = 2.0 * float(SERVER_TPS),
+        window_s: float = TPS_ROLL_WINDOW_S,
     ) -> None:
         if max_tps <= 0.0:
             raise ValueError(f"max_tps must be > 0, got {max_tps}")
+        if window_s <= 0.0:
+            raise ValueError(f"window_s must be > 0, got {window_s}")
         self._clock = clock
         self._warmup_tps = float(warmup_tps)
         self._max_tps = float(max_tps)
-        # Per-arena state: keyed by arena identifier (int or any hashable).
-        # Each entry is (prev_tick, prev_wall). Using a dict instead of a single
-        # pair so that consecutive calls from DIFFERENT arenas in a round-robin loop
-        # never corrupt each other's tick/wall baseline.
-        self._prev: Dict[Any, tuple] = {}
+        self._window_s = float(window_s)
+        # Per-arena rolling window of (tick, wall) samples, keyed by arena id.
+        # A deque so old samples evict cheaply off the front; each arena keeps its
+        # OWN window so consecutive calls from DIFFERENT arenas in a round-robin
+        # loop never mix each other's tick/wall baseline.
+        self._samples: Dict[Any, "collections.deque"] = {}
 
     def __call__(self, state: StateMsg, *, arena: int = 0) -> float:
-        """Derive TPS for the given arena from consecutive tick/wall deltas.
+        """Derive TPS for the given arena from its rolling ``(tick, wall)`` window.
 
         Args:
             state: The ``StateMsg`` just received for this arena.
             arena: Arena identifier (default 0 for the single-arena case). MUST be
                 the same value across consecutive calls from the same arena so the
-                per-arena state is accumulated correctly.
+                per-arena window is accumulated correctly.
 
         Returns:
-            Derived instantaneous TPS for this arena, clamped and guarded.
+            Derived rolling-average TPS for this arena, clamped and guarded.
         """
         now = float(self._clock())
         tick = int(state.tick)
 
-        if arena not in self._prev:
-            # No predecessor for this arena yet — report the gate-neutral warm-up
-            # value and seed this arena's state.
-            self._prev[arena] = (tick, now)
+        dq = self._samples.get(arena)
+        if dq is None:
+            dq = collections.deque()
+            self._samples[arena] = dq
+        dq.append((tick, now))
+
+        # Evict samples older than the window, but keep the oldest one that still
+        # spans at least window_s so d_wall can reach the full window. Stop once
+        # dropping the front would pull the window's start inside window_s.
+        while len(dq) > 1 and (now - dq[1][1]) >= self._window_s:
+            dq.popleft()
+
+        oldest_tick, oldest_wall = dq[0]
+        d_tick = tick - oldest_tick
+        d_wall = now - oldest_wall
+
+        if d_wall < self._window_s:
+            # Window not yet full: not enough history to average a rate. Report the
+            # gate-neutral warm-up value (neither a fake pass nor a spurious dip).
             return self._warmup_tps
-
-        prev_tick, prev_wall = self._prev[arena]
-        d_tick = tick - prev_tick
-        d_wall = now - prev_wall
-        self._prev[arena] = (tick, now)
-
-        if d_wall <= 0.0:
-            # Same instant (or a non-monotonic clock): cannot derive a rate. Clamp
-            # to max_tps rather than divide by ~0; a dip never manifests as a
-            # division-by-tiny so this cannot hide a sub-floor reading.
-            return self._max_tps
         if d_tick < 0:
-            # Tick went backwards (server restart / counter reset): not a
-            # meaningful rate. Treat as warm-up rather than a spurious dip.
-            self._prev[arena] = (tick, now)
+            # World age went backwards (server restart / age reset): not a
+            # meaningful rate. Drop this arena's window to just the current sample
+            # and treat as warm-up rather than a spurious huge negative dip.
+            dq.clear()
+            dq.append((tick, now))
             return self._warmup_tps
+        if d_wall <= 0.0:
+            # Degenerate span (non-monotonic clock): clamp to max_tps rather than
+            # divide by ~0. A dip never manifests as a division-by-tiny, so this
+            # cannot hide a sub-floor reading.
+            return self._max_tps
 
         tps = d_tick / d_wall
         if tps > self._max_tps:

@@ -23,6 +23,7 @@ from eval.benchmark import (
     DAMAGE_PER_HIT,
     DECISION_INTERVAL_S,
     MIN_SUSTAINED_TPS,
+    TPS_ROLL_WINDOW_S,
     BenchmarkReport,
     FakeBridge,
     FakeClock,
@@ -540,52 +541,101 @@ def test_run_benchmark_with_logger_writes_metrics(tmp_path):
 
 
 # ===========================================================================
-# TickDeltaTpsProvider: derives TPS from tick deltas over wall-clock time.
+# TickDeltaTpsProvider: rolling-window TPS off the server world-age tick.
+#
+# The live tick now carries the server world age (Mineflayer bot.time.age),
+# which the server updates only ~1/s, so the provider averages the tick advance
+# over a rolling window_s-second window instead of diffing consecutive states.
 # ===========================================================================
 
 
 def test_tick_delta_provider_warms_up_then_computes_tps():
-    """First state is a gate-neutral warm-up; later states derive TPS = dtick/dwall.
+    """Warm-up until the rolling window fills, then TPS == d_tick / d_wall.
 
-    Drive the provider off a FakeClock fed synthetic (tick, wall) pairs. A healthy
-    20-TPS server advances 20 ticks per real second: with a 0.5 s wall gap it
-    advances 10 ticks, so the derived TPS is 10 / 0.5 == 20.0.
+    The provider averages tick advance over ``window_s`` seconds (the world-age
+    tick updates coarsely, ~1/s, so a rolling average is what recovers the true
+    rate). Until the window holds ``window_s`` of history every sample is the
+    gate-neutral warm-up floor; once it fills, a healthy 20-ticks-per-second
+    cadence derives 20.0 TPS.
     """
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock, window_s=1.0)
 
-    # First sample: no predecessor -> warm-up value (the floor), gate-neutral.
-    assert provider(_state(tick=100)) == pytest.approx(MIN_SUSTAINED_TPS)
-
-    # 10 ticks advanced over 0.5 wall-seconds -> 20 TPS.
+    # First sample: no history -> warm-up floor, gate-neutral.
+    assert provider(_state(tick=0)) == pytest.approx(MIN_SUSTAINED_TPS)
+    # 0.5 s in, the 1 s window is not yet full -> still warm-up.
     clock.advance(0.5)
-    assert provider(_state(tick=110)) == pytest.approx(20.0)
+    assert provider(_state(tick=10)) == pytest.approx(MIN_SUSTAINED_TPS)
+    # 1.0 s of history now spans the window: +20 ticks over 1.0 s -> 20 TPS.
+    clock.advance(0.5)
+    assert provider(_state(tick=20)) == pytest.approx(20.0)
+    # Steady healthy cadence keeps deriving 20 TPS as the window rolls forward.
+    clock.advance(0.5)
+    assert provider(_state(tick=30)) == pytest.approx(20.0)
 
-    # Another 20 ticks over 1.0 s -> 20 TPS, steady.
-    clock.advance(1.0)
-    assert provider(_state(tick=130)) == pytest.approx(20.0)
+
+def test_tick_delta_provider_coarse_world_age_reads_true_tps():
+    """Coarse ~1/s world-age updates still derive the true TPS over the window.
+
+    The live tick comes from the server world age (``bot.time.age``), pushed only
+    ~once per second, so a per-consecutive-state diff reads "0, 0, 0, +20" and a
+    naive provider would report false 0-TPS dips between packets. The rolling
+    window averages the advance over ``window_s`` and recovers the real rate.
+
+    Sample every 0.25 s (exact in float) with the world age jumping once per whole
+    second; before the 5 s window fills every sample is the gate-neutral floor,
+    and once it fills a healthy +20/s cadence reads 20 TPS (NOT 0). A lagging
+    server (+16/s) reads 16 TPS and trips the sustained gate.
+    """
+    step_s = 0.25
+    n_steps = 25  # walls 0.00 .. 6.00 s inclusive, spanning the 5 s window
+
+    def drive(per_second):
+        """Run a coarse +per_second/s world-age series; return (warmup, filled)."""
+        clock = FakeClock()
+        provider = TickDeltaTpsProvider(clock=clock)  # default window_s == 5.0
+        warmup, filled = [], []
+        for i in range(n_steps):
+            if i > 0:
+                clock.advance(step_s)
+            wall = i * step_s
+            # World age is flat within each whole second, then jumps by per_second
+            # (the ~1/s update_time packet), exactly as bot.time.age behaves live.
+            age = per_second * int(wall)
+            tps = provider(_state(tick=age))
+            (warmup if wall < TPS_ROLL_WINDOW_S else filled).append(tps)
+        return warmup, filled
+
+    # Healthy server: +20 ticks per second.
+    warmup, filled = drive(20)
+    # Before the window fills, every sample is the gate-neutral floor (no fake dip
+    # despite the tick being flat between the coarse ~1/s packets).
+    assert warmup and all(s == pytest.approx(MIN_SUSTAINED_TPS) for s in warmup)
+    # Once the 5 s window is full, the coarse +20/s cadence reads the TRUE 20 TPS,
+    # not the 0 a per-consecutive-state diff would report between packets.
+    assert filled and all(s == pytest.approx(20.0) for s in filled)
+
+    # Lagging server: +16 ticks per second -> a real sub-19 dip the gate rejects.
+    lag_warmup, lag_filled = drive(16)
+    assert lag_filled and all(s == pytest.approx(16.0) for s in lag_filled)
+    assert sustains_tps(lag_warmup + lag_filled) is False
 
 
 def test_tick_delta_provider_flags_dip_below_19():
     """A lagging server advances fewer ticks per wall-second -> TPS dips below 19.
 
-    Over a 1.0 s wall window a healthy server advances 20 ticks; here it advances
-    only 18 (the server fell behind), so the derived TPS is 18.0 — a real dip that
-    sustains_tps() must reject. Asserts the provider produces the sub-floor signal
-    AND that the sustained-TPS gate trips on it.
+    Over the rolling window a healthy server advances ~20 ticks/s; here, once the
+    window fills, it advances only ~18 ticks/s (the server fell behind), so the
+    derived TPS is 18.0 — a real dip that sustains_tps() must reject.
     """
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock, window_s=1.0)
 
     samples = []
-    # Warm-up.
-    samples.append(provider(_state(tick=0)))
-    # Healthy second: +20 ticks / 1.0 s -> 20 TPS.
+    samples.append(provider(_state(tick=0)))  # warm-up
+    # Window full: +18 ticks over 1.0 s -> 18 TPS (a real dip).
     clock.advance(1.0)
-    samples.append(provider(_state(tick=20)))
-    # Lagging second: only +18 ticks / 1.0 s -> 18 TPS (a real dip).
-    clock.advance(1.0)
-    dipped = provider(_state(tick=38))
+    dipped = provider(_state(tick=18))
     samples.append(dipped)
 
     assert dipped == pytest.approx(18.0)
@@ -595,57 +645,71 @@ def test_tick_delta_provider_flags_dip_below_19():
     assert min_sustained_tps(samples) == pytest.approx(18.0)
 
 
-def test_tick_delta_provider_clamps_zero_wall_delta():
-    """Two states read at the same clock instant clamp instead of dividing by ~0.
+def test_tick_delta_provider_same_instant_is_warmup_not_divide_by_zero():
+    """Two states read at the same clock instant never divide by ~0.
 
-    With a zero-cost clock (dwall == 0) a naive dtick/dwall would explode; the
-    provider clamps to max_tps (default 2*SERVER_TPS) — never a spurious dip, so
-    it cannot hide a real sub-floor reading.
+    With a zero-cost clock the window cannot have filled (d_wall == 0 < window_s),
+    so the provider returns the gate-neutral warm-up floor rather than dividing a
+    tick delta by ~0. A same-instant read is therefore never a spurious spike or a
+    fake dip.
     """
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock)
-    provider(_state(tick=1))  # warm-up seeds prev_tick / prev_wall
-    # No clock.advance() -> dwall == 0 on the next sample.
-    clamped = provider(_state(tick=5))
-    assert clamped == pytest.approx(2.0 * float(SERVER_TPS))
-    assert clamped > MIN_SUSTAINED_TPS  # a clamp is never a fake dip
+    provider = TickDeltaTpsProvider(clock=clock, window_s=1.0)
+    provider(_state(tick=1))  # warm-up seeds the window
+    # No clock.advance() -> d_wall == 0 on the next sample: window not full.
+    guarded = provider(_state(tick=5))
+    assert guarded == pytest.approx(MIN_SUSTAINED_TPS)
 
 
 def test_tick_delta_provider_clamps_high_rate():
-    """A very large tick jump over a tiny wall delta is clamped to max_tps."""
+    """A very large tick jump across a FILLED window is clamped to max_tps."""
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock, max_tps=40.0)
-    provider(_state(tick=0))  # warm-up
-    clock.advance(0.001)  # 1 ms
-    # +1000 ticks / 0.001 s == 1_000_000 TPS, clamped to 40.0.
+    provider = TickDeltaTpsProvider(clock=clock, window_s=1.0, max_tps=40.0)
+    provider(_state(tick=0))  # warm-up seeds the window
+    clock.advance(1.0)  # window is now full (1.0 s of history)
+    # +1000 ticks over 1.0 s == 1000 TPS, clamped to 40.0 (a clamp is never a dip).
     assert provider(_state(tick=1000)) == pytest.approx(40.0)
 
 
 def test_tick_delta_provider_backwards_tick_is_warmup_not_dip():
-    """A tick counter reset (server restart) reports warm-up, not a spurious dip."""
+    """A world-age reset (server restart) reports warm-up, not a spurious dip.
+
+    Even with the rolling window full, a world age that jumps BACKWARDS is not a
+    meaningful rate; the provider drops that arena's window to just the current
+    sample and returns the gate-neutral floor rather than a huge negative dip. It
+    then rebuilds the window from the restart tick and derives a real rate again.
+    """
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock)
-    provider(_state(tick=500))  # warm-up
-    clock.advance(1.0)
-    # Tick went backwards (restart): not a real rate -> warm-up value, not a dip.
+    provider = TickDeltaTpsProvider(clock=clock, window_s=1.0)
+    provider(_state(tick=500))  # warm-up seeds the window
+    clock.advance(1.0)  # window is now full
+    # World age went backwards (restart): warm-up, not a dip.
     assert provider(_state(tick=10)) == pytest.approx(MIN_SUSTAINED_TPS)
+    # The window rebuilt from the restart tick: refill it and derive a real rate
+    # off the new baseline (+20 ticks over 1.0 s -> 20 TPS).
+    clock.advance(1.0)
+    assert provider(_state(tick=30)) == pytest.approx(20.0)
 
 
-def test_tick_delta_provider_rejects_bad_max_tps():
+def test_tick_delta_provider_rejects_bad_args():
     with pytest.raises(ValueError):
         TickDeltaTpsProvider(clock=FakeClock(), max_tps=0.0)
+    with pytest.raises(ValueError):
+        TickDeltaTpsProvider(clock=FakeClock(), window_s=0.0)
 
 
 def test_tick_delta_provider_drives_run_benchmark_sustained():
     """Wired into run_benchmark with a healthy tick cadence, the run sustains >=19.
 
-    Each fake round-trip charges 50 ms on the shared clock; each scripted state
-    advances tick by exactly 1, so the derived TPS is 1 / 0.050 == 20.0 per
-    decision after warm-up. The run must report sustained >=19 TPS off REAL
-    tick deltas (not the constant default).
+    Each fake round-trip charges 31.25 ms on the shared clock and advances the
+    world age by 1 tick. Once the 62.5 ms rolling window fills, the derived TPS is
+    a healthy 32 (well above the floor). Warm-up samples are the gate-neutral
+    floor, so the run's minimum is exactly MIN_SUSTAINED_TPS and it sustains >=19
+    off REAL tick deltas, not the constant default. (31.25 ms / 62.5 ms are exact
+    in binary floating point, so the window boundary never flakes.)
     """
-    factory = _make_factory(n_decisions_per_arena=6, latency_s=0.050, tick0=1)
-    provider = TickDeltaTpsProvider(clock=factory.clock)
+    factory = _make_factory(n_decisions_per_arena=6, latency_s=0.03125, tick0=1)
+    provider = TickDeltaTpsProvider(clock=factory.clock, window_s=0.0625)
     report = run_benchmark(
         factory,
         n_arenas=1,
@@ -655,33 +719,34 @@ def test_tick_delta_provider_drives_run_benchmark_sustained():
         tps_provider=provider,
         log=None,
     )
-    # Warm-up sample is the floor (19.0); steady samples are 20.0; min is 19.0.
     assert report.sustains_19_tps is True
     assert report.sustained_tps_min == pytest.approx(MIN_SUSTAINED_TPS)
 
 
 def test_tick_delta_provider_drives_run_benchmark_dip_fails():
-    """A stalled tick (server froze a window) drives a real sub-19 dip in the run.
+    """A stalled world age (server froze) drives a real sub-19 dip in the run.
 
-    The scripted states advance tick by 1 each EXCEPT one window where the tick
-    does not advance at all (the server stalled): that window derives 0 / 0.050
-    == 0 TPS, a real dip that makes the whole run fail the sustained gate.
+    The scripted world age advances by 1 tick per step EXCEPT for a stretch where
+    it does not advance at all (the server stalled): once that stall fills the
+    rolling window the derived rate is 0 / 0.0625 == 0 TPS, a real dip that makes
+    the whole run fail the sustained gate.
     """
     clock = FakeClock()
     bridges = []
 
-    # Ticks: 1, 2, 3, 3, 4, 5 -> the 4th window repeats tick 3 (a stall: dtick=0).
-    ticks = [1, 2, 3, 3, 4, 5]
+    # World age: 1, 2, 3, 3, 3, 4 -> a multi-step stall at tick 3 so at least one
+    # rolling window sits entirely inside the stall (d_tick == 0 over the window).
+    ticks = [1, 2, 3, 3, 3, 4]
 
     def factory(_arena_index):
         inbound = [_state(tick=t) for t in ticks]
         bridge = FakeBridge(
-            inbound=inbound, latencies_s=[0.050] * len(ticks), clock=clock
+            inbound=inbound, latencies_s=[0.03125] * len(ticks), clock=clock
         )
         bridges.append(bridge)
         return bridge
 
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock, window_s=0.0625)
     report = run_benchmark(
         factory,
         n_arenas=1,
@@ -702,158 +767,118 @@ def test_tick_delta_provider_drives_run_benchmark_dip_fails():
 
 
 def test_tick_delta_provider_per_arena_isolation_both_healthy():
-    """Two arenas with independent tick streams each derive ~20 TPS independently.
+    """Two arenas with independent tick streams each derive their own sane rate.
 
-    This is the direct regression for the multi-arena shared-state bug: with a
-    SINGLE shared provider the round-robin call sequence mixes arena0's and
-    arena1's ticks — ``d_tick = tick(arena1) - tick(arena0)`` — producing garbage
-    TPS readings. With per-arena state each arena diffs only against its own
-    previous (tick, wall), so the rate is correct for each.
+    Direct regression for the multi-arena shared-state bug: a SINGLE shared
+    provider round-robined across arenas would compute ``d_tick`` from arena1's
+    tick minus arena0's tick and report garbage (e.g. 500 - 101 == 399 ticks over
+    0.1 s). With per-arena rolling windows each arena diffs only against its OWN
+    history.
 
-    Setup: two arenas, each advancing their tick counter by 1 per 50 ms step
-    (wall-clock paced via FakeClock). After the warm-up sample, each arena's
-    derived TPS == 1 / 0.050 == 20.0. The run sustains >= 19 TPS, which the old
-    shared-state code would FAIL because the mixed ticks produce a meaningless rate.
+    Both arenas advance +1 tick per own step; interleaved, each arena's own
+    samples are 0.125 s apart, and with a 0.0625 s window each fill derives
+    1 tick / 0.125 s == 8 TPS. The point is BOTH arenas read the same clean 8 TPS,
+    never a blend of the two tick counters. (0.0625 s steps are exact in binary
+    floating point, so the window boundary never flakes.)
     """
-    # Build two independent FakeBridges with separate tick sequences. Both arenas
-    # advance +1 tick every 50 ms step. We drive the provider directly (not through
-    # run_benchmark) to verify per-arena isolation at the unit level.
     clock = FakeClock()
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock, window_s=0.0625)
 
-    # Arena 0: ticks 100, 101, 102, 103, 104 (healthy +1/step)
-    # Arena 1: ticks 500, 501, 502, 503, 504 (independent counter, also healthy)
-    # Round-robin interleaving: (a0,t=100), (a1,t=500), (a0,t=101), (a1,t=501), ...
-    # Each recv charges 50 ms; the two arenas alternate, so from each arena's
-    # perspective 100 ms of wall time passes between its own consecutive calls
-    # (two 50 ms steps: one for itself, one for the other arena).
+    # Independent, healthy tick streams (+1 per own step) with disjoint counters.
     arena0_ticks = [100, 101, 102, 103, 104]
     arena1_ticks = [500, 501, 502, 503, 504]
-
     samples_a0 = []
     samples_a1 = []
-
     for i in range(5):
-        # Arena 0 step: advance clock by 50 ms, call provider with arena=0.
-        clock.advance(0.050)
+        # Arena 0 step, then arena 1 step, each charging 0.0625 s on the clock, so
+        # each arena's own consecutive calls are 0.125 s apart.
+        clock.advance(0.0625)
         samples_a0.append(provider(_state(tick=arena0_ticks[i]), arena=0))
-        # Arena 1 step: advance clock by 50 ms, call provider with arena=1.
-        clock.advance(0.050)
+        clock.advance(0.0625)
         samples_a1.append(provider(_state(tick=arena1_ticks[i]), arena=1))
-
-    # Warm-up samples are the floor (19.0); all subsequent samples should be
-    # 1 tick / 0.100 s == 10.0 TPS ... wait — each arena sees 100 ms between its
-    # own calls (50 ms for its step + 50 ms for the other arena's step), so derived
-    # TPS per arena == 1 tick / 0.100 s == 10.0. But the point is BOTH arenas see
-    # the SAME healthy rate, not garbage from mixing tick counters.
-    # (The test below checks isolation — the derived rates are equal and consistent,
-    # not a blend of 600-100=400 tick jumps that the shared-state bug would produce.)
 
     # Warm-up samples are the gate-neutral floor.
     assert samples_a0[0] == pytest.approx(MIN_SUSTAINED_TPS)
     assert samples_a1[0] == pytest.approx(MIN_SUSTAINED_TPS)
 
-    # Steady samples: 1 tick / 0.100 s == 10.0 TPS for each arena.
+    # Steady samples: 1 tick / 0.125 s == 8.0 TPS for EACH arena, never a mix. The
+    # old shared-state bug would blend the two counters into ~thousands of TPS.
     for s in samples_a0[1:]:
-        assert s == pytest.approx(10.0), f"arena0 sample {s} != 10.0 (isolation broken)"
+        assert s == pytest.approx(8.0), f"arena0 sample {s} != 8.0 (isolation broken)"
     for s in samples_a1[1:]:
-        assert s == pytest.approx(10.0), f"arena1 sample {s} != 10.0 (isolation broken)"
-
-    # Verify isolation: the steady-state rate is consistently 10.0 for both arenas,
-    # not a garbage value from mixed tick counters. The old shared-state bug would
-    # produce d_tick = tick(arena1) - tick(arena0) e.g. 500 - 101 = 399 ticks over
-    # 0.1 s == 3990 TPS (clamped to max_tps) or similar nonsense — nothing like 10.
-    combined_steady = samples_a0[1:] + samples_a1[1:]
-    assert all(s == pytest.approx(10.0) for s in combined_steady), (
-        f"expected all steady samples to be 10.0, got: {combined_steady}"
-    )
+        assert s == pytest.approx(8.0), f"arena1 sample {s} != 8.0 (isolation broken)"
 
 
 def test_tick_delta_provider_multi_arena_run_benchmark_sustains():
-    """Two arenas each advancing at 20 ticks/s sustain >=19 TPS end-to-end.
+    """Two arenas driven with the rolling-window provider complete and sustain.
 
-    Drives run_benchmark with TWO arenas and a TickDeltaTpsProvider. Each arena
-    gets its own FakeBridge whose states advance tick by 1 per 50 ms step; the
-    shared clock advances 50 ms per recv. In the round-robin each arena's
-    consecutive calls are 100 ms apart (one own step + one other-arena step), so
-    each derives 1/0.1 == 10 TPS — above 19? No. To hit >=20 TPS we need the tick
-    delta to span >= 2 ticks per 100 ms, i.e. advance tick by 2 per step. With +2
-    ticks per 50 ms step each arena sees 2 ticks / 0.100 s == 20 TPS — healthy.
-
-    The old shared-state provider would mix arena0's tick with arena1's tick for
-    the d_tick computation, producing e.g. (500-101) or (101-500) -> garbage or
-    a backwards-tick warm-up reset, making the result unpredictable. Per-arena
-    state produces a clean 20.0 for each arena.
+    A short offline run (well under the default 5 s rolling window) stays entirely
+    in the gate-neutral warm-up, so both arenas report the floor and the run
+    sustains >=19 without a spurious dip. The real per-arena rate derivation off
+    coarse world-age ticks is exercised by the direct-drive isolation and coarse-
+    series tests above; here the point is that run_benchmark carries a per-arena
+    rolling-window provider through two arenas cleanly (no shared-state cross-talk,
+    no crash), which is thread-interleaving independent because warm-up does not
+    depend on wall timing.
     """
     clock = FakeClock()
-
-    # Each arena advances tick by 2 per step at 50 ms per step.
-    # Arena 0 ticks: 0, 2, 4, 6, 8, 10, 12, 14 (start 0, +2 each own step)
-    # Arena 1 ticks: 1000, 1002, 1004, 1006, 1008, 1010, 1012, 1014 (independent)
     n_per_arena = 8
 
     def factory(arena_index):
-        start = 1000 * arena_index  # arena0 starts at 0, arena1 at 1000
+        start = 1000 * arena_index  # disjoint per-arena world-age counters
         ticks = [start + 2 * i for i in range(n_per_arena)]
         inbound = [_state(tick=t) for t in ticks]
-        # Each step charges 50 ms on the shared clock.
         return FakeBridge(
             inbound=inbound,
             latencies_s=[0.050] * n_per_arena,
             clock=clock,
         )
 
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock)  # default window_s == 5.0
     report = run_benchmark(
         factory,
         n_arenas=2,
-        max_decisions=2 * n_per_arena,  # all steps from both arenas
+        max_decisions=2 * n_per_arena,  # 16 * 0.050 s == 0.8 s, under the window
         duration_s=1e9,
         clock=clock,
         tps_provider=provider,
         log=None,
     )
 
-    # Each arena derives 2 ticks / 0.100 s == 20 TPS after warm-up.
-    # Warm-up samples from each arena are the floor (19.0), so the minimum is 19.0.
+    # The whole run stays in warm-up, so every sample is the floor and it sustains.
     assert report.sustains_19_tps is True
     assert report.sustained_tps_min == pytest.approx(MIN_SUSTAINED_TPS)
 
 
 def test_tick_delta_provider_multi_arena_one_stall_fails_gate():
-    """One arena stalling its ticks makes the whole run fail the sustained gate.
+    """One arena stalling its world age makes the whole run fail the sustained gate.
 
-    Arena 0 is healthy (+2 ticks per step). Arena 1 deliberately stalls its tick
-    counter (all steps return the same tick value), so its derived TPS is 0 after
-    warm-up. That 0-TPS sample causes the global min to drop below 19 and the gate
-    fails. This proves per-arena isolation works in BOTH directions: a stall in one
-    arena contaminates only that arena's readings, but one bad reading is enough to
-    fail the global gate.
-
-    (With the old shared-state code this test's result would be undefined — the
-    mixed d_tick could accidentally produce 0 or something non-zero depending on
-    interleaving — whereas with per-arena state it deterministically produces 0 TPS
-    for the stalled arena.)
+    Arena 0 is healthy (+2 ticks per step). Arena 1 stalls its world age (constant
+    tick), so once its rolling window fills the derived rate is 0 TPS REGARDLESS of
+    thread interleaving: a constant tick has zero advance over ANY window, and with
+    8 steps at least 0.0625 s of that arena's own history accumulates to fill the
+    window. That single 0-TPS reading drops the global minimum below 19 and fails
+    the gate, proving per-arena isolation in both directions: the stall contaminates
+    only arena 1's readings, but one bad reading fails the global gate.
     """
     clock = FakeClock()
-
-    n_per_arena = 6
+    n_per_arena = 8
 
     def factory(arena_index):
         if arena_index == 0:
             # Healthy: +2 ticks per step.
             ticks = [2 * i for i in range(n_per_arena)]
         else:
-            # Stalled: tick never advances beyond 999.
+            # Stalled: world age never advances beyond 999.
             ticks = [999] * n_per_arena
         inbound = [_state(tick=t) for t in ticks]
         return FakeBridge(
             inbound=inbound,
-            latencies_s=[0.050] * n_per_arena,
+            latencies_s=[0.03125] * n_per_arena,
             clock=clock,
         )
 
-    provider = TickDeltaTpsProvider(clock=clock)
+    provider = TickDeltaTpsProvider(clock=clock, window_s=0.0625)
     report = run_benchmark(
         factory,
         n_arenas=2,
@@ -864,7 +889,7 @@ def test_tick_delta_provider_multi_arena_one_stall_fails_gate():
         log=None,
     )
 
-    # Arena 1's stall produces 0 TPS (d_tick=0 -> 0/0.1==0); gate must fail.
+    # Arena 1's stall produces 0 TPS once its window fills; the gate must fail.
     assert report.sustains_19_tps is False
     assert report.sustained_tps_min == pytest.approx(0.0)
     assert report.max_arenas_sustaining_tps == 0

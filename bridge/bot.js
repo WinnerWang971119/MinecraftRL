@@ -839,7 +839,7 @@ class ArenaBots {
           opponent: this._snapshotOpponent(),
           events: this.events.drain(),
           wallDistances: this._probeWallDistances(),
-          tick: this._currentTick,
+          tick: this._serverTick(),
           codeVersion: resolveCodeVersion(),
         }),
       );
@@ -850,6 +850,36 @@ class ArenaBots {
   attackCooldown() {
     const lastSwingTick = this.executor !== null ? this.executor.lastSwingTick : null;
     return computeAttackCooldown(this._currentTick, lastSwingTick, this._weaponAttackSpeedTicks);
+  }
+
+  /**
+   * Server-authoritative game tick for the OUTBOUND `state.tick` field.
+   *
+   * Sourced from the learner bot's world age (`bot.time.age`), which Mineflayer
+   * sets ONLY from the server `update_time` packet (node_modules/mineflayer/lib/
+   * plugins/time.js), so it reflects the REAL server tick rate, decoupled from
+   * the client-side physicsTick timer that `this._currentTick` and the swing/
+   * cooldown gate ride on. The server sends `update_time` only ~once per second,
+   * so this value updates coarsely (flat, then jumps ~20); the eval benchmark
+   * averages it over a rolling window to recover the true rate (eval/benchmark.py
+   * TickDeltaTpsProvider).
+   *
+   * Falls back to the internal per-step counter (`this._currentTick`) before the
+   * first `update_time` arrives, and for unit-test fakes whose learner has no
+   * `time`. assembleStateMsg still clamps the result to a non-negative integer.
+   *
+   * @returns {number} The learner's server world-age tick, or the internal counter.
+   */
+  _serverTick() {
+    if (
+      this.learner &&
+      this.learner.time &&
+      Number.isInteger(this.learner.time.age) &&
+      this.learner.time.age >= 0
+    ) {
+      return this.learner.time.age;
+    }
+    return this._currentTick;
   }
 
   /**
@@ -908,7 +938,7 @@ class ArenaBots {
       opponent: this._snapshotOpponent(),
       events,
       wallDistances: this._probeWallDistances(),
-      tick: this._currentTick,
+      tick: this._serverTick(),
       codeVersion: resolveCodeVersion(),
     });
     this._trySend(stateMsg);
