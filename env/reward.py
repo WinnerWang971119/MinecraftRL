@@ -150,8 +150,9 @@ class TermInfo:
             / lost all health). Adds ``+R_terminal_win``.
         lost: True iff the episode ended with the learner losing (learner died).
             Adds ``−R_terminal_loss``. Takes precedence over ``won``.
-        timeout: True iff the episode ended on the step/time cap. A draw → adds
-            ``R_terminal_timeout`` (0.0 by default; no win/loss reward).
+        timeout: True iff the episode ended on the step/time cap. Adds
+            ``R_terminal_timeout`` — a penalty by default (kiting/avoiding combat
+            is the worst outcome), not a neutral draw. See ``RewardConfig``.
     """
 
     done: bool = False
@@ -279,8 +280,8 @@ def _terminal_reward(terminal: TermInfo, cfg: RewardConfig) -> float:
 
       - loss → ``−R_terminal_loss``,
       - win  → ``+R_terminal_win``,
-      - timeout / unspecified terminal → ``R_terminal_timeout`` (0.0; the safe,
-        no-bias draw default).
+      - timeout / unspecified terminal → ``R_terminal_timeout`` (a penalty by
+        default: timing out means the agent kited instead of fighting).
     """
     if not terminal.done:
         return 0.0
@@ -288,7 +289,8 @@ def _terminal_reward(terminal: TermInfo, cfg: RewardConfig) -> float:
         return -float(cfg.R_terminal_loss)
     if terminal.won:
         return float(cfg.R_terminal_win)
-    # timeout, or an unspecified terminal — treat as a draw (no win/loss reward).
+    # timeout, or an unspecified terminal — the configured timeout reward
+    # (a penalty by default; see RewardConfig.R_terminal_timeout).
     return float(cfg.R_terminal_timeout)
 
 
@@ -392,8 +394,8 @@ def compute_reward(
         ``in_crosshair`` in ``gated_obs`` — EXACTLY 0 the instant not visible
         (guards AC6 / TC6 spin-farming).
       - **Terminal**: applied only when ``terminal.done``; loss ``−R_terminal_loss``
-        (precedence over win), win ``+R_terminal_win``, timeout/draw
-        ``R_terminal_timeout`` (0.0).
+        (precedence over win), win ``+R_terminal_win``, timeout
+        ``R_terminal_timeout`` (a penalty by default — kiting is the worst outcome).
       - **Positional shaping**: potential-based ``F = γ·Φ(gated_obs) − Φ(prev_obs)``
         with ``γ = cfg.gamma``; a no-op while ``cfg.c_approach == 0.0`` and
         provably policy-invariant for any Φ.

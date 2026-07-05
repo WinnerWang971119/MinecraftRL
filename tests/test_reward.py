@@ -77,16 +77,24 @@ def _nonterminal():
 # ===========================================================================
 
 
-def test_default_config_reproduces_spec_starting_values():
-    """The frozen defaults are the spec §7 start table (the formula's coefficients)."""
+def test_default_config_reproduces_combat_reward_shape():
+    """The frozen defaults are the tuned combat-reward shape (see RewardConfig).
+
+    Win dominates (+50), damage dealt is weighted 2x damage taken so combat is
+    net-positive (1.0 vs 0.5 per HP = +2 vs -1 per heart), and a timeout is the
+    worst outcome (-30) to punish kiting.
+    """
     cfg = RewardConfig()
     assert cfg.c_dmg_out == 1.0
-    assert cfg.c_dmg_in == 1.0
+    assert cfg.c_dmg_in == 0.5
+    assert cfg.c_dmg_out == 2.0 * cfg.c_dmg_in  # dealt weighted 2x taken
     assert cfg.c_step == 0.005  # finalized step penalty (T17)
     assert cfg.c_aim == 0.01
-    assert cfg.R_terminal_win == 8.0
+    assert cfg.R_terminal_win == 50.0
     assert cfg.R_terminal_loss == 8.0
-    assert cfg.R_terminal_timeout == 0.0
+    assert cfg.R_terminal_timeout == -30.0
+    assert cfg.R_terminal_win > cfg.R_terminal_loss  # winning beats fear of losing
+    assert cfg.R_terminal_timeout < -cfg.R_terminal_loss  # timeout worse than a loss
     assert cfg.gamma == 0.99
     assert cfg.c_approach == 0.0  # shaping is a no-op by default
 
@@ -203,7 +211,7 @@ def test_damage_terms_scale_with_events(dealt, taken):
 
 
 def test_damage_dealt_is_rewarded_damage_taken_is_penalized():
-    """Dealing raises reward; taking the same amount lowers it by the symmetric amount."""
+    """Dealing raises reward, taking lowers it — and dealing is weighted more (aggression)."""
     cfg = RewardConfig()
     obs = _obs()
     r_deal = compute_reward(_events(damage_dealt=5.0), obs, obs, _nonterminal(), cfg)
@@ -211,8 +219,12 @@ def test_damage_dealt_is_rewarded_damage_taken_is_penalized():
     baseline = compute_reward(_events(), obs, obs, _nonterminal(), cfg)
     assert r_deal > baseline
     assert r_take < baseline
-    # Symmetric coefficients → the deltas mirror each other.
-    assert (r_deal - baseline) == pytest.approx(-(r_take - baseline))
+    # Each delta tracks its own coefficient.
+    assert (r_deal - baseline) == pytest.approx(cfg.c_dmg_out * 5.0)
+    assert (r_take - baseline) == pytest.approx(-cfg.c_dmg_in * 5.0)
+    # Asymmetric shape: dealing the same HP is rewarded more than taking it is
+    # penalized, so an even trade is net-positive → engaging beats avoiding.
+    assert (r_deal - baseline) > -(r_take - baseline)
 
 
 def test_step_penalty_always_applied():

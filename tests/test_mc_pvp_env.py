@@ -387,7 +387,7 @@ def test_double_death_resolves_as_loss():
 
 
 def test_timeout_ends_episode_at_max_steps():
-    """Reaching max_episode_steps ends the episode via timeout (a draw)."""
+    """Reaching max_episode_steps ends the episode via timeout (penalized, not a draw)."""
     # Use a tiny horizon so the test is fast but exercises the real timeout path.
     bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
     env = _env(bridge, max_episode_steps=3)
@@ -403,7 +403,7 @@ def test_timeout_ends_episode_at_max_steps():
     assert info["timeout"] is True
     assert info["won"] is False and info["lost"] is False
     assert info["step"] == 3
-    # Timeout terminal reward is the draw value (0.0 by default).
+    # Timeout terminal reward is the configured timeout penalty (anti-kiting).
     assert info["r_terminal"] == pytest.approx(RewardConfig().R_terminal_timeout)
 
 
