@@ -30,16 +30,40 @@
 //     - one step runs the macro, drains exactly the window's events, and sends
 //       one schema-valid `state`; damage that arrives during the window is
 //       counted exactly once and is cleared from the next window.
+//   The DAMAGE CHANNEL (TC1-TC4, bot.js wireDamageEvents/_onOpponentHealth):
+//     - damage_dealt is sourced from the dummy bot's OWN `health` channel;
+//     - an `entityHurt` event is inert (no subscription exists at all);
+//     - opponent_died latches once per window and clears on drain;
+//     - undefined/NaN health, heals, double-wiring and reset suppression each
+//       produce EXACT recorder call counts (spy), not merely plausible totals.
+//
+// MOCK FIDELITY — READ BEFORE ADDING A FAKE HERE.
+//   Mineflayer populates `health` ONLY on a bot's own connection
+//   (lib/plugins/health.js: `bot.health = packet.health`, fed by update_health,
+//   which the server sends only about the receiving client's own player).
+//   `prismarine-entity`'s Entity class defines NO health field, so
+//   `entity.health` is `undefined` for every entity that is not the bot itself.
+//   Health, hunger, XP and effects come only from a bot's own connection;
+//   position, yaw, velocity and equipment are fine from the entity view.
+//   A previous version of this file gave its fake ENTITIES a `health` property.
+//   Those tests drove the real handler and asserted the real number — and passed
+//   against an always-zero production path for the entire life of the project.
+//   A mock more capable than reality tests nothing. Fakes here must not carry a
+//   field mineflayer does not populate. The ONE deliberate exception is TC2,
+//   which hands the bridge an impossible health-bearing entity precisely to
+//   prove nothing listens to it; it is labelled as such at the test.
 //
 // WHAT STILL NEEDS THE LIVE HANDSHAKE (NOT covered here — server/compat_check.md):
-//   TC7b the real damage exchange: two opped bots, real entityHurt timing, real
-//        swing cooldown actually moving health. A documented human follow-up.
+//   TC7b the real damage exchange: two opped bots, real `health` packet timing
+//        on each bot's own connection, real swing cooldown actually moving
+//        health. A documented human follow-up (and the AC8 combat probe).
 // ============================================================================
 
 'use strict';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 
 const {
   Macro,
@@ -55,6 +79,9 @@ const {
 
 const { validateOutbound } = require('./transport');
 const { buildEventsBlock, assembleStateMsg, ArenaBots, ACTION_REPEAT } = require('./bot');
+// Recorder spies live in the shared testkit so a change to the EventAggregator
+// recorder surface cannot be applied here and silently missed in bot.test.js.
+const { spyRecorders } = require('./testkit');
 
 // ===========================================================================
 // Frozen enum sanity — must mirror agent/actions.py Macro IntEnum exactly.
@@ -510,15 +537,25 @@ test('assembleStateMsg tolerates an empty/not-ready snapshot and still validates
 // ArenaBots.handleStep — full step wiring, no live server.
 //
 // Drives handleStep with mock bots and an injected tick wait. During the
-// injected wait we simulate the opponent taking a hit (the wired entityHurt
-// handler folds it into the aggregator), then assert the emitted `state` carries
-// exactly that damage and that the NEXT step starts clean (exactly-once).
+// injected wait we simulate the opponent taking a hit ON ITS OWN CONNECTION
+// (`dummy.health` drops and the dummy emits `health`, exactly as mineflayer
+// does), then assert the emitted `state` carries exactly that damage and that
+// the NEXT step starts clean (exactly-once).
 // ===========================================================================
 
-/** A mock learner/dummy bot exposing the fields handleStep snapshots. */
+/**
+ * A mock learner/dummy bot exposing the fields handleStep snapshots.
+ *
+ * Built on a REAL EventEmitter because mineflayer bots are EventEmitters — that
+ * also lets the idempotency tests assert `listenerCount(...)` directly, which is
+ * the only structural way to see a double registration that the health-delta
+ * logic would otherwise mask.
+ *
+ * `health` lives on the BOT and deliberately NOT on `entity`: see the mock
+ * fidelity note in the file header.
+ */
 function stepBot({ username, health, pos }) {
-  const handlers = {};
-  return {
+  return Object.assign(new EventEmitter(), {
     username,
     health,
     heldItem: { name: 'iron_sword' },
@@ -529,27 +566,25 @@ function stepBot({ username, health, pos }) {
       yaw: 0,
       pitch: 0,
       onGround: true,
-      health,
-    },
-    on(event, fn) {
-      (handlers[event] || (handlers[event] = [])).push(fn);
-    },
-    off(event, fn) {
-      if (!handlers[event]) return;
-      handlers[event] = handlers[event].filter((h) => h !== fn);
-    },
-    once() {},
-    emit(event, arg) {
-      for (const fn of handlers[event] || []) {
-        fn(arg);
-      }
+      // NO `health` here — prismarine-entity defines no such field.
     },
     setControlState() {},
     clearControlStates() {},
     attack() {},
     lookAt() {},
     chat() {},
-  };
+  });
+}
+
+/** An ArenaBots with two wired mock bots at the arena spawn offsets. */
+function wiredArena({ transport = captureTransport() } = {}) {
+  const learner = stepBot({ username: 'learner_bot', health: 20, pos: { x: 0.5, y: 64, z: 0.5 } });
+  const dummy = stepBot({ username: 'dummy_bot', health: 20, pos: { x: 3.5, y: 64, z: 0.5 } });
+  const arena = new ArenaBots({}, { transport });
+  arena.learner = learner;
+  arena.dummy = dummy;
+  arena.wireDamageEvents();
+  return { arena, learner, dummy, transport };
 }
 
 /** A capturing transport stub: records sent messages, swallows the rest. */
@@ -584,11 +619,12 @@ test('handleStep runs a macro, drains the window once, and sends one schema-vali
   arena.wireDamageEvents();
 
   // Inject a deterministic tick wait that simulates the opponent taking 5 damage
-  // mid-window (its health drops from 20 to 15 and entityHurt fires once).
+  // mid-window: the DUMMY's own health drops 20 -> 15 and the dummy emits its
+  // own `health` event, which is the only channel that carries another player's
+  // health (the learner's entity view of the dummy never does).
   arena._waitTicksImpl = async () => {
     dummy.health = 15;
-    dummy.entity.health = 15;
-    learner.emit('entityHurt', dummy.entity);
+    dummy.emit('health');
   };
 
   await arena.handleStep({ type: 'step', action: Macro.ATTACK });
@@ -662,32 +698,56 @@ test('handleStep emits an error on an out-of-range action and sends no state', a
 
 // ===========================================================================
 // W1a — wireDamageEvents() idempotency: a second call must not double-register
-// handlers. Calling wireDamageEvents() twice then emitting ONE hit must count
-// that hit exactly ONCE in the aggregator, not twice.
+// handlers.
+//
+// A health-DELTA assertion alone cannot see this bug. With two registered
+// copies, one `health` emit at 14 runs copy #1 (drop 6, records, rebaselines to
+// 14) and then copy #2 (drop 0, records nothing) — final total 6, one recorder
+// call, indistinguishable from correct behavior. So this is pinned two ways
+// that ARE discriminating: the listener count, and the DEATH channel, which has
+// no delta guard and therefore fires once per registered copy.
 // ===========================================================================
 
+test('W1a wireDamageEvents() is idempotent: a second call leaves exactly one listener per channel', () => {
+  const { arena, learner, dummy } = wiredArena();
+
+  // Wire again — simulates a reconnect / re-bind scenario.
+  arena.wireDamageEvents();
+  arena.wireDamageEvents();
+
+  assert.equal(dummy.listenerCount('health'), 1, 'one damage_dealt source, not three');
+  assert.equal(dummy.listenerCount('death'), 1, 'one opponent_died source, not three');
+  assert.equal(learner.listenerCount('health'), 1, 'one damage_taken source, not three');
+  assert.equal(learner.listenerCount('death'), 1, 'one i_died source, not three');
+});
+
+test('W1a wireDamageEvents() is idempotent: one death emit records opponentDied exactly once', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  arena.wireDamageEvents();
+
+  // The death handler has no delta guard, so a double registration is visible
+  // here as a doubled CALL COUNT even though the latched flag would hide it.
+  dummy.emit('death');
+
+  assert.equal(spy.opponentDied, 1, 'one death after two wireDamageEvents() calls records once');
+  assert.equal(arena.events.drain().opponent_died, true);
+});
+
 test('W1a wireDamageEvents() is idempotent: a second call + one hit counts once (not twice)', () => {
-  const learner = stepBot({ username: 'learner_bot', health: 20, pos: { x: 0, y: 64, z: 0 } });
-  const dummy = stepBot({ username: 'dummy_bot', health: 20, pos: { x: 3, y: 64, z: 0 } });
-  const transport = captureTransport();
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
 
-  const arena = new ArenaBots({}, { transport });
-  arena.learner = learner;
-  arena.dummy = dummy;
-
-  // Wire twice — simulates a reconnect / re-bind scenario.
-  arena.wireDamageEvents();
   arena.wireDamageEvents();
 
-  // Emit ONE entityHurt event representing the opponent taking 5 damage.
+  // ONE real hit on the dummy's own connection: 20 -> 15.
   dummy.health = 15;
-  dummy.entity.health = 15;
-  learner.emit('entityHurt', dummy.entity);
+  dummy.emit('health');
 
-  // The aggregator must record the hit exactly once.
-  const w = arena.events.drain();
+  assert.deepEqual(spy.damageDealt, [5], 'exactly one recorder call, for exactly 5');
   assert.equal(
-    w.damage_dealt,
+    arena.events.drain().damage_dealt,
     5,
     'one hit after two wireDamageEvents() calls must be counted exactly once, not twice',
   );
@@ -706,27 +766,20 @@ test('W1a wireDamageEvents() is idempotent: a second call + one hit counts once 
 // ===========================================================================
 
 test('W1b opponent death→respawn→hit: post-respawn hit is counted correctly (not dropped)', () => {
-  const learner = stepBot({ username: 'learner_bot', health: 20, pos: { x: 0, y: 64, z: 0 } });
-  const dummy = stepBot({ username: 'dummy_bot', health: 20, pos: { x: 3, y: 64, z: 0 } });
-  const transport = captureTransport();
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
 
-  const arena = new ArenaBots({}, { transport });
-  arena.learner = learner;
-  arena.dummy = dummy;
-  arena.wireDamageEvents();
-
-  // Phase 1: opponent takes a lethal hit (20 → 0).
+  // Phase 1: opponent takes a lethal hit (20 → 0) on its own health channel.
   dummy.health = 0;
-  dummy.entity.health = 0;
-  learner.emit('entityHurt', dummy.entity);
-  // Consume the death-window events so the next drain is a fresh window.
-  arena.events.drain();
+  dummy.emit('health');
+  const deathWindow = arena.events.drain();
+  assert.equal(deathWindow.damage_dealt, 20, 'the lethal drop is real damage');
+  assert.equal(deathWindow.opponent_died, true, 'health reaching 0 resolves the kill');
 
-  // Phase 2: opponent respawns (health jumps from 0 → 20). The entityHurt
-  // event fires with the new full health — this is the respawn signal.
+  // Phase 2: opponent respawns (health jumps from 0 → 20). The dummy's own
+  // `health` event fires with the new full health — this is the respawn signal.
   dummy.health = 20;
-  dummy.entity.health = 20;
-  learner.emit('entityHurt', dummy.entity);
+  dummy.emit('health');
   // The respawn health-increase must re-seed _prevOpponentHealth; no damage
   // should be recorded for it.
   const respawnWindow = arena.events.drain();
@@ -734,42 +787,34 @@ test('W1b opponent death→respawn→hit: post-respawn hit is counted correctly 
 
   // Phase 3: a genuine 5-damage hit on the freshly respawned opponent (20 → 15).
   dummy.health = 15;
-  dummy.entity.health = 15;
-  learner.emit('entityHurt', dummy.entity);
+  dummy.emit('health');
   const hitWindow = arena.events.drain();
   assert.equal(
     hitWindow.damage_dealt,
     5,
     'post-respawn hit is counted correctly from the re-seeded baseline (not dropped)',
   );
+  // Exactly two recorder calls across the whole sequence: the heal recorded
+  // nothing at all rather than recording a zero or a negative.
+  assert.deepEqual(spy.damageDealt, [20, 5]);
 });
 
 test('W1b self death→respawn→hit: post-respawn damage_taken is counted correctly', () => {
-  const learner = stepBot({ username: 'learner_bot', health: 20, pos: { x: 0, y: 64, z: 0 } });
-  const dummy = stepBot({ username: 'dummy_bot', health: 20, pos: { x: 3, y: 64, z: 0 } });
-  const transport = captureTransport();
-
-  const arena = new ArenaBots({}, { transport });
-  arena.learner = learner;
-  arena.dummy = dummy;
-  arena.wireDamageEvents();
+  const { arena, learner } = wiredArena();
 
   // Phase 1: learner takes a lethal hit (20 → 0).
   learner.health = 0;
-  learner.entity.health = 0;
   learner.emit('health');
   arena.events.drain();
 
   // Phase 2: learner respawns (health 0 → 20). The `health` event fires.
   learner.health = 20;
-  learner.entity.health = 20;
   learner.emit('health');
   const respawnWindow = arena.events.drain();
   assert.equal(respawnWindow.damage_taken, 0, 'a health increase (respawn) records no damage_taken');
 
   // Phase 3: a genuine 3-damage hit on the freshly respawned learner (20 → 17).
   learner.health = 17;
-  learner.entity.health = 17;
   learner.emit('health');
   const hitWindow = arena.events.drain();
   assert.equal(
@@ -798,5 +843,219 @@ test('_turnToLastSeen survives a rejecting bot.lookAt (no unhandled rejection)',
 
   // Give the rejection a tick to settle; an uncaught one aborts node --test.
   await new Promise((resolve) => setImmediate(resolve));
+});
+
+// ===========================================================================
+// TC1-TC4 — THE DAMAGE CHANNEL (AC2-AC5).
+//
+// `damage_dealt` was identically zero for the entire life of the project: the
+// only recorder read `entity.health` off the learner's view of the dummy, a
+// field mineflayer never populates. The tests that "covered" it passed because
+// their fake entity carried a `health` property reality does not have.
+//
+// These cases drive the REAL handlers with fakes that populate only what
+// mineflayer populates, and assert recorder CALL COUNTS rather than totals — a
+// total can be right for the wrong reason, a call count cannot.
+// ===========================================================================
+
+test('TC1/AC2 a dummy-bot health drop 20->14 on its OWN connection records damage_dealt 6', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  // Exactly what mineflayer does live: the dummy's own update_health packet
+  // sets bot.health, then the bot emits 'health' on its own connection.
+  dummy.health = 14;
+  dummy.emit('health');
+
+  assert.deepEqual(spy.damageDealt, [6], 'one recorder call, for exactly the 6 that landed');
+  assert.equal(arena.events.drain().damage_dealt, 6, 'the window carries the landed damage');
+  assert.equal(arena._prevOpponentHealth, 14, 'the baseline advanced to the observed health');
+});
+
+test('TC1/AC2 successive hits each measure from the previous reading (6,6,6,2 -> 20 total)', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  // The AC8 combat-probe sequence, unit-level: three full hits then the lethal
+  // remainder. Each drop must be measured against the previous reading, so the
+  // cumulative dealt damage is exactly the dummy's starting health.
+  for (const health of [14, 8, 2, 0]) {
+    dummy.health = health;
+    dummy.emit('health');
+  }
+
+  assert.deepEqual(spy.damageDealt, [6, 6, 6, 2]);
+  const window = arena.events.drain();
+  assert.equal(window.damage_dealt, 20, 'cumulative dealt damage is exactly the starting health');
+  assert.equal(window.opponent_died, true, 'reaching 0 resolves the kill');
+  assert.equal(spy.opponentDied, 1, 'the kill resolved exactly once');
+});
+
+test('TC2/AC3 an entityHurt event carrying a health-bearing entity is completely inert', () => {
+  const { arena, learner, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  // ==== THE ONE DELIBERATE MOCK INFIDELITY IN THIS FILE ====
+  // Real prismarine-entity objects have NO `health` field. We hand the bridge an
+  // entity MORE capable than any that can exist, because that is the only way to
+  // prove the deleted `entityHurt` damage path cannot come back to life and
+  // double-count alongside the dummy's own health channel. Do not copy this
+  // shape into any other fake.
+  const impossibleEntity = {
+    username: 'dummy_bot',
+    position: { x: 3.5, y: 64, z: 0.5 },
+    health: 15,
+  };
+
+  assert.equal(
+    learner.listenerCount('entityHurt'),
+    0,
+    'no entityHurt subscription exists at all — the damage path is deleted, not bypassed',
+  );
+
+  learner.emit('entityHurt', impossibleEntity);
+  dummy.emit('entityHurt', impossibleEntity);
+
+  assert.deepEqual(spy.damageDealt, [], 'entityHurt records nothing');
+  assert.deepEqual(arena.events.drain(), {
+    damage_dealt: 0,
+    damage_taken: 0,
+    i_died: false,
+    opponent_died: false,
+  });
+  assert.equal(arena._prevOpponentHealth, 20, 'the baseline is untouched by entityHurt');
+
+  // And the genuine channel is unaffected by the noise: a real hit still lands
+  // exactly once, so the two paths cannot double-count.
+  dummy.health = 14;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6]);
+});
+
+test("TC3/AC4 dummy 'death' latches opponent_died once and the latch clears on drain", () => {
+  const { arena, dummy } = wiredArena();
+
+  dummy.emit('death');
+  dummy.emit('death');
+  assert.equal(arena.events.drain().opponent_died, true, 'the window reports the death');
+  assert.equal(
+    arena.events.drain().opponent_died,
+    false,
+    'the latch cleared on drain — a death is never re-reported in a later window',
+  );
+
+  // A realistic kill drives BOTH channels: health reaches 0 on the dummy's own
+  // connection AND the death event fires. They resolve to the same single flag.
+  dummy.health = 0;
+  dummy.emit('health');
+  dummy.emit('death');
+  const killWindow = arena.events.drain();
+  assert.equal(killWindow.opponent_died, true);
+  assert.equal(killWindow.damage_dealt, 20, 'the lethal drop is still counted as damage');
+  assert.equal(arena.events.drain().opponent_died, false, 'and the latch clears again');
+});
+
+test('TC4/AC5 undefined and NaN dummy health record nothing and leave the baseline usable', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  // An unspawned bot reports undefined; a broken feed can report NaN. Folding
+  // either into the baseline is precisely the phantom-damage bug class this
+  // handler replaces.
+  dummy.health = undefined;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [], 'undefined health records nothing');
+  assert.equal(arena._prevOpponentHealth, 20, 'undefined health leaves the baseline untouched');
+
+  dummy.health = NaN;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [], 'NaN health records nothing');
+  assert.equal(arena._prevOpponentHealth, 20, 'NaN health leaves the baseline untouched');
+
+  // The next REAL reading must still be measured from that untouched baseline —
+  // a poisoned baseline would silently eat this hit.
+  dummy.health = 14;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6], 'the next real drop is measured from the intact baseline');
+  assert.equal(arena.events.drain().damage_dealt, 6);
+});
+
+test('TC4/AC5 a NaN self-health reading records nothing and leaves the self baseline usable', () => {
+  const { arena, learner } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  // _onSelfHealth used to fall back to `now = prev`, which silently ate the NEXT
+  // real damage event. The Number.isFinite guard must return early instead.
+  learner.health = undefined;
+  learner.emit('health');
+  learner.health = NaN;
+  learner.emit('health');
+
+  assert.deepEqual(spy.damageTaken, [], 'a garbage self reading records nothing');
+  assert.equal(spy.iDied, 0, 'and never latches a phantom death');
+  assert.equal(arena._prevSelfHealth, 20, 'the self baseline is untouched');
+
+  learner.health = 17;
+  learner.emit('health');
+  assert.deepEqual(spy.damageTaken, [3], 'the next real self drop is still counted');
+});
+
+test('TC4/AC5 a heal re-seeds the baseline, records zero, and never records a negative', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  dummy.health = 14;
+  dummy.emit('health');
+  // Heal / respawn / reset: health goes UP. Nothing is recorded (not a zero, not
+  // a negative) and the baseline moves so the next hit measures from 20.
+  dummy.health = 20;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6], 'the heal added no recorder call at all');
+  assert.equal(arena._prevOpponentHealth, 20, 'the baseline re-seeded to the healed value');
+
+  dummy.health = 14;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6, 6], 'the post-heal hit measures from the re-seeded baseline');
+});
+
+test('TC4/AC5 re-wiring mid-run does not double-count and does not lose the channel', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  dummy.health = 14;
+  dummy.emit('health');
+
+  // A reconnect re-wires; the re-seed reads the dummy's CURRENT health, so the
+  // channel stays continuous rather than replaying the damage already recorded.
+  arena.wireDamageEvents();
+  assert.equal(dummy.listenerCount('health'), 1, 're-wiring left exactly one listener');
+  assert.equal(arena._prevOpponentHealth, 14, 're-wiring re-seeded from the live health');
+
+  dummy.health = 8;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6, 6], 'one call per hit across the re-wire — no double-count');
+  assert.equal(arena.events.drain().damage_dealt, 12);
+});
+
+test('TC4/AC5 a late reset-generated health event is suppressed and leaves the baseline untouched', () => {
+  const { arena, dummy } = wiredArena();
+  const spy = spyRecorders(arena);
+
+  dummy.health = 14;
+  dummy.emit('health');
+
+  // handleReset raises this flag for the whole reset window: the reset's own
+  // /effect heal and /tp generate health events that are NOT combat damage.
+  arena._suppressOpponentEvents = true;
+  dummy.health = 8;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6], 'the reset-generated event recorded nothing');
+  assert.equal(arena._prevOpponentHealth, 14, 'and did not move the baseline');
+
+  // Once the flag drops the channel is live again, measured from the baseline
+  // the suppressed event left alone.
+  arena._suppressOpponentEvents = false;
+  dummy.emit('health');
+  assert.deepEqual(spy.damageDealt, [6, 6], 'the channel resumes after suppression');
 });
 
