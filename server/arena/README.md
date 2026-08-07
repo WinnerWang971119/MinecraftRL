@@ -46,15 +46,22 @@ resetTemplate = {
 ```
 
 Because the read-back gate enforces `requireNoEffects`, the spawn functions
-**clear all effects** and avoid leaving any stored buff active. Knockback
-immunity and void safety are therefore implemented WITHOUT effects:
+**clear all effects first, then grant the instant effects** — never the reverse,
+since a trailing `effect clear` in the same tick can strip an instant effect
+before its first tick applies it. Nothing lingers: `/effect give`'s duration is
+*"in seconds (or in gameticks for `instant_damage`, `instant_health`, and
+`saturation`)"* (minecraft.wiki, `Commands/effect`), so the `1` on those lines is
+**one gametick**, matching `bridge/bot.js:858-860`. Knockback immunity and void
+safety are implemented WITHOUT effects:
 
 - **Knockback immunity** is an **attribute**
-  (`minecraft:knockback_resistance base set 1.0`), not an effect, so the
+  (`minecraft:generic.knockback_resistance base set 1.0`), not an effect, so the
   dummy never gets shoved off its spawn and its position stays observable. Set
-  every reset in `spawn_dummy` to survive respawns.
-  *(1.21 flattened attribute IDs — `generic.` prefix removed; use `minecraft:knockback_resistance`
-  not `minecraft:generic.knockback_resistance`.)*
+  every reset in `spawn_dummy_pad` to survive respawns.
+  *(The `generic.` infix is **required** on the pinned Paper 1.21.1 stack — the
+  flattening that removed it landed in 1.21.2. Verified live and against this
+  repo's boot logs; see `server/README.md` and the header of
+  `spawn_dummy_pad.mcfunction` before changing it.)*
 - **Void / fall immunity** comes from the **bedrock under-floor** laid by
   `arena:setup` (y=62) plus `gamerule fallDamage false` — again, no stored
   effect, so the gate's "no active effects" check still passes.

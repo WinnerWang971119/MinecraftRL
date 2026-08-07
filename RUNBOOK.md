@@ -66,8 +66,10 @@ First-boot checklist (from `server/README.md` / `compat_check.md`):
 - world generates flat, no mobs, `online-mode=false`.
 - the arena datapack loads (`arena:setup` runs on load).
 - `learner_bot` and `dummy_bot` are opped at level 4 (`server/ops.json`).
-- after a bot joins, `/attribute dummy_bot minecraft:knockback_resistance get`
-  resolves and the dummy stays put when hit (the 1.21 attribute-ID fix).
+- after a bot joins, `/attribute dummy_bot minecraft:generic.knockback_resistance get`
+  resolves and the dummy stays put when hit. The `generic.` infix is **required**
+  on the pinned Paper 1.21.1 stack — the flattening that removed it landed in
+  1.21.2. See `server/README.md` before changing this form.
 
 ## Step 2 — start the bridge
 

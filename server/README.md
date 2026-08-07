@@ -128,10 +128,29 @@ Spawn template (matches `bridge/bot.js` `resetTemplate`): learner at
 `[0.5, 64, 0.5]` with an `iron_sword`; dummy at `[3.5, 64, 0.5]` with
 `knockback_resistance = 1.0`.
 
-**1.21 attribute ID note:** Minecraft 1.21 flattened attribute IDs — the `generic.` infix was
-removed. The arena functions use `minecraft:knockback_resistance` and `minecraft:movement_speed`
-(not `minecraft:generic.*`). The live handshake should confirm the `/attribute dummy_bot
-minecraft:knockback_resistance get` command resolves and that the dummy stays put after a hit.
+**Attribute ID note — this stack REQUIRES the `generic.` infix.** The arena functions use
+`minecraft:generic.knockback_resistance` and `minecraft:generic.movement_speed`. The flattening
+that *removed* the `generic.` infix landed in **Minecraft 1.21.2**; Paper here is pinned to
+**1.21.1 build 133**, which predates it, so the un-prefixed ids simply do not exist.
+
+This was verified two ways after an earlier revision of this file asserted the opposite:
+
+1. Live console round-trips against the booted server (`server/logs/latest.log`) — the
+   un-prefixed probes were immediately retried with the `generic.` prefix, and only the
+   prefixed form was used thereafter.
+2. This repo's own boot logs, which had been failing on it for three consecutive boots
+   (`server/logs/2026-08-08-{1,2,3}.log.gz`):
+
+   ```
+   [ServerMain/ERROR]: Failed to load function arena:spawn_dummy
+   IllegalArgumentException: Whilst parsing command on line 41:
+     Can't find element 'minecraft:knockback_resistance' of type 'minecraft:attribute'
+   ```
+
+Do not re-flip this from memory. A wrong id is not a soft failure: inside a **macro** function a
+parse error aborts instantiation of the entire function, so *no* command in it runs — the dummy
+gets no teleport, heal, food, knockback immunity or spawnpoint, and nothing appears in the boot
+log. If the pinned Paper version is ever moved to 1.21.2+, flatten both ids in the same commit.
 
 ## Plugins
 
