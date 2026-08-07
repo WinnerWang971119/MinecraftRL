@@ -3,12 +3,15 @@
 # ============================================================================
 # MACRO ARGUMENT CONTRACT
 # ============================================================================
-#   /function arena:spawn_dummy_pad {x:<int>,z:<int>,dummy:"<name>"}
+#   /function arena:spawn_dummy_pad {x:<int>,z:<int>,dummy:"<name>",nonce:<int>}
 #
 #   x, z  : pad ANCHOR. NON-NEGATIVE PLAIN INTEGERS, no NBT type suffix.
 #           (See arena:setup_pad's header for the rationale.)
 #   dummy : the dummy bot's Minecraft username, e.g. "dummy_bot" (pad 0) or
 #           "dummy_3". Must be opped (server/ops.json).
+#   nonce : NON-NEGATIVE PLAIN INTEGER, unique per reset. Stamped into the
+#           causality beacon on the last line so a beacon that arrives after its
+#           own reset gave up cannot satisfy the next one. REQUIRED.
 #
 #   Normally invoked via arena:reset_pad, which forwards its own arguments here.
 #   arena:spawn_dummy is the pad-0 / "dummy_bot" convenience wrapper.
@@ -121,3 +124,14 @@ $attribute $(dummy) minecraft:generic.movement_speed base set 0.0
 $execute as $(dummy) at @s run spawnpoint @s ~ ~ ~
 
 $tellraw @a[tag=arena_debug] {"text":"[arena] dummy $(dummy) reset @ anchor $(x),$(z) +3.5X (kb_resist=1.0, idle, spawnpoint pinned).","color":"gold"}
+
+# --- RESET CAUSALITY BEACON. MUST STAY THE LAST LINE OF THIS FILE. ----------
+#     See the twin block at the end of spawn_learner_pad.mcfunction for the full
+#     rationale. It matters MOST here: the dummy dies every episode, so its
+#     post-respawn state (full health, empty inventory, effects cleared by
+#     death, at the previously-pinned spawnpoint) is indistinguishable from a
+#     correct reset — and the `generic.` attribute ids above are the single
+#     likeliest line in this datapack to abort instantiation of this whole
+#     function. Addressed to $(dummy) by name; the bridge listens on the DUMMY's
+#     own connection for it and matches the text exactly.
+$tellraw $(dummy) {"text":"[arena] reset_ok dummy $(x) $(z) $(dummy) $(nonce)"}

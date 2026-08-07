@@ -6,7 +6,7 @@
 #   on pad 0.
 #
 # Multi-pad callers must NOT use this — they call the macro directly:
-#     /function arena:spawn_dummy_pad {x:<int>,z:<int>,dummy:"<name>"}
+#     /function arena:spawn_dummy_pad {x:<int>,z:<int>,dummy:"<name>",nonce:<int>}
 # See spawn_dummy_pad.mcfunction for the argument contract and the template.
 #
 # Attribute ids on this stack REQUIRE the `generic.` infix
@@ -15,4 +15,4 @@
 # repo's boot logs — see the header of spawn_dummy_pad.mcfunction before
 # changing it.
 
-function arena:spawn_dummy_pad {x:0,z:0,dummy:"dummy_bot"}
+function arena:spawn_dummy_pad {x:0,z:0,dummy:"dummy_bot",nonce:0}

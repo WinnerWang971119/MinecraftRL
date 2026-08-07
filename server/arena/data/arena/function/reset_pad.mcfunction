@@ -3,7 +3,7 @@
 # ============================================================================
 # MACRO ARGUMENT CONTRACT  (this is the entry point the bridge calls every reset)
 # ============================================================================
-#   /function arena:reset_pad {x:<int>,z:<int>,learner:"<name>",dummy:"<name>"}
+#   /function arena:reset_pad {x:<int>,z:<int>,learner:"<name>",dummy:"<name>",nonce:<int>}
 #
 #   x, z    : pad ANCHOR. NON-NEGATIVE PLAIN INTEGERS, no NBT type suffix
 #             (`0`, `340`, `1200` — never `0b`, `0d`, `340L`, `"340"`, `340.0`;
@@ -16,6 +16,12 @@
 #   learner : learner bot username, e.g. "learner_bot" (pad 0) or "learner_3".
 #   dummy   : dummy   bot username, e.g. "dummy_bot"   (pad 0) or "dummy_3".
 #             Both must be opped (server/ops.json).
+#   nonce   : NON-NEGATIVE PLAIN INTEGER, unique per reset (the bridge passes its
+#             monotonic reset epoch). Forwarded verbatim to both spawn functions
+#             and stamped into their causality beacons, so a beacon delayed past
+#             its own reset cannot satisfy the NEXT one. Pad-0 wrappers pass 0.
+#             REQUIRED, like every macro key: a macro function errors if a
+#             referenced key is absent.
 #
 #   Example, pad 0 (the anchor is (0,0) by definition, not a copied constant):
 #     /function arena:reset_pad {x:0,z:0,learner:"learner_bot",dummy:"dummy_bot"}
@@ -41,5 +47,5 @@ $execute positioned $(x) 64 $(z) run kill @e[type=!minecraft:player,distance=..6
 # --- Re-place and re-gear both bots ----------------------------------------
 #     Arguments are forwarded verbatim; the two callees hold the single source
 #     of truth for each bot's reset template.
-$function arena:spawn_learner_pad {x:$(x),z:$(z),learner:"$(learner)"}
-$function arena:spawn_dummy_pad {x:$(x),z:$(z),dummy:"$(dummy)"}
+$function arena:spawn_learner_pad {x:$(x),z:$(z),learner:"$(learner)",nonce:$(nonce)}
+$function arena:spawn_dummy_pad {x:$(x),z:$(z),dummy:"$(dummy)",nonce:$(nonce)}

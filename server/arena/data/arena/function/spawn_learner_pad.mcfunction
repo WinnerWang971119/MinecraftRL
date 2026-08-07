@@ -3,7 +3,7 @@
 # ============================================================================
 # MACRO ARGUMENT CONTRACT
 # ============================================================================
-#   /function arena:spawn_learner_pad {x:<int>,z:<int>,learner:"<name>"}
+#   /function arena:spawn_learner_pad {x:<int>,z:<int>,learner:"<name>",nonce:<int>}
 #
 #   x, z    : pad ANCHOR. NON-NEGATIVE PLAIN INTEGERS, no NBT type suffix.
 #             (See arena:setup_pad's header for the full rationale — `$(x)` is a
@@ -13,6 +13,9 @@
 #             illustrate literal syntax only; they are not anchors.)
 #   learner : the learner bot's Minecraft username, e.g. "learner_bot" (pad 0)
 #             or "learner_3". Must be opped (server/ops.json).
+#   nonce   : NON-NEGATIVE PLAIN INTEGER, unique per reset. Stamped into the
+#             causality beacon on the last line so a beacon that arrives after
+#             its own reset gave up cannot satisfy the next one. REQUIRED.
 #
 #   Normally invoked via arena:reset_pad, which forwards its own arguments here.
 #   arena:spawn_learner is the pad-0 / "learner_bot" convenience wrapper.
@@ -130,3 +133,22 @@ $give $(learner) minecraft:iron_sword 1
 $execute as $(learner) at @s run spawnpoint @s ~ ~ ~
 
 $tellraw @a[tag=arena_debug] {"text":"[arena] learner $(learner) reset @ $(x).5 64 $(z).5 (iron_sword, spawnpoint pinned).","color":"aqua"}
+
+# --- RESET CAUSALITY BEACON. MUST STAY THE LAST LINE OF THIS FILE. ----------
+#     The bridge's read-back gate verifies TEMPLATE MATCH, not causality, and
+#     after a kill the natural post-respawn state IS the template state (full
+#     health at the pinned spawnpoint, effects cleared by death, keepInventory
+#     preserving the gear). So if this function ever aborts at INSTANTIATION —
+#     the silent-at-boot, total-at-runtime macro hazard documented in
+#     spawn_dummy_pad's header, whose likeliest real trigger is a Paper 1.21.2
+#     bump or someone "fixing" the `generic.` attribute prefix from memory —
+#     the gate would pass and the bridge would ack a reset that never happened.
+#     No saturation restore (AC18 drifts), no attribute re-apply, invisibly.
+#
+#     A bare respawn cannot produce this line, so observing it is proof the
+#     function ran. It is addressed to $(learner) BY NAME rather than @a so a
+#     25-pad fleet does not broadcast 2N confirmations to 2N clients, and it
+#     carries the anchor and the username so one pad's beacon can never confirm
+#     another's. bridge/bot.js matches this text EXACTLY (formatResetConfirmation)
+#     — change one and you must change the other.
+$tellraw $(learner) {"text":"[arena] reset_ok learner $(x) $(z) $(learner) $(nonce)"}

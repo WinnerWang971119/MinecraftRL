@@ -6,7 +6,7 @@
 #   (the heal/food restore uses instant effects that last one gametick).
 #
 # Multi-pad callers must NOT use this — they call the macro directly:
-#     /function arena:spawn_learner_pad {x:<int>,z:<int>,learner:"<name>"}
+#     /function arena:spawn_learner_pad {x:<int>,z:<int>,learner:"<name>",nonce:<int>}
 # See spawn_learner_pad.mcfunction for the argument contract and the template.
 
-function arena:spawn_learner_pad {x:0,z:0,learner:"learner_bot"}
+function arena:spawn_learner_pad {x:0,z:0,learner:"learner_bot",nonce:0}
