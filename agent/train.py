@@ -2019,9 +2019,10 @@ def _build_parser() -> "Any":
         help="number of parallel Minecraft arenas to train from (default: 1). "
         "1 == today's exact single-env path (no threading, no weight sync). "
         ">1 engages the multi-arena ActorPool + decoupled learner: arena i "
-        "connects to bridge port (--port)+i. The N bridges/servers must already "
-        "be started (server/setup/start-arenas.ps1). This is the agent.train "
-        "TRAINING flag, distinct from eval.benchmark's measurement --arenas.",
+        "connects to bridge port (--port)+i. The N pads must already be booted "
+        "and PRIMED (server/setup/start-pads.sh --pads N, wait for FLEET READY). "
+        "This is the agent.train TRAINING flag, distinct from eval.benchmark's "
+        "measurement --arenas.",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -2177,11 +2178,12 @@ def _main_multi_arena(
     Constructs, per arena ``i``, an env factory that opens a
     :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port ``--port + i`` and wraps
     it in an :class:`~env.mc_pvp_env.MCPvPEnv`, then runs :func:`train_multi_arena`.
-    The N bridges/servers must ALREADY be started by the human
-    (``server/setup/start-arenas.ps1``); T8 only connects clients. The
+    The N pads must ALREADY be booted AND PRIMED by the human
+    (``server/setup/start-pads.sh --pads N``, which resets every pad before any pad
+    may step); T8 only connects clients. The
     :class:`~distributed.launcher.SubprocessArenaLauncher` is imported lazily here so
     the import is paid only on the N>1 path; if it is unavailable the run fails with a
-    clear message (the launcher is needed only to RELAUNCH a dead arena).
+    clear message (the launcher is needed only to RELAUNCH a dead pad's bridge).
 
     Returns the process exit code (0 == passed the M2 gate).
     """

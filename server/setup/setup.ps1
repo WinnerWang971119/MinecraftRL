@@ -31,7 +31,8 @@
 
 .PARAMETER McPort
   Minecraft server-port written into server.properties. Defaults to 25565 (the
-  single-arena default). Multi-arena callers pass 25565+i (see start-arenas.ps1).
+  single-arena default). The pad topology keeps ONE JVM on 25565; this parameter
+  survives for a hand-stamped alternate root.
 
 .PARAMETER WorldName
   level-name / world directory written into server.properties. Defaults to
@@ -70,8 +71,9 @@
   Backward compatibility: with NO new args this script behaves exactly as
   before (single arena, port 25565, world 'world', usernames learner_bot /
   dummy_bot, plus the jar download, eula, and datapack install). The new
-  parameters and the ops.json write are ADDITIVE; start-arenas.ps1 reuses this
-  script to stamp each per-arena root.
+  parameters and the ops.json write are ADDITIVE. NOTE: the N-JVM orchestrator
+  that used to drive them (start-arenas.ps1) is gone -- the pad fleet runs ONE JVM
+  and is launched from server/setup/start-pads.sh on macOS/Linux.
 #>
 
 [CmdletBinding()]

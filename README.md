@@ -172,7 +172,7 @@ the kickoff stack only logs it so train/serve skew stays visible.
 | M1 slice | `python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555` | ≥100 eps, zero crashes |
 | M1 benchmark | `python -m eval.benchmark --duration 600 --arenas 1` | Sweep `--arenas 2,3,4` for the max; this is the AC4 **measurement** flag on `eval.benchmark` |
 | M2 training (single arena) | `python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
-| Multi-arena training | `pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas N` then `python -m agent.train --arenas N --max-episodes 10000 --checkpoint runs/m2.pt --run-name m2_multi` | `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
+| Multi-arena training | `bash server/setup/start-pads.sh --pads N` (wait for `FLEET READY`) then `python -m agent.train --arenas N --max-episodes 10000 --checkpoint runs/m2.pt --run-name m2_multi` | One Paper JVM, N enclosed pads, bridge port `5555+i`. `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
 
 **Run order for anything live: Paper → bridge → Python driver.** Full ordered
 procedure, pass conditions, and what to watch (reward components, Q divergence) are

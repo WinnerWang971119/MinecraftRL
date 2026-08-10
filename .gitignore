@@ -59,9 +59,9 @@ server/config/
 server/version_history.json
 server/whitelist.json
 
-# Multi-arena runtime: start-arenas.ps1 materializes server/arenas/arena-<i>,
-# each a full Paper runtime. All generated; source of truth is the setup script
-# + the committed arena datapack.
+# Multi-arena runtime leftovers. The pad topology (T10) runs ONE Paper JVM out of
+# server/, so nothing is materialized here any more; the entry stays so a checkout
+# that still has the old per-arena roots on disk does not commit them.
 server/arenas/
 
 # ---- Logs / scratch ----

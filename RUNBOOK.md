@@ -159,45 +159,54 @@ Do not confuse them.
 
 ### Launch procedure
 
-**1. Dry-run first** to print the full plan and sanity-check ports, usernames, and
-arena roots before anything goes live:
+> **Topology note (T10).** This is now **one Paper JVM hosting N enclosed pads**,
+> not N JVMs. The Minecraft port stays `25565`; pad `i` gets bridge port `5555+i`,
+> anchor `((i % 5) * 512, (i // 5) * 512)`, and bots `learner_bot`/`dummy_bot` at
+> `i == 0`, `learner_<i>`/`dummy_<i>` above. `server/setup/start-pads.sh` is the
+> launcher. The old PowerShell N-JVM orchestrator is gone.
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -DryRun
+**1. Dry-run first** to print the full plan and sanity-check ports, usernames, and
+anchors before anything goes live:
+
+```bash
+bash server/setup/start-pads.sh --pads 2 --dry-run
 ```
 
-Check the output: each arena should show distinct MC ports (25565, 25566, ...),
-distinct bridge ports (5555, 5556, ...), distinct learner/dummy usernames
-(`learner_0`/`dummy_0`, `learner_1`/`dummy_1`, ...), and separate server roots
-under `server/arenas/arena-N`.
+Check the output: one shared MC port (25565), distinct bridge ports (5555, 5556,
+...), distinct anchors (`0,0`, `512,0`, ...) and distinct usernames
+(`learner_bot`/`dummy_bot`, `learner_1`/`dummy_1`, ...).
 
 You can also verify the Python-side plan without touching any process:
 
-```powershell
-python -m distributed.launcher --arenas 2 --dry-run
+```bash
+python -m distributed.launcher --pads 2 --dry-run
 ```
 
-**2. Run `setup.ps1` once** (idempotent; downloads the Paper jar into the canonical
-root that `start-arenas.ps1` copies from):
+**2. Run `setup.sh` once with the pad count** (idempotent; downloads the Paper jar
+and sizes `max-players` to `2N+10`):
 
-```powershell
-pwsh -NoProfile -File server/setup/setup.ps1
+```bash
+PADS=2 bash server/setup/setup.sh
 ```
 
-**3. Start N arenas** (Paper servers + bridges). This blocks and keeps all processes
-alive until Ctrl-C:
+**3. Start the fleet** (Paper + N bridges + the prime barrier). This blocks and
+keeps every process alive until Ctrl-C:
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2
+```bash
+bash server/setup/start-pads.sh --pads 2
 ```
 
-Wait for each bridge to print `listening on 127.0.0.1:555N` before proceeding. First boot is
-slow; give it a minute per arena. If a bridge fails to connect, the script will
-show the process exit; Paper was not ready. Stop everything (Ctrl-C), wait for the
-JVMs to finish world-gen, and re-run.
+Add `--check` to run only the preflight gates (max-players, ports, datapack, ops)
+and exit. The script starts Paper, then each bridge one at a time — a pad's bridge
+port opens only after both of its bots have joined, so the port coming up *is* the
+join gate — then resets every pad once before printing `FLEET READY`.
+
+**Do not start the Python driver until `FLEET READY` is printed.** Until every pad
+has been reset, all 2N bots are stacked at the shared world spawn inside pad 0, and
+a stepping pad will hit foreign bots and credit the damage to the wrong policy.
 
 **4. Confirm each bridge is listening** (from a second terminal, while
-`start-arenas.ps1` is still running):
+`start-pads.sh` is still running):
 
 ```powershell
 # Arena 0 (bridge port 5555)
@@ -210,8 +219,8 @@ python -c "import socket; s=socket.create_connection(('127.0.0.1',5556),2); s.cl
 by cores + thermal, not RAM, so this is the measurement that actually finds it.
 The answer is the highest N where **every** arena holds ≥19 TPS for the **full**
 10 min *and* aggregate transitions/s is still rising. Because the live benchmark
-opens one real `TcpBridgeClient` on `port + i` per arena, N real servers must be
-up first — relaunch `start-arenas.ps1 -Arenas N` (step 3) to match before each run:
+opens one real `TcpBridgeClient` on `port + i` per arena, N pads must be up first —
+relaunch `start-pads.sh --pads N` (step 3) to match before each run:
 
 ```powershell
 python -m eval.benchmark --duration 600 --arenas 1
@@ -242,11 +251,12 @@ The max usable arena count is the last N *before* the trip. Record each run:
 The real AC4 number is measured live here; it could not be measured in-session.
 
 **6. Run multi-arena training** with the winning N (once you know it from step 5).
-Keep `start-arenas.ps1` running (or relaunch it), then in a separate terminal:
+Keep `start-pads.sh` running (or relaunch it), wait for `FLEET READY`, then in a
+separate terminal:
 
-```powershell
-python -m agent.train --arenas 2 --max-episodes 10000 `
-  --eval-every-grad-steps 1000 --eval-episodes 100 `
+```bash
+python -m agent.train --arenas 2 --max-episodes 10000 \
+  --eval-every-grad-steps 1000 --eval-episodes 100 \
   --checkpoint runs/m2_multi.pt --run-name m2_multi
 ```
 
@@ -258,17 +268,18 @@ N bridges must already be listening before this command runs.
 **Stopping.** Ctrl-C on `agent.train` cleanly stops the collector threads. The
 multi-arena path writes a checkpoint during the run whenever a greedy eval
 improves the win-rate (not on exit), so the latest best-eval checkpoint is
-already on disk. Then Ctrl-C on `start-arenas.ps1` tears down all Paper servers
-and bridges.
+already on disk. Then Ctrl-C on `start-pads.sh` tears down every bridge and the
+Paper JVM.
 
-**Fast relaunch** (if you need to restart training without re-generating worlds):
+**Fast relaunch** (restart the bridges against a Paper JVM that is already up):
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -SkipSetup
+```bash
+bash server/setup/start-pads.sh --pads 2 --no-server
 ```
 
-`-SkipSetup` skips the per-arena `setup.ps1` call, so existing worlds and
-`ops.json` files are reused. Relaunch is still 30–60 s+ per arena for JVM startup.
+`--no-server` attaches to the running JVM instead of starting one, so you skip the
+world load. It requires `ops.json` to already op all 2N bots (a running server will
+not re-read that file) and still runs the prime barrier.
 
 ---
 
@@ -327,7 +338,7 @@ If Q diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
 |-----------|---------|----------------|-----|
 | M1 plumbing | `eval.run_random --episodes 100` | ≥100 eps, 0 crashes, RSS < 200 MB | AC3 |
 | M1 number | `eval.benchmark --duration 600` | transitions/s, p99, damage-exact, max-arenas@19TPS | AC4 |
-| Multi-arena live run | `start-arenas.ps1 -Arenas N` + `eval.benchmark --arenas N` | max N sustaining ≥19 TPS (live-measured); `agent.train --arenas N` runs training | AC4 follow-up |
+| Multi-arena live run | `start-pads.sh --pads N` + `eval.benchmark --arenas N` | max N sustaining ≥19 TPS (live-measured); `agent.train --arenas N` runs training | AC4 follow-up |
 | Recurrence | `pytest tests/test_dqn.py -k memory` | memory fixture green, ablation fails | TC8b |
 | M2 learning | `agent.train --checkpoint runs/m2.pt` | win ≥95%, aim-while-invisible == 0, len < cap | AC6 |
 
