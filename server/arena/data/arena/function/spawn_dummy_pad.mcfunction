@@ -20,7 +20,7 @@
 # RESET TEMPLATE (MUST stay consistent with bridge/bot.js: dummy = spawn.x + 3)
 # ============================================================================
 #   position : (x+3.5, 64, z+0.5)
-#   facing   : -X toward the learner (yaw -90, pitch 0)
+#   facing   : -X toward the learner (yaw 90, pitch 0)  <- 90, see the teleport
 #   health   : full (20)
 #   food     : full (20) + full saturation
 #   inventory: empty (a passive target, no weapon)
@@ -67,7 +67,28 @@
 # --- Clear inventory: the dummy carries nothing ---
 $clear $(dummy)
 
-# --- Teleport to the fixed spawn, facing the learner (-X, yaw -90) ----------
+# --- Teleport to the fixed spawn, facing the learner (-X, yaw 90) -----------
+#     THE YAW IS 90, NOT -90. Minecraft's look vector is
+#         look.xz = (-sin(yaw), cos(yaw))     [env/perception_filter.py:59-65]
+#     so yaw -90 -> (+1, 0) = +X and yaw 90 -> (-1, 0) = -X. The dummy stands at
+#     anchor+3.5 and the learner at anchor+0.5 on the SAME z, so dummy ->
+#     learner is -X, and the yaw that looks -X solves -sin(yaw) = -1, i.e.
+#     yaw = 90 (cos(90) = 0, so the z component is 0 as the shared z requires).
+#
+#     MEASURED, NOT INFERRED (T22). This line used to read `-90 0` and was
+#     annotated "facing the learner (-X, yaw -90)". A server-authoritative read
+#     after a reset, both bots at rest, showed:
+#         learner_bot Rotation: [90.0f, 0.0f]   Pos: [1024.5d, 64.0d, 0.5d]
+#         dummy_bot   Rotation: [-90.0f, 0.0f]  Pos: [1027.5d, 64.0d, 0.5d]
+#     Both bots were pointing directly AWAY from each other. The dummy is the
+#     worse half: it is stationary and passive, so it never turns, and it faced
+#     away for the ENTIRE episode, every episode. Corroborated by the wire yaws
+#     (1.570796 rad and 4.712389 rad) and a live walk whose forward/APPROACH leg
+#     moved -X. No test catches this — bot.attack(entity) does not require
+#     facing, so AC8's combat probe passed throughout.
+#     spawn_learner_pad.mcfunction carries the mirrored fix; the two must stay
+#     opposite (learner -90, dummy +90) or the bots point the same way.
+#
 #     Two steps, because the dummy sits at anchor + 3.5 and `$(x)` is a purely
 #     textual substitution: there is no macro form that yields "3.5" from "0".
 #       step 1: absolute park on the learner cell, using the same safe
@@ -85,7 +106,7 @@ $clear $(dummy)
 #               unambiguous. LIVE CHECK (TC6/TC7): confirm the dummy sits at
 #               anchor+3.5 on EVERY pad, not just pad 0.
 $tp $(dummy) $(x).5 64 $(z).5
-$execute positioned $(x).5 64 $(z).5 run tp $(dummy) ~3 ~ ~ -90 0
+$execute positioned $(x).5 64 $(z).5 run tp $(dummy) ~3 ~ ~ 90 0
 
 # --- Full health, full hunger, no leftover effects --------------------------
 #     CLEAR FIRST, THEN GIVE. See spawn_learner_pad for the full rationale: a

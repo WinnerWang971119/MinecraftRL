@@ -272,8 +272,9 @@ data get entity dummy_bot Health
 
 ## What "working correctly" looks like
 
-Go through this list while the driver runs. Items 5 and 6 are the two things nobody
-has ever checked by eye.
+Go through this list while the driver runs. Item 5 was the open question; it has now
+been checked, it was a real defect, and the item is the confirmation that the fix took.
+Item 6 is still the one thing nobody has ever checked by eye.
 
 **1. Both bots are placed, three blocks apart, at every episode start.**
 Learner at `x ≈ 0.5`, dummy at `x ≈ 3.5`, both `y = 64`, both `z ≈ 0.5`. Press F3 and
@@ -318,22 +319,45 @@ there is a known first-cycle-after-boot false-fail tied to issue **#28**, the
 episode-start attack-cooldown observable. That has been fixed bridge-side but is
 itself **pending live verification**.)
 
-**5. Which way is the dummy facing? — open question, please check this.**
-The dummy never turns on its own, so whatever direction it points at episode start is
-exactly what the datapack's teleport set. It is *supposed* to face the learner, i.e.
-look toward `−X` / toward `x = 0.5`.
+**5. Which way do the bots face? — answered, defect confirmed, fixed. Verify the fix.**
+This was an open question. It was checked, and both bots really were spawning facing
+directly **away** from each other. Both spawn yaws were inverted; **T22 fixed them**,
+and this item is now the live confirmation that the fix took.
 
-If it is facing **away** from the learner, say so — that is a real defect and nothing
-in the automated suite would catch it (`bot.attack()` does not require the attacker to
-be facing its target, so the combat probe passes either way). Both spawn functions
-annotate their teleport yaw as facing the opponent, and the value used is the one
-Minecraft normally reads as the *opposite* direction. Nobody has looked.
+The reading that found it (server console, both bots at rest after a reset, on pad 2):
 
-Why it would matter beyond looking odd: `r_aim` pays out only when the opponent is
-both visible **and** in the crosshair, so if the *learner*'s spawn yaw is inverted the
-same way, every episode starts with the one dense shaping term reading zero and the
-agent has to turn around before any of it comes back. The dummy is the cleaner thing
-to read, because it never turns; the learner starts moving the moment the driver does.
+```
+learner_bot Rotation: [90.0f, 0.0f]   Pos: [1024.5d, 64.0d, 0.5d]
+dummy_bot   Rotation: [-90.0f, 0.0f]  Pos: [1027.5d, 64.0d, 0.5d]
+```
+
+Minecraft's look vector is `(x, z) = (−sin yaw, cos yaw)`, so yaw `90` looks `−X` and
+yaw `−90` looks `+X`. The learner was looking `−X` with the dummy `+X` of it, and the
+dummy `+X` with the learner `−X` of it: each pointed exactly 180° from its opponent.
+The datapack now uses learner yaw **−90** (looks `+X`, toward the dummy) and dummy yaw
+**+90** (looks `−X`, toward the learner).
+
+**What to check.** From the console, right after a reset and before the driver moves
+anything — this is the whole test, and it does not need the game window:
+
+```
+data get entity learner_bot Rotation
+data get entity dummy_bot Rotation
+```
+
+Expected, exactly: `learner_bot` → `[-90.0f, 0.0f]`, `dummy_bot` → `[90.0f, 0.0f]`.
+Anything else — and especially the old `[90.0f, ...]` / `[-90.0f, ...]` pair — means
+the server is running a stale datapack copy; re-run `server/setup/setup.sh`'s datapack
+install step and `/reload`. By eye, the dummy should be looking back down the fight
+line at the learner's spawn cell, not out over the `+X` wall.
+
+Nothing in the automated suite can confirm this for you. `bot.attack()` does not
+require the attacker to be facing its target, so the combat probe passed the entire
+time the bots were back-to-back. What the bug actually cost: `r_aim` pays out only
+when the opponent is both visible **and** in the crosshair, so every episode opened
+with the one dense shaping term reading zero until the agent turned ~180°, and the
+dummy — which never turns on its own — faced away for the whole episode, every
+episode. With the fix, both bots start eye-to-eye at 0° of crosshair error.
 
 **6. Is the bedrock ring actually closed?**
 Fly to each of the four corners — `(−8, −12)`, `(−8, +12)`, `(+16, −12)`, `(+16, +12)`

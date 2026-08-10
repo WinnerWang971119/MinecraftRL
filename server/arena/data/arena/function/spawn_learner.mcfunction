@@ -1,7 +1,7 @@
 # arena:spawn_learner — pad-0 convenience wrapper around arena:spawn_learner_pad.
 #
 # Takes NO arguments. Resets learner_bot at anchor (0, 64, 0) to the template:
-#   position (0.5, 64, 0.5), yaw 90 (facing the dummy), health 20, food 20,
+#   position (0.5, 64, 0.5), yaw -90 (facing the dummy, +X), health 20, food 20,
 #   inventory exactly { iron_sword }, spawnpoint on pad 0, no active effects
 #   (the heal/food restore uses instant effects that last one gametick).
 #

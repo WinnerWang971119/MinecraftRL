@@ -24,7 +24,7 @@
 # RESET TEMPLATE (MUST match bridge/bot.js resetTemplate, anchored)
 # ============================================================================
 #   position : (x+0.5, 64, z+0.5)   block centre, one block above the y=63 floor
-#   facing   : +X toward the dummy  (yaw 90, pitch 0)
+#   facing   : +X toward the dummy  (yaw -90, pitch 0)  <- -90, see the teleport
 #   health   : full (20)
 #   food     : full (20) + full saturation
 #   inventory: exactly { iron_sword }
@@ -36,12 +36,21 @@
 #              — that is the bug the ordering removes.
 #   spawnpoint: this pad
 #
-# At anchor (0,0) with learner="learner_bot" the /tp line expands to the
-# byte-identical text of the pre-macro arena:spawn_learner:
-#   `tp learner_bot 0.5 64 0.5 90 0`  ->  AC11 (same coordinates and usernames).
-# ONLY that one line is byte-identical. Do NOT read this as a claim about the
-# whole sequence — it differs from the pre-macro arena:spawn_learner in five
-# ways, all deliberate:
+# At anchor (0,0) with learner="learner_bot" the /tp line expands to
+#   `tp learner_bot 0.5 64 0.5 -90 0`
+# — the same POSITION and USERNAME the pre-macro arena:spawn_learner used, which
+# is exactly what AC11 pins (same ports, usernames and coordinates at N=1).
+#
+# THE YAW DELIBERATELY NO LONGER MATCHES THE PRE-MACRO TEXT. That text ended
+# `90 0`, and 90 was measured live to point the learner AWAY from the dummy (the
+# teleport comment below carries the reading). AC11 says nothing about rotation,
+# and the offline proof of AC11 — bridge/bot.test.js "the default-anchor reset
+# command is byte-identical to the committed arena:reset wrapper" — compares the
+# `function arena:reset_pad {...}` invocation line in reset.mcfunction, which
+# carries no yaw at all. So this correction cannot move that test.
+#
+# Do NOT read the expansion above as a claim about the whole sequence — it
+# differs from the pre-macro arena:spawn_learner in six ways, all deliberate:
 #   1. no trailing `effect clear` (see the ordering note below);
 #   2. an added saturation restore (food/hunger stationarity, plan AC18);
 #   3. an added per-bot /spawnpoint (cross-pad respawn contamination);
@@ -49,19 +58,46 @@
 #      "[arena] learner reset @ 0.5 64 0.5 (iron_sword)."; this file emits the
 #      macro form carrying the username and "spawnpoint pinned";
 #   5. every line here is `$`-prefixed, so it is the EXPANSION that matches
-#      HEAD's text, never the source line as written in this file.
+#      HEAD's text, never the source line as written in this file;
+#   6. the spawn yaw is -90; HEAD's 90 was inverted (T22).
 
 # --- Clear inventory so the read-back gate sees EXACTLY the template gear ---
 $clear $(learner)
 
-# --- Teleport to the fixed spawn, facing the dummy (+X, yaw 90) ---
+# --- Teleport to the fixed spawn, facing the dummy (+X, yaw -90) ------------
+#     THE YAW IS -90, NOT 90. Minecraft's look vector is
+#         look.xz = (-sin(yaw), cos(yaw))     [env/perception_filter.py:59-65]
+#     so yaw 0 -> (0, +1) = +Z, yaw 90 -> (-1, 0) = -X, yaw -90 -> (+1, 0) = +X.
+#     The dummy sits at anchor+3.5 on the SAME z, so learner -> dummy is +X, and
+#     the yaw that looks +X is the solution of -sin(yaw) = 1, i.e. yaw = -90
+#     (cos(-90) = 0, so the z component is 0 as the shared z requires).
+#
+#     MEASURED, NOT INFERRED (T22). This line used to read `90 0` and was
+#     annotated "facing the dummy (+X, yaw 90)". A server-authoritative read
+#     after a reset, both bots at rest, showed:
+#         learner_bot Rotation: [90.0f, 0.0f]   Pos: [1024.5d, 64.0d, 0.5d]
+#         dummy_bot   Rotation: [-90.0f, 0.0f]  Pos: [1027.5d, 64.0d, 0.5d]
+#     The learner looked -X while the dummy stood +X of it: dot product -1,
+#     facing exactly away. Corroborated by the wire yaws (1.570796 rad and
+#     4.712389 rad) and by a live walk whose forward/APPROACH leg moved -X.
+#
+#     Nothing in the automated suite catches a bad yaw: bot.attack(entity) does
+#     not require the attacker to be facing its target, which is why AC8's
+#     combat probe passed throughout and why this survived so long. The cost was
+#     paid by the reward instead — r_aim is hard-gated on the opponent being
+#     visible AND in the crosshair (env/reward.py), so every episode opened with
+#     the one dense shaping term unearnable until the agent turned ~180 degrees.
+#     spawn_dummy_pad.mcfunction carries the mirrored fix; the two must stay
+#     opposite (learner -90, dummy +90) or the bots point the same way.
+#
 #     `$(x).5` concatenates the anchor with a half-block offset: x=0 -> "0.5",
 #     x=340 -> "340.5". This is deliberately an ABSOLUTE coordinate. Whether a
 #     /teleport `<location>` relative is measured from the TARGET or from the
 #     EXECUTION POSITION is contested on Java, so no relative form is trusted to
 #     place a named player from scratch; an absolute coordinate has exactly one
-#     reading. It is also byte-identical to the pre-macro command at anchor 0.
-$tp $(learner) $(x).5 64 $(z).5 90 0
+#     reading. Its expansion at anchor 0 also reproduces the pre-macro command's
+#     coordinate text character for character; only the yaw differs (header).
+$tp $(learner) $(x).5 64 $(z).5 -90 0
 
 # --- Full health, full hunger, no leftover effects --------------------------
 #     ORDER IS LOAD-BEARING: `effect clear` FIRST, then give. Do not append a

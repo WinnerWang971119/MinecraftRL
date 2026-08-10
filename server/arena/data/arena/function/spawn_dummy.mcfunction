@@ -1,7 +1,7 @@
 # arena:spawn_dummy — pad-0 convenience wrapper around arena:spawn_dummy_pad.
 #
 # Takes NO arguments. Resets dummy_bot at anchor (0, 64, 0) to the template:
-#   position (3.5, 64, 0.5), yaw -90 (facing the learner), health 20, food 20,
+#   position (3.5, 64, 0.5), yaw 90 (facing the learner, -X), health 20, food 20,
 #   empty inventory, knockback_resistance 1.0, movement_speed 0.0, spawnpoint
 #   on pad 0.
 #

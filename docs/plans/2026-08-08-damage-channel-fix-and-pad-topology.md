@@ -243,10 +243,38 @@ $fill $(x)-8 62 $(z)-12 $(x)16 62 $(z)12 minecraft:bedrock replace
 
 ```mcfunction
 # arena:reset_pad — macro function. Called with {x, z, learner, dummy}
-$tp $(learner) $(x)0.5 64 $(z)0.5 90 0
-$tp $(dummy)   $(x)3.5 64 $(z)0.5 -90 0
+# YAWS CORRECTED — see the retraction directly below this block.
+$tp $(learner) $(x)0.5 64 $(z)0.5 -90 0
+$tp $(dummy)   $(x)3.5 64 $(z)0.5 90 0
 # ... regear, health, effects, hunger, spawnpoint
 ```
+
+**Correction to this plan: the spawn yaws sketched above were inverted, and the inversion shipped.**
+The two lines as originally written here are **FALSE**. Quoted verbatim, one marker per line, so a
+grep for the original text lands on this retraction rather than on an assertion:
+
+    FALSE, RETRACTED: $tp $(learner) $(x)0.5 64 $(z)0.5 90 0
+    FALSE, RETRACTED: $tp $(dummy)   $(x)3.5 64 $(z)0.5 -90 0
+
+Minecraft's look vector is `look.xz = (−sin yaw, cos yaw)` (`env/perception_filter.py:59-65`), so
+yaw `90` looks **−X** and yaw `−90` looks **+X** — the opposite of what this plan assumed. The
+learner sits at `anchor+0.5` and the dummy at `anchor+3.5` on the same `z`, so learner→dummy is
+`+X` (yaw **−90**) and dummy→learner is `−X` (yaw **+90**). T6 copied these values into
+`spawn_learner_pad.mcfunction` / `spawn_dummy_pad.mcfunction` verbatim, comments and all, and
+**both bots spawned facing directly away from each other in every episode of this branch.**
+
+Measured on a live server, both bots at rest after a reset, not inferred:
+
+    learner_bot Rotation: [90.0f, 0.0f]   Pos: [1024.5d, 64.0d, 0.5d]
+    dummy_bot   Rotation: [-90.0f, 0.0f]  Pos: [1027.5d, 64.0d, 0.5d]
+
+Corroborated by the wire yaws (`1.570796` and `4.712389` rad) and by a live walk whose
+forward/`APPROACH` leg moved `−X`. **AC8 could not have caught it**: `bot.attack(entity)` does not
+require the attacker to be facing its target, so the combat probe passes either way. The cost fell
+on the reward — `r_aim` is hard-gated on the opponent being visible **and** in the crosshair
+(`env/reward.py`), so every episode opened with the only dense shaping term unearnable until the
+agent turned ~180°, and the passive dummy, which never turns, faced away for entire episodes.
+Fixed in **T22**; live re-confirmation is checklist item 5 of `docs/spectate.md`.
 
 **Anchor vs. floor origin.** `(0, 64, 0)` is the **spawn anchor**, not the floor origin. The real
 floor spans `x = anchor−8 … anchor+16`, `z = anchor−12 … anchor+12` at `y = 63`; learner feet sit
