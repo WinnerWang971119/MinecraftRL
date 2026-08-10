@@ -35,20 +35,57 @@ raw ``state`` messages stay inspectable), constructs ONE
 every cycle through that single env/connection — the same borrow pattern as
 ``agent.train._eval_against_dummy``.
 
-KNOWN FALSE-FAIL MODE (D2, issue #28) — read this before rationalizing a red
-run. The wire's ``attack_cooldown`` reads 1.0 at episode start (the bridge's
-swing tracker is cleared by the reset), but the reset's ``/clear`` + ``/give``
-re-equip resets the SERVER-side attack meter, which the bridge does not model.
-On the FIRST cycle after a fresh bridge boot the resulting w0 swing can land a
-weak partial-cooldown hit (observed live: ``1.269, 6, 6, 6, 0.731``), failing
-the 6,6,6,2 sequence assertion ON A CORRECT DAMAGE CHANNEL (1 of 3 fresh-boot
-runs observed). The fingerprint: cycle 0 only, every value still reconciles
-window-for-window against the wire, and the total is still exactly 20. That is
-D2 (a bridge cooldown observable defect), NOT a damage-channel fault — re-run
-before concluding anything, and do NOT weaken the probe to tolerate it: once D2
-is fixed bridge-side, w0 legitimately reads not-ready, the probe IDLEs there,
-and the arithmetic holds for an understood reason. In steady state (every cycle
-after the first) the sequence was exact across 48/48 live cycles.
+FALSE-FAIL MODE (D2, issue #28) — HISTORICAL, NOW FIXED. Read this before
+assuming a red run means the damage channel is broken; it doesn't anymore, but
+the history is kept because a future regression here will look exactly like it
+did the first time. One fresh-boot run recorded a weak w0 swing (observed live:
+``1.269, 6, 6, 6, 0.731`` — still reconciling to exactly 20) and failed the
+6,6,6,2 sequence assertion ON A CORRECT DAMAGE CHANNEL (1 of 3 fresh-boot runs
+observed; the sequence was exact across the other 48/48 live cycles, all of
+them past cycle 0).
+
+The mechanism first written down here was WRONG. It blamed the reset's
+``/clear`` + ``/give`` re-equip for zeroing the server's attack-strength meter.
+Decompiling the pinned ``server/versions/1.21.1/paper-1.21.1.jar``
+(Mojang-mapped, readable with ``javap -p -c``) shows ``Player.tick()`` only
+calls ``resetAttackStrengthTicker()`` when the main-hand item TYPE changes
+tick-over-tick; a same-tick ``/clear`` + ``/give`` of the SAME item is invisible
+to it — both ends of the tick still read ``iron_sword``. The real sources of a
+zeroed meter at episode start are (a) the learner joining EMPTY-HANDED, where
+``air -> iron_sword`` genuinely is a type change (a playerdata property, not
+stochastic — see the "Playerdata sampling" caveat below), and (b) the previous
+episode's final kill swing, which zeroes the meter server-side while
+``handleReset`` clears the bridge's ``lastSwingTick`` so the bridge forgets it
+happened.
+
+That reporting gap is now fixed (commit ``8ab2634``, T18): ``bridge/bot.js``'s
+``attackCooldown()`` also ramps from the reset boundary (``_meterResetTick``,
+which stands in for both sources above) and reports the MINIMUM of that ramp
+and the swing-tracker ramp, so the wire no longer claims a charged swing at
+episode start when the server isn't actually ready. This probe already drives
+off that value (see ``_COOLDOWN_READY`` below) — it IDLEs the early windows and
+opens its first ATTACK only once the wire reports ready, with no special-casing
+of cycle 0. DO NOT weaken the 6,6,6,2 sequence assertion to tolerate a weak
+first hit: a red run here now is a regression, not expected noise.
+
+TWO LIVE CAVEATS remain, since a T13 operator will gate on this probe's exit
+code unattended:
+
+  * TPS FLOOR. The first ATTACK lands at bridge tick 16, ~800ms of wall clock
+    into the episode. At exactly 15 TPS that is server ticker 12, giving
+    ``f = (12 + 0.5) / 12.5 == 1.0`` with zero margin — so below 15 TPS the
+    first hit lands just under 6 (roughly 5.98) and the exact-6 assertion fails
+    WITH THE IMPLEMENTATION CORRECT. Diagnostic: a first hit ``< 6`` but
+    ``>= 5.9`` together with measured world-age TPS below 15 is the floor, not
+    a damage-channel fault; a first hit in the 1.2-5 range is a genuinely wrong
+    cooldown anchor. This applies to the FIRST swing of a cycle only — later
+    swings are gated on ``lastSwingTick``, ride the same bridge clock, and
+    inherit the same 16-tick spacing.
+  * PLAYERDATA SAMPLING. The empty-hand branch above only fires at cycle 0 if
+    the learner's playerdata has an empty main hand at join. Against a
+    persisted ``server/world`` the learner rejoins already holding last
+    session's sword, cycle 0 degenerates to steady state, and a run against
+    that world cannot reproduce the original regression even if it returned.
 
 Usage (Paper and the bridge already running, in that order):
 

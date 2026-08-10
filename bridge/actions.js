@@ -328,7 +328,18 @@ class MacroExecutor {
     return this._lastSwingTick;
   }
 
-  /** Reset the per-episode swing gate (called on reset so cooldown starts ready). */
+  /**
+   * Reset the per-episode swing gate: called on reset so the GATE (canSwing)
+   * starts permissive. This is deliberately NOT the same as the wire-reported
+   * attack_cooldown starting at 1.0 — the server can still have the
+   * attack-strength meter uncharged at episode start (the previous episode's
+   * kill swing, or a same-tick regear after joining empty-handed), so
+   * bot.js's attackCooldown() also ramps from the reset boundary
+   * (_meterResetTick) and reports the minimum of that and this gate's ramp
+   * (T18, issue #28). Leaving the gate itself permissive is deliberate too:
+   * the server does allow a weak swing at w0, and silently downgrading an
+   * ATTACK to IDLE here would be a worse lie than the one T18 fixed.
+   */
   resetCooldown() {
     this._lastSwingTick = null;
   }
