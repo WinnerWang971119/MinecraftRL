@@ -43,8 +43,9 @@
 //   uses time-bounded `bot.setControlState(...)` held for ACTION_REPEAT ticks
 //   then cleared. We deliberately do NOT use `bot.pvp.attack` or pathfinder goals
 //   (see agent/actions.py MACRO_SEMANTICS + bridge/actions.js). The bridge
-//   computes `attack_cooldown` in [0,1] from the swing tick and the weapon's
-//   attack-speed ticks. Damage/death events are aggregated over the ACTION_REPEAT
+//   computes `attack_cooldown` in [0,1] from the LATER of the last swing and the
+//   reset's regear (see attackCooldown()) against the weapon's attack-speed
+//   ticks. Damage/death events are aggregated over the ACTION_REPEAT
 //   window by the pure EventAggregator (bridge/actions.js), counting each event
 //   EXACTLY ONCE at the window boundary, and emitted in one `state` message.
 //
@@ -55,6 +56,9 @@
 //   - readbackMatchesTemplate(...) REJECTS a position/health/inventory/effect
 //     mismatch and a null (timed-out) readback.
 //   - computeAttackCooldown(...) maps swing tick + weapon speed to [0,1].
+//   - attack_cooldown reads 0.0 on the first observation of an episode and ramps
+//     to 1.0 over the weapon period, because the reset boundary can leave the
+//     server's attack-strength meter uncharged (T18 / issue #28, bot.test.js).
 //   - buildEventsBlock / assembleStateMsg shape a schema-valid `state` from a
 //     snapshot + the EventAggregator drain (actions.test.js).
 //   - The EventAggregator counts each window's damage/death exactly once at the
@@ -410,6 +414,10 @@ function sameItemSet(actual, expected) {
 // calls bot.attack; weaponAttackSpeedTicks comes from the held weapon's attack
 // speed (e.g. an iron sword in 1.9+ combat). Here we set up the math; T7b wires
 // the live tick source.
+//
+// A SWING IS NOT THE ONLY THING THAT RE-ZEROES THE SERVER'S METER (T18, issue
+// #28) — see attackCooldown(), which combines this ramp with the reset's. This
+// function stays a pure one-anchor ramp and is reused for both.
 // ---------------------------------------------------------------------------
 
 /**
@@ -833,6 +841,17 @@ class ArenaBots {
 
     /** End-of-window server tick (advances by ACTION_REPEAT each step). */
     this._currentTick = 0;
+
+    // Tick (on the same post-reset clock as _currentTick) at which the RESET's
+    // regear re-zeroed the server-side attack-strength meter, or null if no
+    // reset has been confirmed on this instance yet. Set to 0 by handleReset's
+    // epoch-guarded post-gate block; null leaves attackCooldown() reporting
+    // exactly what the swing tracker alone says, which is what unit fakes and a
+    // never-reset bridge should see.
+    //
+    // See attackCooldown() for the mechanic this models and why the anchor is
+    // tick 0 rather than a wall-clock offset from the causality beacon.
+    this._meterResetTick = null;
   }
 
   /**
@@ -1293,11 +1312,16 @@ class ArenaBots {
     const confirmStartedAt = Date.now();
     this._sendCommand(this.learner, this._resetPadCommand(epoch));
 
-    // Reset per-episode state: the swing gate (so attack_cooldown starts ready),
-    // the tick counter, the last-seen memory, and the held control states. (The
-    // event accumulator is reset AFTER the read-back gates, so everything the
-    // reset itself generated — including events fired while the gates poll —
-    // is discarded before the ack.)
+    // Reset per-episode state: the swing gate (so no previous episode's swing
+    // is still cooling), the tick counter, the last-seen memory, and the held
+    // control states. (The event accumulator is reset AFTER the read-back
+    // gates, so everything the reset itself generated — including events fired
+    // while the gates poll — is discarded before the ack.)
+    //
+    // NOTE (T18): clearing the swing gate no longer means attack_cooldown starts
+    // at 1.0. The regear can re-zero the SERVER's attack-strength meter, so the
+    // reported value also ramps from _meterResetTick, seeded in the
+    // epoch-guarded post-gate block below. See attackCooldown().
     if (this.executor !== null) {
       this.executor.resetCooldown();
       this.executor.clearAll();
@@ -1392,6 +1416,23 @@ class ArenaBots {
           ? dummyResult.readback.health
           : MAX_HEALTH;
 
+      // Anchor the learner's attack-strength meter at the start of this
+      // episode's tick frame (T18, issue #28). Two things can have left the
+      // SERVER's meter uncharged here — the datapack's regear, and the previous
+      // episode's final swing, which executor.resetCooldown() above just made
+      // the bridge forget — and the beacon that confirmed this reset is emitted
+      // on the line AFTER the regear, so both are at or before this point.
+      // _currentTick was set to 0 above and the first step's window begins
+      // there, so tick 0 IS that moment expressed on this episode's clock;
+      // attackCooldown() ramps from it over the weapon period.
+      //
+      // Placed inside the epoch guard with the other three post-gate effects
+      // for consistency, not because a stale handler could corrupt it today: a
+      // stale handler would write the same constant 0, and _currentTick is
+      // owned by the newest reset. The guard is what keeps that true if this
+      // anchor ever stops being a constant.
+      this._meterResetTick = 0;
+
       // Discard every event the reset generated (teleport jank, heals, a
       // dummy respawn death) before acknowledging. No step can interleave
       // here — the transport serves one client request at a time — so no real
@@ -1463,10 +1504,136 @@ class ArenaBots {
     }
   }
 
-  /** Current attack-cooldown for the learner's held weapon, in [0,1]. */
+  /**
+   * Current attack-cooldown for the learner's held weapon, in [0,1] (1.0 ==
+   * fully charged, a full-power swing is available; 0.0 == just re-zeroed).
+   *
+   * TWO EVENTS RE-ZERO THE SERVER'S METER, AND THE WIRE MUST REFLECT BOTH
+   * (T18, issue #28). The reported value is the ramp from whichever happened
+   * LAST, so it is the MINIMUM of the two ramps:
+   *
+   *   1. the learner's last swing this episode (executor.lastSwingTick), and
+   *   2. the RESET boundary (this._meterResetTick) — which stands for the
+   *      regear AND for the previous episode's final swing, since handleReset
+   *      clears lastSwingTick and the bridge forgets that one ever happened.
+   *
+   * THE MECHANIC, VERIFIED AT PRIMARY SOURCE — not from memory. Paper 1.21.1 is
+   * Mojang-mapped, so `javap -p -c net/minecraft/world/entity/player/Player.class`
+   * out of server/versions/1.21.1/paper-1.21.1.jar reads Player.tick() directly:
+   *
+   *     this.attackStrengthTicker++;
+   *     ItemStack main = this.getMainHandItem();
+   *     if (!ItemStack.matches(this.lastItemInMainHand, main)) {
+   *       if (!ItemStack.isSameItem(this.lastItemInMainHand, main)) {
+   *         this.resetAttackStrengthTicker();   // -> attackStrengthTicker = 0
+   *       }
+   *       this.lastItemInMainHand = main.copy();
+   *     }
+   *
+   * and Player.attack() scales the hit by `0.2F + f*f*0.8F` where
+   * `f = getAttackStrengthScale(0.5F) = clamp((ticker + 0.5) / delay, 0, 1)` and
+   * `delay = getCurrentItemAttackStrengthDelay() = (1 / ATTACK_SPEED) * 20`
+   * (12.5 ticks for an iron sword's 1.6 atk/s == IRON_SWORD_ATTACK_SPEED_TICKS).
+   *
+   * CORRECTION TO THE ISSUE'S PREMISE. The reset does NOT re-zero the meter
+   * because `/clear` and `/give` are issued — there is no command hook. It is a
+   * once-per-tick main-hand item-TYPE comparison, so a `/clear` + `/give` of the
+   * SAME item inside ONE tick (which is exactly what arena:spawn_learner_pad
+   * does) is invisible to it. On this datapack the regear therefore re-zeroes
+   * the meter in exactly ONE situation: the first reset after a bot JOINS with
+   * an empty main hand (air -> iron_sword). That is why the live probe deviated
+   * on cycle 0 and was exact for the following 48. It is also playerdata-
+   * dependent, not stochastic — a learner rejoining a PERSISTED world already
+   * holding last session's sword does not take the branch at all.
+   *
+   * RETRACTED — an earlier revision of this comment claimed a second case, and
+   * shipped it as verified fact. It is FALSE on Paper 1.21.1. Quoted so a grep
+   * for the original words lands on the refutation:
+   *   FALSE, RETRACTED: "the first reset after a learner death, because
+   *   FALSE, RETRACTED:  PlayerList.respawn builds a NEW ServerPlayer whose
+   *   FALSE, RETRACTED:  lastItemInMainHand starts at ItemStack.EMPTY"
+   * PlayerList's only `new ServerPlayer` is in canPlayerLogin; BOTH respawn
+   * overloads REUSE the instance through ServerPlayer.restoreFrom (the
+   * CraftBukkit entity-identity patch). `lastItemInMainHand` is referenced by
+   * exactly ONE class in the whole jar — Player — so neither restoreFrom nor
+   * ServerPlayer.reset() clears it, and `attackStrengthTicker` (LivingEntity's
+   * field) is untouched by both. With keepInventory on, the sword survives the
+   * death, the first post-respawn tick sees no type change, and the ticker
+   * simply carries over. The vanilla constructor initialiser IS real; on Paper
+   * it just never runs a second time.
+   *
+   * THE REAL REASON THE ANCHOR IS UNCONDITIONAL — and why a conditional one
+   * would be strictly WORSE, not merely equivalent. A conditional anchor is
+   * derivable: `learner.heldItem` is readable before the reset goes out. It
+   * would still be wrong, because the item comparison is NOT the only thing
+   * that re-zeroes the server's meter. THE PREVIOUS EPISODE'S FINAL KILL SWING
+   * ZEROES IT TOO — Paper's LivingEntity.actuallyHurt resets the attacker's
+   * ticker when the damage lands, and ServerPlayer.swing resets it as well
+   * (mineflayer sends arm_animation right after use_entity) — and handleReset
+   * clears executor.lastSwingTick, so the bridge forgets it ever happened. The
+   * reset path is not guaranteed to outlast the recovery period either: 12.5
+   * SERVER ticks is 658-833 ms at this machine's measured 15-19 TPS, and the
+   * live 1.269 hit shows the regear -> ack -> first step leg alone can cost a
+   * single tick. So a conditional's "accurate" branch — report 1.0 in steady
+   * state because heldItem is already a sword — would be OPTIMISTIC against a
+   * source neither heldItem nor death-tracking can observe. The unconditional
+   * anchor covers swing carryover, the join case and the respawn no-op
+   * identically, on every cycle. That is why it is right, not just safe.
+   *
+   * heldItem could not even substitute for the item branch alone: the client is
+   * never told about intra-tick inventory states. AbstractContainerMenu
+   * .triggerSlotListeners diffs each slot against `lastSlots` with
+   * ItemStack.matches and sends nothing when they agree (verified in the same
+   * jar), so a same-tick /clear + /give of an equal stack produces NO packet,
+   * and an unequal one (a worn sword replaced by a fresh one) produces a single
+   * set_slot that says nothing about an item-TYPE change.
+   *
+   * The residual error is bounded and one-directional: the wire under-reports by
+   * whatever charge the server accumulated during the reset path, costing at
+   * most ceil(12.5 / ACTION_REPEAT) == 4 windows of waiting. Under-reporting
+   * makes a policy wait when it could have swung; OVER-reporting is the bug
+   * being fixed, and would be a standing invitation to a partial-cooldown hit.
+   *
+   * WHY TICK 0 AND NOT A WALL-CLOCK OFFSET FROM THE CAUSALITY BEACON. The
+   * beacon IS the causally correct anchor — spawn_learner_pad emits it on the
+   * line after the regear `/give`, in the same tick, and it gates the ack — so
+   * anchoring the post-reset tick frame at 0 already anchors at the beacon,
+   * erring conservative by exactly the beacon->ack gap. Crediting that gap back
+   * explicitly was considered and rejected: it would have to convert wall-clock
+   * ms into ticks at an assumed 20 TPS, and this server is measured at 15-19,
+   * so the correction would err OPTIMISTIC — the one direction that re-creates
+   * this defect. The gap is also small: the live 1.269-damage first hit is
+   * exactly 6 * (0.2 + 0.8 * (1.5/12.5)^2), so the server's ticker read 1 when
+   * that swing was processed — the whole regear -> beacon -> ack -> first step
+   * path had cost a single tick.
+   *
+   * It also protects the probe's arithmetic. 12.5 is not a multiple of
+   * ACTION_REPEAT, so the ramp first clears 1.0 at tick 16 — about 3.5 ticks
+   * of overshoot past the true period, which absorbs sub-20 TPS jitter and
+   * inter-step latency. Crediting 1-3 ticks back would move the first swing to
+   * tick 12, i.e. right on the boundary, where a server running below 20 TPS
+   * would land a scale-<1 hit and break the exact 6,6,6,2 sequence.
+   *
+   * NOT A SWING GATE. MacroExecutor.canSwing() is untouched and still allows an
+   * ATTACK at w0. That is faithful: the server allows a weak swing there, and an
+   * action silently downgraded to IDLE would be a worse lie than the one being
+   * fixed. The agent is now simply told the swing is not charged.
+   *
+   * @returns {number} Swing progress clamped to [0, 1].
+   */
   attackCooldown() {
     const lastSwingTick = this.executor !== null ? this.executor.lastSwingTick : null;
-    return computeAttackCooldown(this._currentTick, lastSwingTick, this._weaponAttackSpeedTicks);
+    const sinceSwing = computeAttackCooldown(
+      this._currentTick,
+      lastSwingTick,
+      this._weaponAttackSpeedTicks,
+    );
+    const sinceRegear = computeAttackCooldown(
+      this._currentTick,
+      this._meterResetTick,
+      this._weaponAttackSpeedTicks,
+    );
+    return sinceSwing < sinceRegear ? sinceSwing : sinceRegear;
   }
 
   /**

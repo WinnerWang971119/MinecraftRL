@@ -24,6 +24,11 @@
 //     - RESET CAUSALITY: both gates matching is NOT enough — the datapack's
 //       per-bot beacon must also arrive, or a post-kill state that merely LOOKS
 //       reset would be acked as one. Only this pad's beacon counts.
+//   attack_cooldown across a reset (T18, issue #28):
+//     - the first observation of an episode reports 0.0, not a phantom 1.0: the
+//       reset's regear can re-zero the SERVER's attack-strength meter, so the
+//       reported value ramps from the LATER of the last swing and the regear;
+//     - the ramp reaches 1.0 at w4 and the anchor is re-armed every episode.
 //   Static datapack contracts (read from the committed .mcfunction files):
 //     - clear-before-give in both spawn functions, with no trailing clear (the
 //       coverage the deleted _regear tests used to provide);
@@ -59,6 +64,11 @@ const {
   formatResetPadCommand,
   formatSetupPadCommand,
 } = require('./bot');
+// The REAL executor and the REAL weapon period drive the cooldown tests below:
+// MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
+// the stand-in. IRON_SWORD_ATTACK_SPEED_TICKS is the one source of truth both
+// modules share (bot.js imports it too), so the expected ramp cannot drift.
+const { Macro, MacroExecutor, IRON_SWORD_ATTACK_SPEED_TICKS } = require('./actions');
 const { validateOutbound } = require('./transport');
 // Recorder spies live in the shared testkit so a change to the EventAggregator
 // recorder surface cannot be applied here and silently missed in actions.test.js.
@@ -1092,4 +1102,201 @@ test('handleReset rejects on a throwing chat(), sends no ack, and leaves the dam
   arena.dummy.health = MAX_HEALTH - 6;
   arena.dummy.emit('health');
   assert.equal(arena.events.drain().damage_dealt, 6, 'the damage channel survived the failed reset');
+});
+
+// ===========================================================================
+// ATTACK-COOLDOWN vs. THE RESET'S REGEAR (T18, issue #28).
+//
+// THE DEFECT. attack_cooldown reported 1.0 on the first observation of every
+// episode because the bridge's only anchor was executor.lastSwingTick, cleared
+// to null by the reset. The server's own meter is not necessarily charged
+// there, for TWO independent reasons:
+//   - Paper 1.21.1's Player.tick() re-zeroes attackStrengthTicker whenever the
+//     MAIN-HAND ITEM TYPE differs from the previous tick's, so the regear
+//     re-zeroes it when the learner joined empty-handed (air -> iron_sword).
+//     A same-tick /clear + /give of the SAME type — every steady-state reset —
+//     is invisible to that comparison, so this leg fires on cycle 0 only.
+//   - the PREVIOUS episode's final kill swing zeroes it on EVERY cycle
+//     (LivingEntity.actuallyHurt resets the attacker's ticker; ServerPlayer
+//     .swing does too), and the reset path is not guaranteed to outlast the
+//     12.5-tick recovery period — 658-833 ms at this machine's 15-19 TPS.
+// Live, the first produced a first swing of 1.269 damage — exactly
+// 6 * (0.2 + 0.8 * (1.5/12.5)^2), i.e. ticker == 1 — instead of 6, and told a
+// policy it had a full charge it did not have.
+//
+// THE FIX. handleReset anchors _meterResetTick at tick 0 of the new episode's
+// clock and attackCooldown() reports the MINIMUM of the swing ramp and the
+// regear ramp, so the value always describes whichever re-zeroing happened
+// last. computeAttackCooldown itself is untouched (its four pure tests live in
+// transport.test.js) — both ramps go through it.
+//
+// The anchor is UNCONDITIONAL because a conditional one would be strictly
+// worse. It IS derivable (learner.heldItem is readable before the reset goes
+// out), but its "accurate" branch — report 1.0 in steady state because the hand
+// already holds a sword — is optimistic against the swing-carryover source
+// above, which neither heldItem nor death-tracking can observe. The
+// unconditional anchor covers swing carryover, the join case and the respawn
+// no-op identically. Under-reporting costs a policy at most four IDLE windows;
+// over-reporting is the defect. These tests pin that direction on purpose.
+// ===========================================================================
+
+/**
+ * An EventEmitter bot that satisfies BOTH the reset read-back gate and the step
+ * path's snapshot, so one fixture can drive reset -> step -> step. Every added
+ * field is one mineflayer really populates on a bot's own connection
+ * (`heldItem`) or on its own entity (velocity/yaw/pitch/onGround) — the mock
+ * fidelity rule at the top of this file still applies.
+ */
+function cooldownBot(username, opts = {}) {
+  const bot = liveBot(username, opts);
+  bot.heldItem = { name: 'iron_sword' };
+  Object.assign(bot.entity, {
+    username,
+    velocity: { x: 0, y: 0, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    onGround: true,
+  });
+  bot.setControlState = () => {};
+  bot.clearControlStates = () => {};
+  bot.attack = () => {};
+  bot.lookAt = () => {};
+  return bot;
+}
+
+/**
+ * A reset-then-step arena: gates satisfied, beacons answered, the REAL
+ * MacroExecutor bound to the learner, and the tick wait injected so the step
+ * path needs no clock.
+ */
+function cooldownArena(sent) {
+  const arena = new ArenaBots({}, {
+    transport: { send: (msg) => sent.push(msg) },
+    readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
+  });
+  arena.learner = cooldownBot('learner_bot');
+  arena.dummy = cooldownBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+  arena.wireDamageEvents();
+  answerResetLikeTheServer(arena);
+  return arena;
+}
+
+/** The readiness threshold eval/combat_probe.py applies to the wire value. */
+const PROBE_READY = 1.0 - 1e-6;
+
+test('the first observation of an episode reports attack_cooldown 0.0, not a phantom 1.0 (issue #28)', async () => {
+  const sent = [];
+  const arena = cooldownArena(sent);
+
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  assert.equal(sent.length, 2, 'ack + first observation');
+  assert.equal(sent[0].ok, true);
+  assert.equal(sent[1].type, 'state');
+  assert.doesNotThrow(() => validateOutbound(sent[1]));
+  // THE REGRESSION. Before T18 this read 1.0 and a policy that attacked here
+  // got a partial-cooldown hit while being told the swing was fully charged.
+  assert.equal(sent[1].self.attack_cooldown, 0.0);
+  assert.ok(
+    sent[1].self.attack_cooldown < PROBE_READY,
+    'the combat probe must IDLE at w0 rather than swing into an uncharged meter',
+  );
+  // The wire field itself is untouched: same name, same [0,1] range, same
+  // meaning. Only the value is now honest.
+  assert.equal(typeof sent[1].self.attack_cooldown, 'number');
+});
+
+test('attack_cooldown ramps from the regear over the weapon period and is ready at w4', async () => {
+  const sent = [];
+  const arena = cooldownArena(sent);
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  const observed = [sent[1].self.attack_cooldown];
+  for (let window = 0; window < 4; window += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await arena.handleStep({ type: 'step', action: Macro.IDLE });
+    observed.push(sent[sent.length - 1].self.attack_cooldown);
+  }
+
+  // Derived from the shared period, never hard-coded: ACTION_REPEAT ticks of
+  // progress per window against IRON_SWORD_ATTACK_SPEED_TICKS (12.5).
+  const expected = [0, 1, 2, 3, 4].map((w) =>
+    Math.min((w * ACTION_REPEAT) / IRON_SWORD_ATTACK_SPEED_TICKS, 1.0),
+  );
+  for (let i = 0; i < expected.length; i += 1) {
+    assert.ok(
+      Math.abs(observed[i] - expected[i]) < 1e-12,
+      `w${i}: expected ${expected[i]}, got ${observed[i]}`,
+    );
+  }
+  // 12.5 ticks is not a multiple of the 4-tick window, so w1..w3 (0.32/0.64/
+  // 0.96) all sit BELOW the probe's readiness threshold and only w4 clears it.
+  // That ~3.5-tick overshoot is the margin the exact 6,6,6,2 arithmetic rides
+  // on — a "corrected" earlier anchor would spend it.
+  assert.ok(
+    observed.slice(0, 4).every((value) => value < PROBE_READY),
+    'w0..w3 must all read not-ready',
+  );
+  assert.equal(observed[4], 1.0, 'fully charged at w4');
+});
+
+test('a swing dominates the reported cooldown once the regear ramp has finished', async () => {
+  const sent = [];
+  const arena = cooldownArena(sent);
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  // Charge the meter (w1..w4), then swing on the first window that reads ready.
+  for (let window = 0; window < 4; window += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  }
+  assert.equal(sent[sent.length - 1].self.attack_cooldown, 1.0, 'ready before the swing');
+
+  await arena.handleStep({ type: 'step', action: Macro.ATTACK });
+
+  assert.equal(arena.executor.lastSwingTick, 4 * ACTION_REPEAT, 'the swing stamped the tick');
+  // The swing ramp (4 ticks of 12.5) is now behind the regear ramp (20 of 12.5,
+  // long since clamped to 1.0), so the MIN must follow the swing.
+  assert.ok(
+    Math.abs(sent[sent.length - 1].self.attack_cooldown - ACTION_REPEAT / IRON_SWORD_ATTACK_SPEED_TICKS) < 1e-12,
+    'the swing re-zeroed the reported meter',
+  );
+});
+
+test('every episode starts not-ready, not just the first', async () => {
+  const sent = [];
+  const arena = cooldownArena(sent);
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+  // Run episode 1 well past the weapon period so the meter is fully charged.
+  for (let window = 0; window < 6; window += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  }
+  assert.equal(sent[sent.length - 1].self.attack_cooldown, 1.0);
+
+  await arena.handleReset({ type: 'reset', episode: 1, seed: 1 });
+
+  // What this pins is that episode N's first observation reads 0.0 for every N,
+  // which catches an anchor that is cleared, moved out of handleReset, or made
+  // conditional. It does NOT distinguish one-shot from per-episode arming: the
+  // anchor is the constant 0 and every reset re-zeroes _currentTick, so a
+  // one-shot mutant is an EQUIVALENT mutant, not a gap this test misses. The
+  // distinction only becomes observable if the anchor ever stops being constant.
+  assert.equal(sent[sent.length - 1].type, 'state');
+  assert.equal(sent[sent.length - 1].self.attack_cooldown, 0.0);
+});
+
+test('with no reset and no executor the cooldown still reports 1.0 (the null anchor is inert)', () => {
+  // Pre-reset (and for every fake that never runs handleReset) the anchor is
+  // null, so attackCooldown() collapses to exactly what it reported before
+  // T18. This is what keeps computeAttackCooldown's own no-swing-yet contract
+  // — and the transport.test.js cases that pin it — meaningful.
+  const arena = new ArenaBots({}, { transport: { send: () => {} } });
+  assert.equal(arena._meterResetTick, null);
+  assert.equal(arena.attackCooldown(), 1.0);
+
+  arena.executor = new MacroExecutor(cooldownBot('learner_bot'));
+  assert.equal(arena.attackCooldown(), 1.0, 'an executor that never swung is charged');
 });
