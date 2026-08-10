@@ -72,24 +72,29 @@ from __future__ import annotations
 import argparse
 import collections
 import math
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
     Sequence,
+    Tuple,
     Union,
 )
 
 from agent.contract_config import DECISION_INTERVAL_MS, SERVER_TPS
 from bridge.messages import ResetAckMsg, StateMsg
 from env.mc_pvp_env import BridgeError, BridgeTransport, TcpBridgeClient
+from eval.combat_probe import FULL_HEALTH, StepRecord, reconcile_against_wire
 from eval.logging import MetricsLogger
 
 __all__ = [
@@ -119,6 +124,20 @@ __all__ = [
     "BenchmarkReport",
     "run_benchmark",
     "main",
+    # T12 -- cross-pad isolation (AC13)
+    "PadLogAnchor",
+    "PadForeignSighting",
+    "PadLogSummary",
+    "PadReconciliation",
+    "PadIsolationReport",
+    "PadIsolationRecorder",
+    "parse_pad_log_lines",
+    "parse_pad_log_file",
+    "verify_pad_log",
+    "reconcile_pad_damage",
+    "check_pad_isolation",
+    "default_pad_log_path",
+    "format_isolation_line",
 ]
 
 
@@ -673,6 +692,12 @@ class BenchmarkReport:
             fake-bridge proof (recorded so the artifact is never mistaken for the
             sustained AC4 number).
         notes: Free-form human-readable notes (incl. the AC4 follow-up reminder).
+        pad_isolation: T12/AC13 per-pad isolation evidence, keyed by pad index
+            as a string (JSON object keys are always strings). Empty unless
+            the caller opted in (the live CLI's ``--pad-log-dir``); populated
+            by the caller from :class:`PadIsolationRecorder`, not by
+            ``run_benchmark`` itself, so this field is always present but
+            never changes ``run_benchmark``'s own behavior or timing.
     """
 
     duration_target_s: float = 0.0
@@ -689,6 +714,7 @@ class BenchmarkReport:
     resources: Dict[str, Any] = field(default_factory=dict)
     is_live: bool = False
     notes: List[str] = field(default_factory=list)
+    pad_isolation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Render the report as a plain JSON-serializable dict."""
@@ -707,6 +733,7 @@ class BenchmarkReport:
             "resources": dict(self.resources),
             "is_live": self.is_live,
             "notes": list(self.notes),
+            "pad_isolation": dict(self.pad_isolation),
         }
 
 
@@ -1173,6 +1200,635 @@ class TickDeltaTpsProvider:
 
 
 # ---------------------------------------------------------------------------
+# T12 — Cross-pad isolation (AC13).
+#
+# Zero cross-pad interaction over a >=10-minute N>=8 run is proven by TWO
+# independent, complementary signals, both consumed here:
+#
+#   1. Per-pad damage RECONCILIATION -- cumulative events.damage_dealt (the
+#      frozen wire channel) against the dummy's own wire-derived health loss
+#      (state.opponent.health, the free cross-check the plan's Decisions
+#      describe -- "kept as a free cross-check", never a production source).
+#      This proves the CHANNEL is behaving (no drop, no double-count, no
+#      phantom event) at fleet scale/duration, same window-level algorithm
+#      T8's combat probe already validated it with. It does NOT by itself
+#      prove isolation: dummy.on('health') has no attacker attribution, so a
+#      foreign learner landing a hit on this pad's dummy reconciles exactly
+#      as cleanly as this pad's own learner would (see bridge/bot.js's
+#      _scanForeignPlayers docstring). That is exactly why signal 2 exists.
+#   2. The bridge-side foreign-username SCAN -- bridge/bot.js's
+#      _scanForeignPlayers() logs (to stderr only, never the wire)
+#      ``[bridge] pad <i> foreign_players <name1,name2>`` whenever the
+#      learner's entity view contains a player that is neither this pad's own
+#      learner nor its own dummy. T9 emits it; this module only consumes it.
+#
+# COVERAGE CAVEAT (read before treating a clean scan as proof of anything):
+# _scanForeignPlayers has exactly ONE call site, at the end of handleReset --
+# it never runs mid-episode. A window with no resets in it produces ZERO scan
+# lines, and zero lines is indistinguishable from "no scan ran" -- it is NOT
+# evidence of zero foreign contact during that window. The live AC13 run must
+# include resets throughout its >=10 minutes (a scale-ladder run naturally
+# does; a pure step-only throughput pass, as run_benchmark's own action-cycle
+# driver runs today, does not reset at all and therefore has NO scan
+# coverage). This module never claims coverage it cannot prove: a pad log
+# with no matching anchor line for its expected pad index is an ERROR, not a
+# pass -- see verify_pad_log.
+#
+# WHY eval.combat_probe IS REUSED, NOT REWRITTEN. reconcile_against_wire (T8)
+# is win-outcome-agnostic and cycle-count-agnostic already -- it only matches
+# recorded hits against wire-health drops within +/-1 decision window (the
+# dummy's update_health arrives on a second connection) and flags any
+# unexplained drop or off-death heal. That is exactly T12's fine-grained
+# defect detector, so it is imported and used VERBATIM, unmodified, rather
+# than inventing a second, differently-shaped mechanism. combat_probe.py is
+# NOT edited by this task (T8's file; T13 also reads it) -- see
+# _states_to_step_records below for the one adapter this requires.
+#
+# combat_probe.CycleRecord is deliberately NOT reused: its reset_ms /
+# start_self_pos / start_opp_pos / outcome fields describe one deterministic
+# reset/kill cycle and have no meaning for a continuous run (run_benchmark's
+# arena driver never calls env.reset() -- see its own docstring above). T12
+# needs only the per-window StepRecord shape, so that is all that is reused.
+#
+# WHAT reconcile_against_wire DOES NOT GIVE US: a whole-run cumulative total.
+# It only ever needed to check per-cycle hits against a KNOWN expected
+# sequence (AC8's fixed 6,6,6,2 / total 20). AC13 asks for something
+# reconcile_against_wire was never shaped to answer -- "cumulative
+# damage_dealt vs. per-pad dummy health loss" over an arbitrary, unbounded
+# live run -- so _wire_health_loss below reproduces just enough of the same
+# windowing (health_entering + the doImmediateRespawn masked-killing-blow
+# carve-out) to sum a total, rather than asking combat_probe.py to grow a
+# return shape it has no other use for.
+# ---------------------------------------------------------------------------
+
+#: Float comparison tolerance for T12's reconciliation arithmetic. Matches
+#: eval.combat_probe's own (private) tolerance; damage in the live matchup is
+#: exact multiples of 0.5, so 1e-6 is generous.
+_RECONCILE_TOL: float = 1e-6
+
+#: Verbatim log lines this module consumes. NEVER edit these patterns without
+#: re-reading the literal template strings at their source:
+#:   bridge/run.js  (the anchor line, printed once per bridge boot)
+#:   bridge/bot.js  (_scanForeignPlayers -- the foreign_players line, printed
+#:                   only when >= 1 foreign player was seen, once per reset)
+_PAD_ANCHOR_LOG_RE = re.compile(
+    r"^\[bridge\] pad (?P<pad>\d+) @ anchor (?P<x>-?\d+),(?P<z>-?\d+) "
+    r"\((?P<learner>\S+) / (?P<dummy>\S+)\)\s*$"
+)
+_FOREIGN_PLAYERS_LOG_RE = re.compile(
+    r"^\[bridge\] pad (?P<pad>\d+) foreign_players (?P<names>\S+)\s*$"
+)
+
+
+def _states_to_step_records(states: Sequence[StateMsg]) -> List[StepRecord]:
+    """Adapt raw per-decision ``StateMsg`` into eval.combat_probe's ``StepRecord``.
+
+    ``action`` has no meaning outside combat_probe's scripted ATTACK/IDLE
+    driver (this module's own action cycling is a throughput exercise, not a
+    combat script), so it is recorded as ``-1``; ``reconcile_against_wire``
+    never reads it.
+    """
+    return [
+        StepRecord(
+            action=-1,
+            damage_dealt=float(s.events.damage_dealt),
+            opponent_died=bool(s.events.opponent_died),
+            wire_health=float(s.opponent.health),
+            attack_cooldown=float(s.self_state.attack_cooldown),
+            tick=int(s.tick),
+        )
+        for s in states
+    ]
+
+
+def _wire_health_loss(start_health: float, steps: Sequence[StepRecord]) -> float:
+    """Independently sum how much wire health the dummy actually lost.
+
+    Mirrors the windowing ``eval.combat_probe.reconcile_against_wire`` uses
+    (``health_entering`` plus the ``doImmediateRespawn`` masked-killing-blow
+    carve-out: a death that snaps health back to full inside the SAME window
+    it occurred in leaves no visible drop, so the window's ENTERING health is
+    exactly what was lost) but returns a TOTAL rather than matching individual
+    hits -- combat_probe never needed a running total since AC8's expected
+    total is the fixed constant 20.0.
+
+    A VISIBLE drop within a death window takes precedence over the masked-kill
+    carve-out (checked first, per window), mirroring reconcile_against_wire's
+    own precedence of matching a real drop before assuming an invisible one --
+    this is what keeps a skewed-but-visible fatal drop from being counted
+    twice (once as a plain drop, once as a masked kill).
+
+    WHY THAT PRECEDENCE IS SOUND (pinned at its source, not left as an
+    assertion): the dummy's ``health`` and ``death`` events are both emitted
+    synchronously off ONE ``update_health`` packet handler in mineflayer
+    (``mineflayer/lib/plugins/health.js``) -- there is no code path where a
+    death fires before its own health-drop packet is processed. The
+    respawn's health=20 packet is a SEPARATE, strictly LATER
+    ``update_health`` (the server never folds a respawn into the same packet
+    as the fatal hit), so "hit this window, death this window, respawn this
+    window" is at minimum two packets apart even in the fastest observed
+    case. That ordering is what guarantees a visible drop at window w is
+    always caught by THIS window's own ``delta > _RECONCILE_TOL`` branch
+    before the masked-kill branch could ever double-add it a window away --
+    so a future reader chasing a double-count regression needs three minutes
+    with this docstring and health.js, not an hour of live packet tracing.
+
+    Args:
+        start_health: Wire opponent health entering the FIRST recorded window.
+        steps: Per-decision-window records in order.
+
+    Returns:
+        Total positive wire-health loss across ``steps`` (never negative).
+    """
+    n = len(steps)
+    health_entering = [float(start_health)] + [float(s.wire_health) for s in steps[:-1]]
+    death_windows = {w for w in range(n) if steps[w].opponent_died}
+
+    total = 0.0
+    for w in range(n):
+        delta = health_entering[w] - float(steps[w].wire_health)
+        if delta > _RECONCILE_TOL:
+            total += delta
+        elif w in death_windows:
+            total += health_entering[w]
+        # A negative delta outside a death window is a heal; that is a defect
+        # eval.combat_probe.reconcile_against_wire already flags separately
+        # (regeneration is off), and it contributes no loss here either way.
+    return total
+
+
+@dataclass
+class PadReconciliation:
+    """T12/AC13's per-pad damage reconciliation for one pad's recorded run.
+
+    Attributes:
+        pad_index: 0-based pad index this reconciliation covers.
+        n_windows: Number of decision windows reconciled.
+        start_health: The wire opponent health assumed entering window 0.
+        cumulative_damage_dealt: Sum of ``events.damage_dealt`` across the run
+            (the frozen production channel T2 repaired).
+        cumulative_wire_health_loss: Independently wire-derived total health
+            lost (see :func:`_wire_health_loss`) -- the free cross-check.
+        trailing_residual_allowance: The single trailing-window hit amount (if
+            any) exempted from the cumulative-total check, because its wire
+            confirmation may not have arrived by the time recording stopped
+            (there is no next window in a truncated recording to catch a
+            +/-1-window-skewed drop). Zero when the last window had no hit.
+        errors: Human-readable failures (empty == clean reconciliation).
+    """
+
+    pad_index: int
+    n_windows: int
+    start_health: float
+    cumulative_damage_dealt: float
+    cumulative_wire_health_loss: float
+    trailing_residual_allowance: float
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def reconcile_pad_damage(
+    pad_index: int,
+    states: Sequence[StateMsg],
+    *,
+    start_health: float = FULL_HEALTH,
+) -> PadReconciliation:
+    """Reconcile one pad's recorded ``events.damage_dealt`` against its wire health.
+
+    ``start_health`` defaults to :data:`~eval.combat_probe.FULL_HEALTH`
+    (20.0) rather than the first recorded sample: this driver never calls
+    ``env.reset()`` (see ``run_benchmark``), so there is no post-reset state to
+    read a baseline from the way ``eval.combat_probe`` does. The default is
+    sound only if the pad's dummy was already at a clean, stationary baseline
+    when recording started -- true for a PRIMED fleet per AC18 (see
+    ``server/setup/start-pads.sh``). An unprimed or mid-episode pad then fails
+    LOUDLY here (a spurious window-0 drop/heal), which is the correct failure
+    mode: never silently assume a clean start.
+
+    Args:
+        pad_index: 0-based pad index (used only to label error messages).
+        states: Raw per-decision ``StateMsg`` for this pad, in order.
+        start_health: Wire opponent health assumed entering the first window.
+
+    Returns:
+        A populated :class:`PadReconciliation`.
+    """
+    steps = _states_to_step_records(states)
+
+    if not steps:
+        return PadReconciliation(
+            pad_index=pad_index,
+            n_windows=0,
+            start_health=float(start_health),
+            cumulative_damage_dealt=0.0,
+            cumulative_wire_health_loss=0.0,
+            trailing_residual_allowance=0.0,
+            errors=[
+                f"pad {pad_index}: no decision windows recorded; damage cannot "
+                f"be reconciled (no evidence, not proof of isolation)"
+            ],
+        )
+
+    # T8's window-level defect detector, reused verbatim (see the section
+    # docstring above): unrecorded hits, phantom hits, and off-death heals.
+    errors = list(reconcile_against_wire(start_health, steps))
+
+    cumulative_damage = sum(s.damage_dealt for s in steps)
+    cumulative_loss = _wire_health_loss(start_health, steps)
+
+    trailing_hit = 0.0
+    if steps[-1].damage_dealt > _RECONCILE_TOL:
+        trailing_hit = float(steps[-1].damage_dealt)
+
+    # S1: the trailing-window allowance is ONE-SIDED on purpose. A POSITIVE
+    # residual (damage_dealt ahead of wire-derived loss) has a legitimate
+    # boundary excuse: the last window's hit may not have its wire
+    # confirmation yet (see the docstring). A NEGATIVE residual (wire loss
+    # ahead of damage_dealt) has no such excuse at any magnitude -- it means
+    # the wire lost health with no recorded event to explain it, which is
+    # exactly the unrecorded-hit / under-counting failure this whole plan
+    # exists to catch, and hiding a small one behind the same allowance would
+    # reopen that hole. So only a positive residual gets the trailing-hit
+    # slack; any negative residual beyond float tolerance is always flagged.
+    residual = cumulative_damage - cumulative_loss
+    if residual > trailing_hit + _RECONCILE_TOL or residual < -_RECONCILE_TOL:
+        errors.append(
+            f"pad {pad_index}: cumulative damage_dealt {cumulative_damage:g} != "
+            f"cumulative wire-derived health loss {cumulative_loss:g} "
+            f"(residual {residual:g}; positive residuals are allowed up to the "
+            f"{trailing_hit:g} trailing-window allowance, negative residuals are "
+            f"never allowed)"
+        )
+
+    return PadReconciliation(
+        pad_index=pad_index,
+        n_windows=len(steps),
+        start_health=float(start_health),
+        cumulative_damage_dealt=cumulative_damage,
+        cumulative_wire_health_loss=cumulative_loss,
+        trailing_residual_allowance=trailing_hit,
+        errors=errors,
+    )
+
+
+@dataclass(frozen=True)
+class PadLogAnchor:
+    """One ``[bridge] pad <i> @ anchor <x>,<z> (<learner> / <dummy>)`` line."""
+
+    pad_index: int
+    anchor_x: int
+    anchor_z: int
+    learner: str
+    dummy: str
+
+
+@dataclass(frozen=True)
+class PadForeignSighting:
+    """One ``[bridge] pad <i> foreign_players <names>`` line (>= 1 foreign name)."""
+
+    pad_index: int
+    names: Tuple[str, ...]
+
+
+@dataclass
+class PadLogSummary:
+    """Parsed evidence from one pad's bridge stdout+stderr log file.
+
+    ``server/setup/start-pads.sh`` redirects each pad bridge's combined
+    stdout+stderr into one file (``>pad_log 2>&1``), so both the anchor line
+    (stderr) and any foreign_players lines (stderr) live in the same stream
+    this parses. Any other line -- bridge lifecycle logs, JS stack traces, a
+    malformed write, a mid-write truncation -- simply matches neither pattern
+    and is skipped; the parser never raises on unrecognized content.
+    """
+
+    lines_scanned: int = 0
+    anchors: List[PadLogAnchor] = field(default_factory=list)
+    foreign_sightings: List[PadForeignSighting] = field(default_factory=list)
+
+
+def parse_pad_log_lines(lines: Iterable[str]) -> PadLogSummary:
+    """Parse an iterable of raw log lines into a :class:`PadLogSummary`.
+
+    Pure and socket-free so it is fully unit-testable against fixtures: a
+    clean line, a foreign-player line, a malformed/garbled line, and a
+    truncated final line all pass through this the same way -- match one of
+    the two known patterns, or skip.
+    """
+    summary = PadLogSummary()
+    for raw in lines:
+        summary.lines_scanned += 1
+        line = raw.rstrip("\r\n")
+
+        m = _PAD_ANCHOR_LOG_RE.match(line)
+        if m is not None:
+            summary.anchors.append(
+                PadLogAnchor(
+                    pad_index=int(m.group("pad")),
+                    anchor_x=int(m.group("x")),
+                    anchor_z=int(m.group("z")),
+                    learner=m.group("learner"),
+                    dummy=m.group("dummy"),
+                )
+            )
+            continue
+
+        m = _FOREIGN_PLAYERS_LOG_RE.match(line)
+        if m is not None:
+            names = tuple(n for n in m.group("names").split(",") if n)
+            summary.foreign_sightings.append(
+                PadForeignSighting(pad_index=int(m.group("pad")), names=names)
+            )
+            continue
+
+        # Neither pattern matched (bridge lifecycle noise, a malformed or
+        # truncated line, a decode-mangled line) -- not evidence, not an
+        # error. See the module-level note: absence of a foreign_players line
+        # is never treated as proof of a clean scan on its own.
+    return summary
+
+
+def parse_pad_log_file(path: Union[str, Path]) -> PadLogSummary:
+    """Read and parse one pad's bridge log file.
+
+    Args:
+        path: Path to the per-pad log file (see :func:`default_pad_log_path`
+            for the ``server/setup/start-pads.sh`` naming convention).
+
+    Returns:
+        A populated :class:`PadLogSummary`.
+
+    Raises:
+        FileNotFoundError: if ``path`` does not exist. A missing log is an
+            ERROR, never a silent "zero foreign players" pass -- absence of
+            evidence is not evidence of absence, and that is the entire point
+            of AC13.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"pad log not found: {p}")
+    # errors="replace": the live bridge process may still be appending to this
+    # file (or was killed mid multi-byte UTF-8 sequence at EOF); a decode
+    # error must degrade that one trailing line to unmatched noise, never
+    # crash the whole parse.
+    with p.open("r", encoding="utf-8", errors="replace") as f:
+        return parse_pad_log_lines(f)
+
+
+def default_pad_log_path(log_dir: Union[str, Path], pad_index: int) -> Path:
+    """The per-pad bridge log path, mirroring ``server/setup/start-pads.sh``.
+
+    That script writes ``${LOG_DIR:-<server>/logs/pads}/pad-<i>.log`` per pad
+    (combined stdout+stderr); this is the read-side mirror of that convention,
+    not a second definition of it -- the write side is start-pads.sh's alone.
+    """
+    return Path(log_dir) / f"pad-{pad_index}.log"
+
+
+def verify_pad_log(summary: PadLogSummary, expected_pad_index: int) -> List[str]:
+    """Assert this log can be trusted as isolation evidence for ``expected_pad_index``.
+
+    A pad-log-dir mistake (wrong directory, off-by-one pad numbering, an
+    empty or rotated-away file) must never silently read as "clean" -- AC13
+    exists to prove ABSENCE of foreign contact, and absence of a
+    foreign_players line proves nothing unless this log can first be shown to
+    be genuinely THIS pad's own boot log. A log with no matching anchor line
+    is therefore always an error, never a pass.
+
+    Args:
+        summary: Parsed log evidence (see :func:`parse_pad_log_file`).
+        expected_pad_index: The pad index this log is supposed to belong to.
+
+    Returns:
+        Human-readable failures (empty == this log verifiably belongs to
+        ``expected_pad_index`` and only that pad).
+    """
+    errors: List[str] = []
+    matching = [a for a in summary.anchors if a.pad_index == expected_pad_index]
+    if not matching:
+        errors.append(
+            f"pad {expected_pad_index}: no matching '@ anchor' boot line found in "
+            f"this log ({summary.lines_scanned} line(s) scanned) -- cannot trust "
+            f"this file as isolation evidence for this pad"
+        )
+    for other in summary.anchors:
+        if other.pad_index != expected_pad_index:
+            errors.append(
+                f"pad {expected_pad_index}: log also contains a boot line for pad "
+                f"{other.pad_index} -- wrong file, or pads sharing one log"
+            )
+    return errors
+
+
+@dataclass
+class PadIsolationReport:
+    """T12/AC13's combined verdict for one pad: reconciliation + foreign scan.
+
+    Attributes:
+        pad_index: 0-based pad index.
+        reconciliation: The damage-vs-wire-health reconciliation (signal 1).
+        log_summary: The parsed bridge log (signal 2's raw evidence).
+        log_errors: Failures from :func:`verify_pad_log` (an untrustworthy log
+            file, distinct from an actual foreign-player sighting).
+    """
+
+    pad_index: int
+    reconciliation: PadReconciliation
+    log_summary: PadLogSummary
+    log_errors: List[str] = field(default_factory=list)
+
+    @property
+    def foreign_sightings(self) -> List[PadForeignSighting]:
+        return [
+            s for s in self.log_summary.foreign_sightings if s.pad_index == self.pad_index
+        ]
+
+    @property
+    def ok(self) -> bool:
+        return not self.reconciliation.errors and not self.log_errors and not self.foreign_sightings
+
+    def violations(self) -> List[str]:
+        """All human-readable failures, reconciliation first, then log issues."""
+        out = list(self.reconciliation.errors)
+        out.extend(self.log_errors)
+        out.extend(
+            f"pad {self.pad_index}: foreign player(s) seen in this pad's entity "
+            f"view: {', '.join(s.names)}"
+            for s in self.foreign_sightings
+        )
+        return out
+
+
+#: Grace period (seconds) subtracted from ``check_pad_isolation``'s
+#: ``min_mtime`` freshness threshold, to absorb filesystem mtime granularity
+#: and small clock skew between the OS and Python's ``time.time()``. This is
+#: NOT slack against a genuinely stale (previous-boot) log -- a real leftover
+#: predates the run by far more than this; it exists only so a log a live
+#: bridge touches within the same instant this check runs is never flagged on
+#: a rounding artifact.
+_MTIME_FRESHNESS_SLACK_S: float = 2.0
+
+
+def check_pad_isolation(
+    pad_index: int,
+    states: Sequence[StateMsg],
+    log_path: Union[str, Path],
+    *,
+    start_health: float = FULL_HEALTH,
+    min_mtime: Optional[float] = None,
+) -> PadIsolationReport:
+    """Run T12/AC13's full per-pad check: reconciliation + log consumption.
+
+    Args:
+        pad_index: 0-based pad index.
+        states: This pad's raw per-decision ``StateMsg`` sequence, in order.
+        log_path: Path to this pad's bridge log file.
+        start_health: Wire opponent health assumed entering window 0 (see
+            :func:`reconcile_pad_damage`).
+        min_mtime: If given (epoch seconds, e.g. ``time.time()`` captured
+            just before the live run started), the log file's mtime must be
+            at or after ``min_mtime - _MTIME_FRESHNESS_SLACK_S`` or the log is
+            rejected as STALE. ``verify_pad_log`` proves IDENTITY (this log
+            genuinely belongs to this pad) but not FRESHNESS: a leftover
+            ``pad-<i>.log`` from a previous, smaller/different boot can carry
+            a perfectly valid anchor line and no ``foreign_players`` lines,
+            reporting a silent clean pass for a pad that no longer exists.
+            This check closes that gap using a real side effect: connecting
+            this run's transport to a genuinely live, correctly-addressed
+            bridge always appends an ``env connected`` line to that bridge's
+            own log (``bridge/run.js``), so a live pad's log is always fresh
+            by the time this runs. ``None`` (the default) skips the check
+            entirely -- callers that cannot supply a trustworthy ``min_mtime``
+            (e.g. offline tests) get identity verification only, same as
+            before this parameter existed.
+
+    Returns:
+        A populated :class:`PadIsolationReport`.
+
+    Raises:
+        FileNotFoundError: propagated from :func:`parse_pad_log_file` if
+            ``log_path`` does not exist.
+    """
+    reconciliation = reconcile_pad_damage(pad_index, states, start_health=start_health)
+    summary = parse_pad_log_file(log_path)
+    log_errors = verify_pad_log(summary, pad_index)
+
+    if min_mtime is not None:
+        mtime = Path(log_path).stat().st_mtime
+        threshold = float(min_mtime) - _MTIME_FRESHNESS_SLACK_S
+        if mtime < threshold:
+            log_errors.append(
+                f"pad {pad_index}: log file {log_path} was last modified "
+                f"{threshold - mtime:.1f}s before this run started (mtime "
+                f"{mtime:.3f} < run-start threshold {threshold:.3f}) -- STALE "
+                f"evidence, likely a leftover from a previous boot; refusing "
+                f"to treat it as current"
+            )
+
+    return PadIsolationReport(
+        pad_index=pad_index,
+        reconciliation=reconciliation,
+        log_summary=summary,
+        log_errors=log_errors,
+    )
+
+
+def format_isolation_line(report: PadIsolationReport) -> str:
+    """One human-readable summary line per pad, in combat_probe's log style."""
+    r = report.reconciliation
+    return (
+        f"[isolation] pad {report.pad_index}: windows={r.n_windows} "
+        f"dealt={r.cumulative_damage_dealt:g} wire_loss={r.cumulative_wire_health_loss:g} "
+        f"foreign_events={len(report.foreign_sightings)} "
+        f"{'OK' if report.ok else 'FAIL'}"
+    )
+
+
+class PadIsolationRecorder:
+    """Records live per-decision states, per pad, for T12 reconciliation.
+
+    Drop-in as ``run_benchmark``'s ``step_work`` hook (its exact
+    ``(arena_index, state) -> None`` signature) to capture the raw per-pad
+    ``StateMsg`` sequence WITHOUT modifying ``run_benchmark`` at all: the
+    concurrent driver already flattens ``arena_states`` across every arena
+    before assembling the fleet-wide report (``report.damage_boundary`` sums
+    across ALL arenas), so per-pad identity would otherwise be lost by the
+    time a caller sees the report.
+
+    Each arena thread appends only to its OWN pre-sized slot (mirroring
+    ``run_benchmark``'s own ``arena_states`` pattern), so no lock is needed --
+    this keeps the hook cheap enough to run inside ``step_work``'s per-step,
+    outside-the-shared-lock hot path without adding contention.
+    """
+
+    def __init__(self, n_arenas: int) -> None:
+        if n_arenas < 1:
+            raise ValueError(f"n_arenas must be >= 1, got {n_arenas}")
+        self._states: List[List[StateMsg]] = [[] for _ in range(n_arenas)]
+
+    def record(self, arena_index: int, state: StateMsg) -> None:
+        """Matches ``run_benchmark``'s ``step_work`` signature exactly."""
+        self._states[arena_index].append(state)
+
+    def states_for(self, arena_index: int) -> List[StateMsg]:
+        return list(self._states[arena_index])
+
+    def check_all(
+        self,
+        log_paths: Mapping[int, Union[str, Path]],
+        *,
+        start_health: float = FULL_HEALTH,
+        pad_index_for_arena: Optional[Callable[[int], int]] = None,
+        min_mtime: Optional[float] = None,
+    ) -> Dict[int, PadIsolationReport]:
+        """Run :func:`check_pad_isolation` for every recorded arena.
+
+        Args:
+            log_paths: ``arena_index -> log file path``, must cover every
+                arena this recorder was constructed with.
+            start_health: Forwarded to :func:`reconcile_pad_damage`.
+            pad_index_for_arena: ``arena_index -> TRUE pad index``, used to
+                label each report AND as ``verify_pad_log``'s expected pad
+                index. Defaults to the identity function (arena i IS pad i) --
+                true only when this run's arena 0 is genuinely connected to
+                pad 0's bridge port. A caller that points ``--port`` at a
+                SUBSET or offset of the fleet (e.g. pads 2..5) MUST supply a
+                resolver, or this call would compare each log's anchor line
+                against the wrong expected pad index -- ``verify_pad_log``
+                would then fail loudly rather than silently misattribute, but
+                it is better not to construct that mismatch in the first
+                place. See ``eval.benchmark.main``'s ``--bridge-base-port``.
+            min_mtime: Forwarded to :func:`check_pad_isolation` for every pad
+                (freshness check; ``None`` skips it).
+
+        Returns:
+            ``{arena_index: PadIsolationReport}`` (keyed by ARENA index, same
+            as ``log_paths``; each report's own ``.pad_index`` carries the
+            resolved TRUE pad index).
+
+        Raises:
+            KeyError: if ``log_paths`` is missing an entry for a recorded
+                arena -- never silently skip a pad's isolation evidence.
+        """
+        resolve = pad_index_for_arena or (lambda arena_index: arena_index)
+        reports: Dict[int, PadIsolationReport] = {}
+        for arena_index, states in enumerate(self._states):
+            if arena_index not in log_paths:
+                raise KeyError(f"no log path supplied for arena {arena_index}")
+            reports[arena_index] = check_pad_isolation(
+                resolve(arena_index),
+                states,
+                log_paths[arena_index],
+                start_health=start_health,
+                min_mtime=min_mtime,
+            )
+        return reports
+
+
+# ---------------------------------------------------------------------------
 # CLI — the LIVE AC4 run (needs a started bridge + Paper server).
 # ---------------------------------------------------------------------------
 
@@ -1230,6 +1886,46 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="metrics backend: auto|wandb|tensorboard|jsonl (default: auto)",
     )
+    parser.add_argument(
+        "--pad-log-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "T12/AC13 cross-pad isolation: directory of per-pad bridge logs "
+            "(server/setup/start-pads.sh's --log-dir, default <server>/logs/pads; "
+            "pad i's file is DIR/pad-<i>.log, where i is (--port - "
+            "--bridge-base-port) + arena_index -- see --bridge-base-port). When "
+            "given, this run ALSO reconciles cumulative damage_dealt against "
+            "each pad's own wire-derived dummy health loss and consumes each "
+            "pad's foreign-username scan, printing one [isolation] line per "
+            "pad and folding isolation violations into the exit code. Omit to "
+            "leave this run's behavior BEHAVIORALLY identical to today (the "
+            "printed JSON always carries a pad_isolation key; it is just "
+            "empty). NOTE: the foreign-player scan fires only on reset "
+            "(bridge/bot.js _scanForeignPlayers) -- a run with no resets in "
+            "the window has zero SCAN COVERAGE, not zero violations."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-base-port",
+        type=int,
+        default=5555,
+        metavar="PORT",
+        help=(
+            "the FLEET's bridge base port -- pad 0's port (matches "
+            "server/setup/start-pads.sh's --bridge-base-port / "
+            "distributed/launcher.py's DEFAULT_BRIDGE_BASE_PORT, default "
+            "5555). Only meaningful with --pad-log-dir: this run's arena i "
+            "connects to --port + i, and its TRUE pad index is "
+            "(--port - --bridge-base-port) + i, so pointing --port at a "
+            "SUBSET of the fleet (e.g. --port 5557 to benchmark pads 2..5) "
+            "still reads and labels the correct per-pad logs instead of "
+            "silently reading pad-0.log for what is actually pad 2. A --port "
+            "below --bridge-base-port is refused loudly at startup rather "
+            "than resolving to a negative pad index."
+        ),
+    )
     return parser
 
 
@@ -1239,28 +1935,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     Builds one real :class:`~env.mc_pvp_env.TcpBridgeClient` per arena
     (``port + arena_index``), runs :func:`run_benchmark` for ``--duration``
     seconds, logs through a :class:`~eval.logging.MetricsLogger`, prints the
-    report as JSON, and EXITS WITH THE REPORTED NUMBER baked into the exit code:
-    ``0`` only when the run sustained ≥19 TPS AND the damage-boundary gate
-    actually ran and passed, ``1`` otherwise — so the live run is usable as a
-    pass/fail gate while the printed JSON carries the full measured numbers.
+    report as JSON, and EXITS WITH THE REPORTED NUMBER baked into the exit
+    code: ``0`` when the run sustained ≥19 TPS, the damage-boundary gate
+    either ran and passed OR is inert (never scripted from this live entry
+    point), and, if requested, isolation is clean on every pad; ``1``
+    otherwise — so the live run is usable as a pass/fail gate while the
+    printed JSON carries the full measured numbers.
 
-    Two gates make this exit code honest rather than trivially green:
+    Gates that make this exit code honest rather than trivially green:
 
     * **TPS** — the live run derives server TPS from real ``tick`` deltas via
       :class:`TickDeltaTpsProvider` (NOT the constant offline default), so a real
       lag dip below 19 TPS trips the gate and forces exit ``1``.
-    * **Damage boundary** — a deterministic known-N-hit exchange cannot be driven
-      against a live opponent from this entry point (it is an offline/scripted
-      cross-check fed via ``expected_hits`` + a :class:`FakeBridge`). The live run
-      therefore does NOT compute ``ok``; rather than silently defaulting that gate
-      to "pass", this prints a LOUD banner that the gate is INERT and treats it as
-      NOT-passed, so exit ``0`` can never falsely imply the damage check ran.
+    * **Damage boundary** — a deterministic known-N-hit exchange cannot be
+      driven against a live opponent from this entry point (it is an
+      offline/scripted cross-check fed via ``expected_hits`` + a
+      :class:`FakeBridge`, and this entry point never sets ``expected_hits`` —
+      a live run cannot know N a priori). So this gate is always INERT here: a
+      LOUD banner says so, the printed JSON stamps ``damage_boundary.inert``
+      explicitly, and — because a gate that never ran cannot be graded — it is
+      EXCLUDED from the exit code rather than forced to fail (exit ``0`` can
+      still happen; it truthfully means "TPS passed and the damage gate did
+      not run", exactly what the banner says). A gate that DID run (a
+      caller-supplied ``expected_hits``, e.g. a future harness) and FAILED
+      still fails the exit code — inert and failed are different outcomes.
+
+    With ``--pad-log-dir``, this run ALSO performs T12/AC13's cross-pad
+    isolation check over the SAME live run (see :class:`PadIsolationRecorder`):
+    per-pad reconciliation folds into the exit code alongside the TPS/damage
+    gates, and one ``[isolation]`` line per pad is printed to stderr. Omitting
+    the flag leaves this function's behavior BEHAVIORALLY identical to before
+    T12 (not byte-identical: the printed JSON always carries a
+    ``pad_isolation`` key now, empty when unused).
 
     Args:
         argv: Argument vector (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Process exit code (0 = sustained ≥19 TPS and a damage gate that ran OK).
+        Process exit code (0 = sustained ≥19 TPS, the damage gate did not
+        fail (ran-and-passed or inert), and, if requested, isolation clean on
+        every pad).
     """
     import json
 
@@ -1268,6 +1982,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     def factory(arena_index: int) -> BridgeTransport:
         return TcpBridgeClient(host=args.host, port=args.port + arena_index)
+
+    # T12/AC13, opt-in only (--pad-log-dir). Validated and constructed BEFORE
+    # any resource (the MetricsLogger, the live run) is acquired, so a bad
+    # --arenas or a --port/--bridge-base-port mismatch fails loudly with
+    # nothing left over to leak or tear down.
+    recorder: Optional[PadIsolationRecorder] = None
+    pad_offset = 0
+    if args.pad_log_dir is not None:
+        # W3: this run's arena i connects to --port + i, but a --pad-log-dir
+        # read keyed by raw arena index silently assumes arena i IS pad i.
+        # --port and the fleet's --bridge-base-port are independently
+        # configurable (both default 5555), so e.g. --port 5557 --arenas 4
+        # drives pads 2..5 while a raw-index read would fetch logs 0..3 --
+        # misrouted evidence, worse than none, and verify_pad_log cannot
+        # catch it (pad-0.log legitimately contains pad 0's own anchor). The
+        # offset below derives the TRUE pad index instead of assuming one.
+        pad_offset = args.port - args.bridge_base_port
+        if pad_offset < 0:
+            print(
+                f"[isolation] ABORT: --port {args.port} is below --bridge-base-port "
+                f"{args.bridge_base_port}; arena 0 would resolve to a negative pad "
+                f"index. Misrouted evidence is worse than none -- refusing to "
+                f"start. Pass the fleet's real --bridge-base-port (default 5555), "
+                f"or point --port at (or above) it.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            recorder = PadIsolationRecorder(args.arenas)
+        except ValueError as exc:
+            print(f"[isolation] ABORT: {exc}", file=sys.stderr)
+            return 1
 
     logger = MetricsLogger(
         run_name=args.run_name,
@@ -1285,6 +2031,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     clock = time.perf_counter
     tps_provider = TickDeltaTpsProvider(clock=clock)
 
+    # Real wall-clock run-start marker (deliberately NOT the injectable
+    # `clock` above, which can be fake in tests) -- the freshness check below
+    # compares it against each log file's real filesystem mtime.
+    run_start_wall = time.time()
+
     try:
         report = run_benchmark(
             factory,
@@ -1295,19 +2046,67 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logger=logger,
             is_live=True,
             log=lambda m: print(m, file=sys.stderr),
+            step_work=(recorder.record if recorder is not None else None),
         )
     finally:
         logger.close()
 
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    isolation_passed = True
+    if recorder is not None:
+        print(
+            "\n"
+            "[isolation] NOTE: the foreign-player scan fires ONLY on reset "
+            "(bridge/bot.js _scanForeignPlayers); a window with no resets in "
+            "it has ZERO scan coverage, not zero violations.\n",
+            file=sys.stderr,
+        )
+        pad_index_for_arena = lambda arena_index: pad_offset + arena_index  # noqa: E731
+        log_paths = {
+            i: default_pad_log_path(args.pad_log_dir, pad_index_for_arena(i))
+            for i in range(args.arenas)
+        }
+        try:
+            isolation_reports = recorder.check_all(
+                log_paths,
+                pad_index_for_arena=pad_index_for_arena,
+                min_mtime=run_start_wall,
+            )
+        except FileNotFoundError as exc:
+            print(f"[isolation] ABORT: {exc}", file=sys.stderr)
+            isolation_reports = {}
+            isolation_passed = False
+        for i in sorted(isolation_reports):
+            r = isolation_reports[i]
+            print(format_isolation_line(r), file=sys.stderr)
+            for violation in r.violations():
+                print(f"    FAIL: {violation}", file=sys.stderr)
+        if isolation_reports:
+            isolation_passed = isolation_passed and all(
+                r.ok for r in isolation_reports.values()
+            )
+        report.pad_isolation = {
+            str(r.pad_index): {
+                "ok": r.ok,
+                "windows": r.reconciliation.n_windows,
+                "cumulative_damage_dealt": r.reconciliation.cumulative_damage_dealt,
+                "cumulative_wire_health_loss": r.reconciliation.cumulative_wire_health_loss,
+                "foreign_events": len(r.foreign_sightings),
+                "violations": r.violations(),
+            }
+            for r in isolation_reports.values()
+        }
 
     # Damage-boundary gate: it only ran if expected_hits was supplied, in which
     # case tally_damage_dealt() stamped an "ok" key. A live run cannot script the
-    # exchange, so the gate is INERT here. Do NOT default it to True — treat a gate
-    # that did not run as NOT-passed and say so loudly.
+    # exchange, so the gate is INERT here. Do NOT default it to "passed" -- but
+    # do NOT force it to "failed" either: a gate that never ran cannot be
+    # graded, and forcing it to fail made exit 0 unreachable on this entry
+    # point, contradicting the banner's own text. Computed and stamped into the
+    # report BEFORE the JSON print below, so the artifact records it explicitly.
     damage = report.damage_boundary
     damage_ran = "ok" in damage
     damage_ok = bool(damage.get("ok", False))
+    damage["inert"] = not damage_ran  # explicit, machine-readable, in the JSON artifact
 
     if not damage_ran:
         print(
@@ -1316,15 +2115,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "WARNING: the damage-boundary gate is INERT on this live run.\n"
             "No known-N-hit exchange was scripted (expected_hits was not set),\n"
             "so events.damage_dealt correctness was NOT verified. This gate is\n"
-            "an OFFLINE cross-check (see tests/test_benchmark.py). Exit 0 here\n"
-            "reflects the TPS gate ONLY and does NOT imply the damage check ran.\n"
+            "an OFFLINE cross-check (see tests/test_benchmark.py). It is EXCLUDED\n"
+            "from the exit code (inert, not failed) -- exit 0 here reflects the\n"
+            "TPS gate (and isolation, if requested) and does NOT imply the damage\n"
+            "check ran.\n"
             "================================================================\n",
             file=sys.stderr,
         )
 
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+
     tps_passed = report.sustains_19_tps
-    damage_passed = damage_ran and damage_ok
-    passed = tps_passed and damage_passed
+    damage_passed = damage_ok if damage_ran else True  # inert never forces a failure
+    passed = tps_passed and damage_passed and isolation_passed
 
     if not passed:
         reasons = []
@@ -1332,10 +2135,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reasons.append(
                 f"did not sustain >=19 TPS (min={report.sustained_tps_min:.2f})"
             )
-        if not damage_ran:
-            reasons.append("damage-boundary gate did not run (inert)")
-        elif not damage_ok:
+        if damage_ran and not damage_ok:
             reasons.append("damage-boundary check failed")
+        if not isolation_passed:
+            reasons.append("cross-pad isolation check failed (see [isolation] lines above)")
         print("FAIL: " + "; ".join(reasons), file=sys.stderr)
 
     return 0 if passed else 1
