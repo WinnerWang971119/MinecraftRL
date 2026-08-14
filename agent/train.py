@@ -2140,6 +2140,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from eval.logging import MetricsLogger
 
+    from agent.reward_config import RewardConfig
     from env.mc_pvp_env import TcpBridgeClient
 
     args = _build_parser().parse_args(argv)
@@ -2149,6 +2150,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = dataclasses.replace(
         TrainConfig(), seed=int(args.seed), arenas=int(args.arenas)
     )
+
+    # Reward coefficients go into the run's own config so the run stays readable
+    # without them. `code_version` cannot stand in for this: its SHA half has no
+    # `--dirty`, and its `cfg` half hashes only version pins and timing constants,
+    # so two runs with different coefficients fingerprint identically. Every
+    # archived run paid for that — their coefficients had to be recovered by
+    # inverting logged component values. The env builds `RewardConfig()` itself
+    # (env/mc_pvp_env.py:438) and nothing overrides it, so these ARE the values
+    # this run scores with; if an override is ever added, read it from there.
+    reward_cfg = {
+        f"reward.{k}": v for k, v in dataclasses.asdict(RewardConfig()).items()
+    }
 
     logger = MetricsLogger(
         run_name=args.run_name,
@@ -2161,6 +2174,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_episodes": args.max_episodes,
             "eval_episodes": args.eval_episodes,
             "code_version": code_version(),
+            **reward_cfg,
         },
     )
 
