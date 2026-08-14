@@ -63,7 +63,6 @@ def _tiny_cfg(**overrides) -> TrainConfig:
         seed=0,
         # multi-arena fields -- required by TrainConfig validation
         weight_sync_every_k_steps=5,
-        fault_min_live_arenas=1,
     )
     base.update(overrides)
     return TrainConfig(**base)

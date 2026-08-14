@@ -1,5 +1,5 @@
-// run.test.js — `node --test` suite for the T10 per-arena config parsing in
-// run.js. Runs WITHOUT a live Minecraft server: it drives the PURE
+// run.test.js — `node --test` suite for the per-pad config parsing in run.js.
+// Runs WITHOUT a live Minecraft server: it drives the PURE
 // parseBridgeConfig(argv, env) directly, so no Mineflayer, no socket, no bots.
 //
 // ============================================================================
@@ -27,7 +27,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseBridgeConfig } = require('./run');
+const { parseBridgeConfig, parsePadOrigin, parsePadIndex, usernamesForPad } = require('./run');
 
 // ===========================================================================
 // Defaults — nothing provided means an empty config (everything falls through
@@ -177,4 +177,144 @@ test('parseBridgeConfig throws when a flag is missing its value', () => {
 
 test('parseBridgeConfig throws on a stray non-flag argument', () => {
   assert.throws(() => parseBridgeConfig(['25566'], {}), /unexpected argument "25566"/);
+});
+
+// ===========================================================================
+// PAD TOPOLOGY (T9): --pad-origin / --pad-index.
+//
+// Both are PROCESS-LOCAL — neither reaches the wire. The anchor is only ever
+// PARSED here; it is never derived from the index (padAnchor(i) is the
+// launcher's sole implementation, deliberately not mirrored in this process).
+//
+// Validation is strict on purpose. The anchor is pasted TEXTUALLY into the
+// datapack's macro arguments and the datapack builds `$(x).5` from it, so
+// `512L` yields the non-coordinate `512L.5` and a bad value inside a $-macro
+// aborts instantiation of the WHOLE function — no command runs and nothing
+// reaches the server log. A NEGATIVE anchor is worse still: it parses fine and
+// silently places the bots half a block off the anchor. Hence: two parts, each
+// a plain non-negative integer, or a loud failure naming the offending string.
+// ===========================================================================
+
+test('parseBridgeConfig parses --pad-origin into the flat padOriginX/padOriginZ pair', () => {
+  assert.deepEqual(parseBridgeConfig(['--pad-origin', '512,1024'], {}), {
+    padOriginX: 512,
+    padOriginZ: 1024,
+  });
+  assert.deepEqual(parseBridgeConfig(['--pad-origin=0,0'], {}), { padOriginX: 0, padOriginZ: 0 });
+  // Surrounding and inner whitespace is tolerated; the VALUE grammar is not.
+  assert.deepEqual(parseBridgeConfig([], { PAD_ORIGIN: ' 512 , 1024 ' }), {
+    padOriginX: 512,
+    padOriginZ: 1024,
+  });
+});
+
+test('parseBridgeConfig fails loudly on a malformed --pad-origin, naming the offending value (TC19)', () => {
+  const malformed = [
+    '512', // one part
+    '512,1024,0', // three parts
+    '512,', // missing z
+    ',1024', // missing x
+    '512;1024', // wrong separator
+    '-512,0', // NEGATIVE: the silent half-block misplacement
+    '0,-1024',
+    '512L,0', // NBT type suffix
+    '0b,0',
+    '512.0,0', // decimal
+    '5e2,0', // exponent
+    '0x10,0', // hex
+    '+5,0', // signed
+    '"512",0', // quoted
+    'x,z',
+    '',
+    '   ',
+  ];
+  for (const value of malformed) {
+    assert.throws(
+      () => parseBridgeConfig(['--pad-origin', value], {}),
+      (err) =>
+        /^--pad-origin must be "<x>,<z>" with two non-negative plain integers/.test(err.message) &&
+        err.message.includes(JSON.stringify(value)),
+      `--pad-origin ${JSON.stringify(value)} must fail loudly with the offending value`,
+    );
+  }
+  // The env form names its own source, and never defaults silently.
+  assert.throws(
+    () => parseBridgeConfig([], { PAD_ORIGIN: '512L,0' }),
+    /PAD_ORIGIN must be "<x>,<z>" with two non-negative plain integers.*"512L,0"/,
+  );
+});
+
+test('parseBridgeConfig derives the pad usernames from --pad-index, with i==0 keeping learner_bot/dummy_bot', () => {
+  // i == 0 is DELIBERATELY learner_bot/dummy_bot (not learner_0), so the manual
+  // single-arena path — ops.json, the arena:reset wrapper, the runbook — stays
+  // byte-identical. This changes PR #21's launcher default.
+  assert.deepEqual(parseBridgeConfig(['--pad-index', '0'], {}), {
+    padIndex: 0,
+    learnerUsername: 'learner_bot',
+    dummyUsername: 'dummy_bot',
+  });
+  assert.deepEqual(parseBridgeConfig(['--pad-index', '3', '--pad-origin', '512,1024'], {}), {
+    padIndex: 3,
+    padOriginX: 512,
+    padOriginZ: 1024,
+    learnerUsername: 'learner_3',
+    dummyUsername: 'dummy_3',
+  });
+  // Ports are NOT derived from the index: --pad-index is usernames and logging
+  // only, and the launcher passes --bridge-port explicitly.
+  assert.equal(parseBridgeConfig(['--pad-index', '3', '--pad-origin', '512,0'], {}).bridgePort, undefined);
+});
+
+test('parseBridgeConfig lets an explicit username override the pad-index default', () => {
+  const config = parseBridgeConfig(
+    ['--pad-index', '3', '--pad-origin', '512,0', '--learner-username', 'custom_learner'],
+    { DUMMY_USERNAME: 'env_dummy' },
+  );
+  assert.equal(config.learnerUsername, 'custom_learner');
+  assert.equal(config.dummyUsername, 'env_dummy', 'env also outranks the index-derived name');
+});
+
+test('parseBridgeConfig throws on a malformed --pad-index', () => {
+  for (const value of ['-1', '1.5', '3L', 'three', '', ' ']) {
+    assert.throws(
+      () => parseBridgeConfig(['--pad-index', value], {}),
+      (err) =>
+        /^--pad-index must be a non-negative plain integer/.test(err.message) &&
+        err.message.includes(JSON.stringify(value)),
+      `--pad-index ${JSON.stringify(value)} must fail loudly`,
+    );
+  }
+});
+
+test('parseBridgeConfig refuses a nonzero --pad-index with no --pad-origin (silent pad overlap)', () => {
+  // Defaulting the anchor here would stack pad 3 on top of pad 0: two bot pairs
+  // in one arena, cross-crediting every hit with no attacker attribution. The
+  // anchor must come from the launcher — this process never computes one.
+  assert.throws(
+    () => parseBridgeConfig(['--pad-index', '3'], {}),
+    /--pad-index 3 requires an explicit --pad-origin/,
+  );
+  // Pad 0's anchor IS (0,0) by definition, so index 0 alone is fine.
+  assert.doesNotThrow(() => parseBridgeConfig(['--pad-index', '0'], {}));
+});
+
+test('parseBridgeConfig rejects a username that could break the reset macro', () => {
+  // Usernames are pasted between quotes inside the macro's NBT compound, so a
+  // quote or comma would rewrite its argument list. Caught at STARTUP, not at
+  // the first reset where the macro would abort silently server-side.
+  assert.throws(
+    () => parseBridgeConfig(['--learner-username', 'bad name'], {}),
+    /learnerUsername must be a Minecraft username/,
+  );
+  assert.throws(
+    () => parseBridgeConfig([], { DUMMY_USERNAME: 'a","b' }),
+    /dummyUsername must be a Minecraft username/,
+  );
+});
+
+test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher and tests', () => {
+  assert.deepEqual(parsePadOrigin('512,1024', '--pad-origin'), { x: 512, z: 1024 });
+  assert.equal(parsePadIndex('7', '--pad-index'), 7);
+  assert.deepEqual(usernamesForPad(0), { learnerUsername: 'learner_bot', dummyUsername: 'dummy_bot' });
+  assert.deepEqual(usernamesForPad(7), { learnerUsername: 'learner_7', dummyUsername: 'dummy_7' });
 });

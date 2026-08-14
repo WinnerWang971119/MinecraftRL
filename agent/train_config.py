@@ -190,17 +190,19 @@ class TrainConfig:
     #: when ``arenas > 1``; ignored in single-arena mode. TUNE 20–100.
     weight_sync_every_k_steps: int = 50
 
-    #: When True, the ActorPool attempts a background relaunch of an arena
-    #: process that died mid-run (network drop, JVM crash, etc.). Only read
-    #: when ``arenas > 1``. Set False to surface arena failures immediately
-    #: instead of masking them with retries.
+    #: When True (the default), TIER 1 of the two-tier fault policy is armed: a
+    #: collector whose pad's BRIDGE died restarts that one bridge in the
+    #: background and reconnects, leaving every other pad running. Only read
+    #: when ``arenas > 1``.
+    #:
+    #: Set False only as a hands-on diagnostic: a dead pad then STAYS dead and
+    #: the run keeps going on the rest of the fleet, with nothing to make that
+    #: loud. (It does not turn a pad fault into an abort. The one abort in the
+    #: system is TIER 2 — the shared Paper JVM dying — and that fires whatever
+    #: this flag says.) There is deliberately no survivor floor: a
+    #: ``fault_min_live_arenas``-style knob would license training on a
+    #: silently shrunken fleet, which the plan forbids.
     fault_relaunch: bool = True
-
-    #: Minimum number of live arenas required to keep the run going. If live
-    #: arenas drop below this floor (after relaunch attempts are exhausted),
-    #: the training loop aborts. 1 means the run continues as long as at least
-    #: one arena is alive. Only read when ``arenas > 1``.
-    fault_min_live_arenas: int = 1
 
     #: Max items in the inter-thread experience queue that collectors push to
     #: and the learner pops from. 0 == unbounded ``queue.Queue`` (no
@@ -289,10 +291,6 @@ class TrainConfig:
             raise ValueError(
                 f"weight_sync_every_k_steps must be >= 1, got "
                 f"{self.weight_sync_every_k_steps}"
-            )
-        if self.fault_min_live_arenas < 1:
-            raise ValueError(
-                f"fault_min_live_arenas must be >= 1, got {self.fault_min_live_arenas}"
             )
         if self.collector_queue_max < 0:
             raise ValueError(

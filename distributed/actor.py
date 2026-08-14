@@ -1,14 +1,40 @@
-"""actor — thread-per-arena collectors + the ActorPool supervisor (T7).
+"""actor — thread-per-pad collectors + the two-tier fault policy (T7, T11).
 
 This is the actor side of the Ape-X-lite seam (plan §Decisions). One
-:class:`Collector` runs as a daemon thread per arena: it rolls episodes against
+:class:`Collector` runs as a daemon thread per pad: it rolls episodes against
 its OWN :class:`~env.mc_pvp_env.MCPvPEnv` using a :class:`~distributed.weights.SnapshotPolicy`
 (a periodically-synced weight SNAPSHOT, never the live learner net — that would be
 a torch read-during-write race) and pushes each whole
 :class:`~distributed.serialization.Episode` onto the shared
 :class:`~distributed.transport.ExperienceTransport`. The :class:`ActorPool`
-supervises N collectors and decides, at the WHOLE-RUN level, when too many arenas
-are down to keep going.
+supervises N collectors and owns the WHOLE-RUN abort.
+
+THE TWO-TIER FAULT POLICY (T11). Under the one-JVM/N-pad topology there are
+exactly two kinds of fault and they get opposite responses:
+
+  * **Tier 1 — a pad's BRIDGE dies.** Restart THAT pad's bridge and nothing else
+    (:meth:`Collector.restart_bridge`, which goes through the injected
+    :class:`ArenaLauncher`). Every other pad keeps collecting; the run continues.
+  * **Tier 2 — the shared Paper JVM dies.** ABORT the whole run, loudly, naming
+    the JVM (detected by :func:`jvm_alive`, a plain TCP connect probe of the
+    Minecraft port). Every pad in the fleet lives in that one JVM, so there are no
+    survivors to continue on — and restarting a bridge into a dead JVM only
+    produces a process that exits immediately.
+
+There is deliberately NO survivor floor. ``fault_min_live_arenas`` was DELETED in
+T11: a floor means the run quietly keeps training on a shrunken fleet, which is
+exactly what the plan forbids ("abort rather than silently train on fewer
+arenas"). Tier 1 does not need a floor because a dead pad is REPAIRED rather than
+written off, and tier 2 does not need one because a dead JVM leaves nothing alive.
+A single ``False`` from :func:`jvm_alive` is the abort trigger — no grace period,
+no retry budget, no partial-fleet mode.
+
+Why probe the Minecraft port and not a bridge port: Paper is an ordinary
+multi-client server, so a connect-and-close costs it nothing and evicts nobody.
+``BridgeServer`` is the opposite — it accepts exactly ONE TCP client and a second
+connection DESTROYS the incumbent (``bridge/transport.js``), so a connect probe
+against a live bridge would silently kill the very collector it was checking on.
+Never point :func:`jvm_alive` at a bridge port.
 
 Why these specific shapes:
 
@@ -32,34 +58,38 @@ Why these specific shapes:
     mid-episode reply loss, and we must NOT add one). The collector then FIRST tries
     the env's idempotent ``reset()`` reconnect (bounded): a transient drop — e.g. a
     periodic eval transiently stole the bridge's single connection — recovers there
-    and the collector resumes. Only if that fails does the collector treat the arena
-    as genuinely DEAD: it marks itself down, asks the injectable
-    :class:`ArenaLauncher` to relaunch the OS processes, backs off on a
-    seconds-to-tens-of-seconds scale (relaunching a Paper server is slow — 30-60s+),
-    and reconnects with a FRESH env/client to the SAME arena's bridge. A bridge
-    serves exactly ONE connection, so a reconnect always opens a fresh client to the
-    same port; we never multiplex. The learner and the OTHER collectors are
-    unaffected throughout — survivors keep producing.
+    and the collector resumes. Only if that fails does the collector treat the pad
+    as genuinely DEAD: it marks itself down, checks the SHARED JVM (tier 2 first —
+    a bridge restart into a dead JVM is pointless), then asks the injectable
+    :class:`ArenaLauncher` to restart THAT PAD'S BRIDGE, backs off, and reconnects
+    with a FRESH env/client to the SAME pad's bridge. A bridge serves exactly ONE
+    connection, so a reconnect always opens a fresh client to the same port; we
+    never multiplex. The learner and the OTHER collectors are unaffected
+    throughout — the other pads keep producing.
 
-  * **The pool aborts on the AGGREGATE, not per-arena.** Because a relaunched arena
-    may legitimately be down for tens of seconds, "any arena down" is the wrong abort
-    trigger. The :class:`ActorPool` aborts the run LOUDLY only when the number of
-    LIVE arenas drops below ``cfg.fault_min_live_arenas``; survivors keep feeding the
-    learner meanwhile.
+  * **A restarted bridge re-runs ``arena:reset_pad`` by itself.** The bridge is the
+    SOLE reset authority: ``handleReset`` issues ``/function arena:reset_pad`` with
+    this pad's anchor on EVERY reset, and the relaunched process is spawned with
+    its ``--pad-origin`` anchor. Recovery already ends in ``env.reset()``, so the
+    pad is re-placed by the ordinary path. There is deliberately no separate
+    "re-run the reset macro" step here: it would have to open a SECOND client to a
+    single-client bridge, evicting the collector that just reconnected.
 
 Injectability (T14): every collaborator is injected — an ``env_factory`` (so a
-relaunch rebuilds a fresh client to the same arena), the ``policy``, the
-``transport``, the ``weight_store``, the ``cfg``, and the :class:`ArenaLauncher`
-(a fake in tests records ``launch``/``terminate`` calls). Backoff durations are
-constructor parameters so unit tests pass tiny values and never sleep for real
-seconds. A fake env can raise :class:`~env.mc_pvp_env.BridgeError` on demand to
-drive the fault paths.
+relaunch rebuilds a fresh client to the same pad), the ``policy``, the
+``transport``, the ``weight_store``, the ``cfg``, the :class:`ArenaLauncher`
+(a fake in tests records ``launch``/``terminate`` calls), and the JVM probe
+(``jvm_probe``, a ``(host, port) -> bool``; :func:`jvm_alive` is the live one).
+Backoff durations are constructor parameters so unit tests pass tiny values and
+never sleep for real seconds. A fake env can raise
+:class:`~env.mc_pvp_env.BridgeError` on demand to drive the fault paths.
 
-Owner: T7 (multi-arena throughput track, issue #4)
+Owner: T7 (multi-arena throughput track, issue #4); T11 (two-tier fault policy)
 """
 
 from __future__ import annotations
 
+import socket
 import threading
 from typing import Callable, Dict, List, Optional, Protocol
 
@@ -77,63 +107,213 @@ from env.mc_pvp_env import BridgeError
 
 __all__ = [
     "ArenaLauncher",
+    "JvmProbe",
+    "LaunchAbandoned",
     "PoolAbortedError",
+    "ShutdownSignal",
     "GlobalEpisodeCounter",
     "Collector",
     "ActorPool",
+    "jvm_alive",
+    "MC_HOST",
+    "MC_PORT",
 ]
 
 
-# A zero-arg callable that builds (and connects) a FRESH env bound to one arena's
+# A zero-arg callable that builds (and connects) a FRESH env bound to one pad's
 # bridge. A relaunch rebuilds the env through this so the new connection is a fresh
-# client to the SAME arena's single-connection bridge — never a reused dead socket.
+# client to the SAME pad's single-connection bridge — never a reused dead socket.
 EnvFactory = Callable[[], EnvProtocol]
 
+#: ``(host, port) -> bool`` liveness check for the SHARED Paper JVM.
+#: :func:`jvm_alive` is the live implementation; a test injects a stub so no unit
+#: test ever touches the network. Called positionally, so any two-arg callable works.
+JvmProbe = Callable[[str, int], bool]
 
-# Default fault timing (seconds). Relaunching a Paper server is slow (world-gen,
-# plugin load, bot re-op/re-teleport take 30-60s+), so the backoff between a failed
-# reconnect and the next attempt is on the order of seconds and grows toward a cap.
-# Both are constructor-overridable so unit tests inject tiny values and never sleep
-# for real seconds.
+
+# Default fault timing (seconds). A bridge relaunch is slow (the process reconnects
+# BOTH bots to Paper and waits for their spawns before it listens), so the backoff
+# between a failed reconnect and the next attempt is on the order of seconds and
+# grows toward a cap. Both are constructor-overridable so unit tests inject tiny
+# values and never sleep for real seconds.
 _DEFAULT_RELAUNCH_BACKOFF_SECONDS: float = 5.0
 _DEFAULT_RELAUNCH_BACKOFF_MAX_SECONDS: float = 60.0
-# Bounded attempts at the env's own idempotent reconnect before declaring the arena
+# Bounded attempts at the env's own idempotent reconnect before declaring the pad
 # dead. reset() already retries the transport internally; a couple of outer attempts
 # absorbs a transient drop without masking a genuinely-down bridge.
 _DEFAULT_RESET_RECONNECT_ATTEMPTS: int = 2
+
+#: Where the SHARED Paper JVM listens. ONE JVM serves every pad, so this is a single
+#: port and not a base (mirrors ``server.properties`` ``server-port`` and
+#: ``distributed.launcher``'s default). Callers that can be pointed elsewhere pass
+#: BOTH the launcher and the pool the same value — see ``agent.train._main_multi_arena``.
+MC_HOST: str = "127.0.0.1"
+MC_PORT: int = 25565
+
+#: Seconds between the pool supervisor's JVM probes. Long enough that a live server
+#: is not connect-hammered for hours, short enough that a dead JVM is caught within
+#: a couple of episode lengths. The stop wait uses this same interval, so shutdown
+#: latency is bounded by it.
+_DEFAULT_JVM_POLL_SECONDS: float = 5.0
+
+#: Connect timeout for one JVM probe. Loopback: a live server accepts instantly, and
+#: a dead one refuses instantly. The timeout only bounds the pathological case.
+_DEFAULT_JVM_PROBE_TIMEOUT_SECONDS: float = 1.0
+
+
+def jvm_alive(
+    host: str = MC_HOST,
+    port: int = MC_PORT,
+    *,
+    timeout: float = _DEFAULT_JVM_PROBE_TIMEOUT_SECONDS,
+) -> bool:
+    """True while the SHARED Paper JVM accepts TCP connections on its MC port.
+
+    The tier-2 detector of the two-tier fault policy: a ``False`` here is the abort
+    trigger for the WHOLE run (see :class:`ActorPool`). Defaults make it callable as
+    the contract's ``jvm_alive() -> bool``, and its ``(host, port)`` positional shape
+    makes it directly usable as the injectable :data:`JvmProbe`.
+
+    A plain connect-and-close — NOT a Minecraft handshake, NOT a status ping. That is
+    enough: the failure this guards against is the JVM being gone (crash, OOM kill,
+    operator ``stop``), and a listening socket that is not Paper is an operator error
+    the preflight in ``server/setup/start-pads.sh`` already refuses to start on.
+
+    SAFE ONLY ON THE MC PORT. Paper is an ordinary multi-client server, so this costs
+    it nothing. ``BridgeServer`` accepts exactly ONE client and DESTROYS the incumbent
+    when a second arrives (``bridge/transport.js``), so pointing this at a bridge port
+    would kill the collector attached to it. Never do that.
+
+    Args:
+        host: Host the JVM listens on. Loopback by default.
+        port: The shared Minecraft port (one JVM, so one port).
+        timeout: Per-probe connect timeout in seconds.
+
+    Returns:
+        ``True`` if the connection was accepted, ``False`` on any ``OSError``
+        (refused, unreachable, timed out). Only ``OSError`` is swallowed: anything
+        else is a bug in this probe and must surface rather than be read as "dead".
+    """
+    try:
+        with socket.create_connection((host, int(port)), timeout=float(timeout)):
+            return True
+    except OSError:
+        return False
+
+
+class LaunchAbandoned(RuntimeError):
+    """Raised out of :meth:`ShutdownSignal.sleep` to abandon an in-flight launch.
+
+    Not a fault: it means the run is shutting down while an
+    :class:`ArenaLauncher` happened to be inside its bounded wait. The collector's
+    recovery loop treats it like any other launcher failure and then exits, because
+    its own stop flag is set by the same shutdown.
+    """
+
+
+class ShutdownSignal:
+    """Shutdown flag shared between the :class:`ActorPool` and an :class:`ArenaLauncher`.
+
+    :meth:`distributed.launcher.SubprocessArenaLauncher.launch` waits — bounded, but
+    for up to ~135 s — for a pad's bridge port to free and then to come back up, and
+    it does so by polling with an INJECTED ``sleep``. That sleep runs on a collector
+    thread. With the stock ``time.sleep`` a shutdown landing inside a relaunch is
+    ignored until the whole wait elapses.
+
+    This class is that injection point: pass :meth:`sleep` as the launcher's ``sleep``
+    and hand the same object to the pool. The pool sets it in :meth:`ActorPool.stop`
+    and :meth:`ActorPool._abort`, so the next poll raises :class:`LaunchAbandoned`
+    and ``launch()`` unwinds at once instead of blocking the collector for minutes.
+    Raising (rather than returning early) is required: the launcher's loops re-check
+    a deadline right after sleeping, so a sleep that merely returned would turn a
+    two-minute wait into a two-minute hot spin.
+
+    Thread-safe: it is a :class:`threading.Event` behind two methods.
+    """
+
+    def __init__(self, event: Optional[threading.Event] = None) -> None:
+        self._event = event if event is not None else threading.Event()
+
+    @property
+    def event(self) -> threading.Event:
+        """The underlying event (exposed for callers that must wait on it)."""
+        return self._event
+
+    def set(self) -> None:
+        """Signal shutdown. Idempotent."""
+        self._event.set()
+
+    def is_set(self) -> bool:
+        """True once shutdown has been signalled."""
+        return self._event.is_set()
+
+    def sleep(self, seconds: float) -> None:
+        """Sleep ``seconds``, or raise :class:`LaunchAbandoned` if shutdown lands.
+
+        Args:
+            seconds: Requested sleep. Non-positive values still check the flag, so a
+                zero-length poll cannot slip past a pending shutdown.
+
+        Raises:
+            LaunchAbandoned: if shutdown is already signalled, or becomes signalled
+                before the sleep elapses.
+        """
+        if self._event.is_set():
+            raise LaunchAbandoned("shutdown signalled: abandoning the bridge launch")
+        if self._event.wait(timeout=max(0.0, float(seconds))):
+            raise LaunchAbandoned(
+                "shutdown signalled while waiting on a bridge launch: abandoning it"
+            )
 
 
 class PoolAbortedError(RuntimeError):
     """Raised when the :class:`ActorPool` aborts the run LOUDLY.
 
-    The pool raises this from :meth:`ActorPool.stop` / :meth:`ActorPool.raise_if_aborted`
-    when the number of live arenas has dropped below ``cfg.fault_min_live_arenas``
-    after relaunch attempts could not keep enough arenas alive. It is a loud,
-    explicit failure: the run must stop rather than silently train on a degraded
-    pool that can no longer feed the learner at the required rate.
+    Under the two-tier fault policy there is exactly ONE cause: the shared Paper JVM
+    stopped answering on its Minecraft port. Every pad in the fleet lives inside that
+    one JVM, so there are no survivors to continue on — the run must stop rather than
+    quietly grind on against a world that no longer exists. A dead pad BRIDGE never
+    raises this; it is repaired in place by :meth:`Collector.restart_bridge`.
+
+    Surfaced from :meth:`ActorPool.stop` and :meth:`ActorPool.raise_if_aborted`, with
+    a message naming the JVM and the port that was probed.
     """
 
 
 class ArenaLauncher(Protocol):
-    """Starts/stops the OS processes (Paper server + bridge) for one arena.
+    """Starts/stops the BRIDGE process for one pad. It never touches the JVM.
+
+    Under the one-JVM/N-pad topology a pad's only private process is its Node bridge;
+    the Paper JVM is shared by the whole fleet and is owned by
+    ``server/setup/start-pads.sh``. Killing or restarting it to recover a single pad
+    would take every other pad down with it, so this Protocol is deliberately
+    bridge-scoped — a dead JVM is the run-aborting tier-2 fault, handled by
+    :class:`ActorPool`, not by a relaunch.
 
     Injectable so all supervisor/fault logic is testable offline against a fake that
-    merely records ``launch``/``terminate`` calls; the real subprocess shim (T11) is
-    the thin untested layer. A relaunch is REQUESTED here (start the processes) but
-    the collector reconnects to the bridge itself once the arena is back — the
-    launcher owns process lifecycle, the collector owns the connection.
+    merely records ``launch``/``terminate`` calls;
+    :class:`~distributed.launcher.SubprocessArenaLauncher` is the live implementation.
+    A restart is REQUESTED here (start the process) but the collector reconnects to
+    the bridge itself once the pad is back — the launcher owns process lifecycle, the
+    collector owns the single TCP connection.
     """
 
     def launch(self, arena_id: int) -> None:
-        """Start (or restart) the Paper server + bridge for ``arena_id``.
+        """Start (or restart) the BRIDGE for pad ``arena_id``. The JVM is untouched.
 
-        Slow in production (30-60s+). The collector backs off and then reconnects on
-        a fresh client; this call need only kick the processes off.
+        Slow in production: the live launcher waits for the dying bridge's port to
+        free, spawns a replacement, and waits for it to accept a connection (which
+        only happens once BOTH of that pad's bots have joined and spawned). The
+        collector backs off and then reconnects on a fresh client.
+
+        May raise — the live launcher refuses to spawn a duplicate onto a port some
+        other bridge still holds, and refuses to spawn against an unreachable JVM.
+        The collector treats any exception as a failed attempt and backs off.
         """
         ...
 
     def terminate(self, arena_id: int) -> None:
-        """Stop the Paper server + bridge for ``arena_id``. Best-effort, idempotent."""
+        """Stop pad ``arena_id``'s bridge. Best-effort, idempotent, JVM untouched."""
         ...
 
 
@@ -180,33 +360,52 @@ class Collector:
       5. ``transport.send(episode)`` — hand it to the learner.
       6. advance ``local_ep`` (the global counter advanced in step 2).
 
-    Fault path (the bridge resilience contract): a :class:`BridgeError` from any of
-    the above aborts THAT episode. The collector FIRST tries the env's idempotent
-    ``reset()`` reconnect (bounded); if that recovers, it resumes. If not, it marks
-    the arena DEAD, asks the :class:`ArenaLauncher` to relaunch it, backs off, and
-    rebuilds the env via ``env_factory`` (a FRESH client to the same arena's bridge),
-    then resumes. ``step()`` is NEVER silently retried (that corrupts the episode) —
-    only ``reset()`` may reconnect-and-retry, and the env enforces that internally.
+    Fault path (the bridge resilience contract + the two-tier fault policy): a
+    :class:`BridgeError` from any of the above aborts THAT episode. The collector
+    FIRST tries the env's idempotent ``reset()`` reconnect (bounded); if that
+    recovers, it resumes. If not, it marks the pad DEAD and consults the SHARED JVM
+    before doing anything else:
+
+      * JVM alive  -> TIER 1: :meth:`restart_bridge` for THIS pad only, back off,
+        rebuild the env via ``env_factory`` (a FRESH client to the same pad's
+        bridge), confirm with a reset, resume. No other pad is touched.
+      * JVM dead   -> TIER 2: fire ``on_jvm_down`` so the pool aborts the WHOLE run
+        loudly, and abandon recovery. A bridge restarted into a dead JVM would exit
+        immediately, and there is no fleet left to restart it for.
+
+    ``step()`` is NEVER silently retried (that corrupts the episode) — only
+    ``reset()`` may reconnect-and-retry, and the env enforces that internally.
 
     Args:
-        arena_id: 0-based index of this collector's arena.
+        arena_id: 0-based index of this collector's pad.
         env_factory: Zero-arg callable building (and connecting) a FRESH env for this
-            arena. Called once at start and again on every relaunch so a reconnect is
+            pad. Called once at start and again on every restart so a reconnect is
             always a fresh client to the same single-connection bridge.
         policy: The acting surface (a :class:`~distributed.weights.SnapshotPolicy`),
             satisfying ``RolloutPolicy``. Its ``arena_id`` should match ``arena_id``.
         transport: The shared actor->learner channel (episodes flow up).
         weight_store: The shared snapshot store the learner publishes to.
-        cfg: Training config (ε schedule, per-arena seed scheme, fault knobs).
-        launcher: The :class:`ArenaLauncher` used to relaunch a dead arena.
+        cfg: Training config (ε schedule, per-pad seed scheme, ``fault_relaunch``).
+        launcher: The :class:`ArenaLauncher` used to restart this pad's bridge.
         on_state_change: Optional callback ``(arena_id, alive: bool) -> None`` the
             collector fires when it transitions live<->dead, so the pool tracks the
             aggregate live count. Called OUTSIDE any collector-held lock.
+        on_jvm_down: Optional callback ``(message: str) -> None`` fired ONCE when the
+            JVM probe says the shared Paper JVM is gone. :meth:`ActorPool.start`
+            binds the pool's abort to it. With no callback the collector still
+            abandons recovery — it must never sit restarting bridges into a dead JVM.
+        jvm_probe: Optional :data:`JvmProbe` called as ``probe(mc_host, mc_port)``.
+            ``None`` means "no JVM supervision configured" and the collector behaves
+            as if the JVM were alive — the right default for offline pools driving
+            fake envs, where there is no JVM at all. The live path injects
+            :func:`jvm_alive` (see ``agent.train._main_multi_arena``).
+        mc_host / mc_port: Where the shared JVM listens. Passed to ``jvm_probe`` AND
+            named in the abort message, so the two can never disagree.
         max_episode_steps: Per-episode decision cap forwarded to ``collect_episode``.
         relaunch_backoff_seconds: Initial backoff after a failed reconnect.
         relaunch_backoff_max_seconds: Cap the (doubling) backoff grows toward.
         reset_reconnect_attempts: Bounded env ``reset()`` reconnect attempts before
-            declaring the arena dead.
+            declaring the pad dead.
         sleep: Injectable sleep (defaults to ``time.sleep``); tests pass a no-op /
             recorder so unit tests never block on real seconds.
     """
@@ -223,6 +422,10 @@ class Collector:
         *,
         counter: GlobalEpisodeCounter,
         on_state_change: Optional[Callable[[int, bool], None]] = None,
+        on_jvm_down: Optional[Callable[[str], None]] = None,
+        jvm_probe: Optional[JvmProbe] = None,
+        mc_host: str = MC_HOST,
+        mc_port: int = MC_PORT,
         max_episode_steps: Optional[int] = None,
         relaunch_backoff_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_SECONDS,
         relaunch_backoff_max_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_MAX_SECONDS,
@@ -238,6 +441,10 @@ class Collector:
         self._launcher = launcher
         self._counter = counter
         self._on_state_change = on_state_change
+        self._on_jvm_down = on_jvm_down
+        self._jvm_probe = jvm_probe
+        self._mc_host = str(mc_host)
+        self._mc_port = int(mc_port)
         self._max_episode_steps = max_episode_steps
         self._relaunch_backoff_seconds = float(relaunch_backoff_seconds)
         self._relaunch_backoff_max_seconds = float(relaunch_backoff_max_seconds)
@@ -404,15 +611,16 @@ class Collector:
 
         Builds the env on first entry. A :class:`BridgeError` anywhere in an episode
         is funneled into :meth:`_recover`, which honors the resilience contract
-        (idempotent ``reset()`` reconnect first, then relaunch + backoff + fresh
-        client). The loop exits cleanly when :meth:`stop` is signalled or when a
-        transport close ends the run; any other exception propagates (a real bug
-        should surface, not be swallowed).
+        (idempotent ``reset()`` reconnect first, then the two-tier fault policy:
+        bridge restart + backoff + fresh client, or a loud whole-run abort if the
+        shared JVM is gone). The loop exits cleanly when :meth:`stop` is signalled or
+        when a transport close ends the run; any other exception propagates (a real
+        bug should surface, not be swallowed).
         """
         try:
             self._ensure_env()
         except BridgeError:
-            # The very first connect failed: treat the arena as dead and try to
+            # The very first connect failed: treat the pad as dead and try to
             # recover before entering the steady-state loop.
             self._set_alive(False)
             if not self._recover():
@@ -478,6 +686,90 @@ class Collector:
         self._local_ep += 1
         self._set_alive(True)
 
+    # -- the two-tier fault seam (T11) -------------------------------------
+
+    def jvm_alive(self) -> bool:
+        """True while the SHARED Paper JVM is reachable (tier-2 detector).
+
+        Delegates to the injected :data:`JvmProbe` with this collector's configured
+        ``(mc_host, mc_port)``. With NO probe injected this returns ``True``: an
+        offline pool driving fake envs has no JVM to lose, and treating "unconfigured"
+        as "dead" would abort every such run on the first bridge fault.
+
+        Returns:
+            ``True`` if the JVM answers (or no probe is configured), ``False`` if the
+            probe says the port is closed. A single ``False`` is the abort trigger —
+            there is deliberately no confirmation retry and no grace period.
+        """
+        probe = self._jvm_probe
+        if probe is None:
+            return True
+        return bool(probe(self._mc_host, self._mc_port))
+
+    def restart_bridge(self, pad_index: int) -> None:
+        """TIER 1: restart the BRIDGE of pad ``pad_index`` and nothing else.
+
+        The narrow half of the two-tier policy. It asks the injected
+        :class:`ArenaLauncher` to relaunch exactly one pad's Node bridge process; the
+        shared Paper JVM, every other pad's bridge, and this collector's own thread
+        are all untouched. The reconnect is NOT done here — the collector rebuilds a
+        fresh client itself after backing off, because the bridge serves exactly one
+        TCP client and the launcher must not hold that slot.
+
+        The restarted bridge re-runs ``arena:reset_pad`` for its own anchor without
+        any help from here: it is spawned with its ``--pad-origin``, it is the sole
+        reset authority, and it issues the macro on every ``reset`` — including the
+        confirmation reset :meth:`_recover` performs right after reconnecting.
+
+        CALL ONLY FOR A PAD WHOSE CLIENT IS ALREADY GONE. The live launcher's
+        ``_wait_for_port_free`` / ``_wait_for_bridge`` CONNECT to the pad's bridge
+        port, and ``BridgeServer`` answers a second client by destroying the
+        incumbent. The one call site is safe by TIMING, not by construction:
+        :meth:`_recover` only reaches here after Step A's reconnect attempts have
+        already failed on that connection. Shortening Step A to zero attempts, or
+        calling this for a pad other than ``self.arena_id``, would turn the
+        launcher's readiness probe into an eviction of a live collector.
+
+        Args:
+            pad_index: The pad whose bridge to restart. Non-negative, and in practice
+                always this collector's own ``arena_id`` (see the note above).
+
+        Raises:
+            ValueError: if ``pad_index`` is negative or not an int. Restarting "pad
+                -1" would be a supervisor bug, and the live launcher would reject it
+                much later with a confusing message about anchors.
+            Exception: whatever the launcher raises (it refuses to duplicate a live
+                bridge, and refuses to spawn against an unreachable JVM). The caller
+                treats that as a failed attempt and backs off.
+        """
+        if isinstance(pad_index, bool) or not isinstance(pad_index, int):
+            raise ValueError(f"pad_index must be an int, got {pad_index!r}")
+        if pad_index < 0:
+            raise ValueError(f"pad_index must be >= 0, got {pad_index}")
+        try:
+            self._launcher.launch(pad_index)
+        except LaunchAbandoned:
+            # Shutdown landed inside the launcher's bounded wait. We spawned a bridge
+            # and then walked away from its readiness gate, so do not orphan it —
+            # terminate() only reaches processes this launcher itself owns.
+            try:
+                self._launcher.terminate(pad_index)
+            except Exception:  # noqa: BLE001 - teardown during shutdown is best-effort
+                pass
+            raise
+
+    def _jvm_down_message(self) -> str:
+        """The loud tier-2 abort text, naming the JVM and the port that was probed."""
+        return (
+            f"actor pool aborting: the SHARED Paper JVM stopped answering on "
+            f"minecraft port {self._mc_host}:{self._mc_port} (jvm_alive() probe), "
+            f"detected while pad {self.arena_id} was trying to recover. Every pad in "
+            f"the fleet lives in that one JVM, so there are no survivors to continue "
+            f"on and restarting a pad's bridge would only spawn a process that exits "
+            f"immediately. The run stops here rather than training against a world "
+            f"that no longer exists."
+        )
+
     # -- fault recovery ----------------------------------------------------
 
     def _ensure_env(self) -> None:
@@ -493,22 +785,34 @@ class Collector:
         self._set_alive(True)
 
     def _recover(self) -> bool:
-        """Bring the arena back, honoring the resilience contract. Returns liveness.
+        """Bring the pad back, honoring the resilience contract. Returns liveness.
 
         Step A — idempotent reconnect: try the env's own ``reset()`` (bounded). It is
         idempotent and carries no in-flight episode state, so a transient drop (e.g. a
         periodic eval briefly stole the single connection) recovers here without
-        touching the OS processes. A successful reset means the arena is live again.
+        touching any OS process. A successful reset means the pad is live again.
 
-        Step B — relaunch: if the reconnect cannot recover, the arena is genuinely
-        dead. Ask the launcher to relaunch the processes, back off (seconds-scale,
-        doubling toward the cap — a Paper relaunch is slow), drop the old env, rebuild
-        a FRESH env/client via the factory, and confirm with a reset. Repeat until the
-        arena is back or :meth:`stop` is signalled.
+        Step B — the TWO-TIER fault policy. The reconnect failed, so the pad is
+        genuinely dead and we must decide which fault this is. The JVM is checked
+        FIRST, on every attempt:
+
+          * JVM dead -> fire ``on_jvm_down`` (the pool aborts the whole run loudly)
+            and return ``False``. No bridge is restarted: a bridge spawned against a
+            dead JVM exits immediately, and the fleet it belongs to is gone anyway.
+          * JVM alive -> :meth:`restart_bridge` for THIS pad only, back off
+            (seconds-scale, doubling toward the cap — a bridge relaunch waits for
+            both bots to rejoin), drop the old env, rebuild a FRESH env/client via the
+            factory, and confirm with a reset. Repeat until the pad is back or
+            :meth:`stop` is signalled.
+
+        That confirmation reset is also what re-runs ``arena:reset_pad`` for this
+        pad's anchor: the restarted bridge is the sole reset authority and issues the
+        macro itself. Nothing here opens a second connection to do it.
 
         Returns:
-            ``True`` if the arena is live again; ``False`` if recovery was abandoned
-            because the pool signalled stop (the loop should then exit).
+            ``True`` if the pad is live again; ``False`` if recovery was abandoned —
+            either because the pool signalled stop, or because the JVM is gone (the
+            loop should then exit).
         """
         # --- Step A: bounded idempotent reset() reconnect on the SAME env. ---
         env = self._env
@@ -518,48 +822,60 @@ class Collector:
                     return False
                 try:
                     # reset() reconnect-and-retries internally; a clean return means
-                    # the bridge is back. Seed deterministically off this arena's next
+                    # the bridge is back. Seed deterministically off this pad's next
                     # episode so the resumed stream stays reproducible.
                     seed = arena_episode_seed(self._cfg, self.arena_id, self._local_ep)
                     env.reset(seed=seed)
                 except BridgeError:
                     continue
                 else:
-                    # Recovered without a relaunch. NOTE: collect_episode will reset()
+                    # Recovered without a restart. NOTE: collect_episode will reset()
                     # again at the top of the next episode (idempotent), so this probe
                     # reset does not desync the stream — it only proves the link.
                     self._set_alive(True)
                     return True
 
-        # --- Step B: relaunch the OS processes, then reconnect on a fresh client. ---
+        # --- Step B: two-tier fault policy, then reconnect on a fresh client. ---
         backoff = self._relaunch_backoff_seconds
         while not self._stop.is_set():
+            # TIER 2 FIRST. A dead JVM is not a pad fault and must never be answered
+            # with a bridge restart; it ends the run. Checked regardless of
+            # `fault_relaunch`, which gates repair, not the abort.
+            if not self.jvm_alive():
+                self._report_jvm_down()
+                return False
+
             if self._cfg.fault_relaunch:
-                # Best-effort: a launcher failure must not crash the collector — we
-                # back off and try again. (The pool's aggregate-liveness watchdog is
-                # what ultimately aborts the run if relaunches never succeed.)
+                # TIER 1: this pad's bridge only. Best-effort — a launcher failure
+                # must not crash the collector (the live launcher raises rather than
+                # duplicate a bridge that is still alive on the port), so we back off
+                # and try again. A shutdown landing inside the launcher's bounded wait
+                # arrives here as LaunchAbandoned and is handled the same way: the
+                # stop check right below ends the loop.
                 try:
-                    self._launcher.launch(self.arena_id)
+                    self.restart_bridge(self.arena_id)
                 except Exception:  # noqa: BLE001 - launcher faults must not kill us
                     pass
 
-            # Back off on a seconds-to-tens-of-seconds scale: a Paper server takes
-            # 30-60s+ to come up, so hammering reconnect immediately is pointless.
+            # Back off on a seconds-to-tens-of-seconds scale: a restarted bridge only
+            # accepts a client once BOTH of its bots have rejoined and spawned, so
+            # hammering reconnect immediately is pointless.
             self._interruptible_sleep(backoff)
             if self._stop.is_set():
                 return False
             backoff = min(backoff * 2.0, self._relaunch_backoff_max_seconds)
 
-            # Drop the old (dead) env and rebuild a FRESH client to the SAME arena's
+            # Drop the old (dead) env and rebuild a FRESH client to the SAME pad's
             # single-connection bridge. Never reuse or multiplex a connection.
             self._close_env_quietly()
             try:
                 self._env = self._env_factory()
             except BridgeError:
-                # Arena not back yet (factory connects eagerly); keep backing off.
+                # Pad not back yet (factory connects eagerly); keep backing off.
                 continue
 
-            # Confirm the fresh connection with an idempotent reset probe.
+            # Confirm the fresh connection with an idempotent reset probe. This is the
+            # reset that re-runs the pad's arena:reset_pad macro after a restart.
             try:
                 seed = arena_episode_seed(self._cfg, self.arena_id, self._local_ep)
                 self._env.reset(seed=seed)
@@ -570,6 +886,21 @@ class Collector:
             return True
 
         return False
+
+    def _report_jvm_down(self) -> None:
+        """Escalate a dead JVM to the pool (tier 2), then let recovery abandon.
+
+        Fires ``on_jvm_down`` when one is bound. With none bound — a standalone
+        collector in a test, or one built outside a pool — the collector still stops
+        itself, because the alternative is an endless loop restarting bridges into a
+        JVM that is not there. Either way the caller returns ``False`` and the rollout
+        loop exits.
+        """
+        callback = self._on_jvm_down
+        if callback is not None:
+            callback(self._jvm_down_message())
+        # Independent of the callback: this collector is done either way.
+        self._stop.set()
 
     def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep ``seconds`` but wake immediately if stop is signalled.
@@ -601,40 +932,78 @@ class Collector:
 
 
 class ActorPool:
-    """Supervises N :class:`Collector` daemons and aborts the run if too many die.
+    """Supervises N :class:`Collector` daemons and owns the WHOLE-RUN abort (tier 2).
 
-    ``start()`` builds and starts one collector per arena (each owns its own env,
-    policy, and recovery loop) plus tracks the aggregate live count. A single arena
-    going down does NOT stop the pool: that collector relaunches its arena out-of-band
-    (slow — 30-60s+) while the survivors keep feeding the learner. The pool aborts the
-    WHOLE run LOUDLY only when :meth:`live_count` drops below
-    ``cfg.fault_min_live_arenas`` — using the aggregate threshold (not "any arena
-    down") precisely because a relaunching arena is expected to be absent a while.
+    ``start()`` starts one collector per pad (each owns its own env, policy, and
+    recovery loop), tracks the aggregate live count, and runs a supervisor thread
+    whose single job is watching the SHARED Paper JVM.
+
+    A pad going down does NOT stop the pool: that collector restarts its OWN bridge
+    out-of-band while every other pad keeps feeding the learner. There is NO survivor
+    floor — ``fault_min_live_arenas`` was deleted in T11 — because a floor is a licence
+    to keep training on a shrunken fleet, which the plan forbids. The pool aborts for
+    exactly one reason: :func:`jvm_alive` reports the shared JVM gone, either from the
+    supervisor's periodic probe or from a collector that hit it first during recovery.
+    A single ``False`` aborts; there is no grace period and no retry budget.
+
+    ``fault_relaunch=False`` disables tier 1 (no bridge is restarted) as a diagnostic
+    mode. It does NOT abort — a pad simply stays down. Use it only when you are
+    watching the run.
 
     The abort is surfaced two ways: :meth:`raise_if_aborted` lets a driver poll, and
     :meth:`stop` raises :class:`PoolAbortedError` on its way out if the run aborted —
-    so a run can never quietly continue on a sub-floor pool.
+    so a run can never quietly end after its world disappeared.
 
     Args:
-        collectors: The collectors to supervise (one per arena). Build them with
+        collectors: The collectors to supervise (one per pad). Build them with
             :meth:`build` for the common case, or inject pre-built/fake collectors.
-        cfg: Training config (reads ``fault_min_live_arenas``).
+        cfg: Training config (reads ``fault_relaunch``; the ε/seed knobs are the
+            collectors' concern).
+        jvm_probe: Optional :data:`JvmProbe` called as ``probe(mc_host, mc_port)``.
+            ``None`` disables JVM supervision entirely — the correct default for a
+            pool of fake envs, which has no JVM. The live path injects
+            :func:`jvm_alive`. The same probe is pushed onto every supervised
+            collector that has none, so both detectors agree by construction.
+        mc_host / mc_port: Where the shared JVM listens; probed and named in the
+            abort message.
+        jvm_poll_seconds: Supervisor probe interval. Also the shutdown-latency bound
+            for the supervisor thread.
+        shutdown: Optional :class:`ShutdownSignal` shared with the
+            :class:`ArenaLauncher`'s injected ``sleep``. Set by :meth:`stop` and
+            :meth:`_abort`, so a collector parked inside a bridge relaunch unwinds
+            immediately instead of finishing a two-minute wait nobody is waiting for.
     """
 
-    def __init__(self, collectors: List[Collector], cfg: TrainConfig) -> None:
+    def __init__(
+        self,
+        collectors: List[Collector],
+        cfg: TrainConfig,
+        *,
+        jvm_probe: Optional[JvmProbe] = None,
+        mc_host: str = MC_HOST,
+        mc_port: int = MC_PORT,
+        jvm_poll_seconds: float = _DEFAULT_JVM_POLL_SECONDS,
+        shutdown: Optional[ShutdownSignal] = None,
+    ) -> None:
         self._collectors = list(collectors)
         self._cfg = cfg
+        self._jvm_probe = jvm_probe
+        self._mc_host = str(mc_host)
+        self._mc_port = int(mc_port)
+        self._jvm_poll_seconds = float(jvm_poll_seconds)
+        self._shutdown = shutdown
 
         # Aggregate liveness. Seeded from each collector's current state; mutated only
         # via the collectors' on_state_change callback (fired off the collector
-        # threads) and read by live_count()/the supervisor — all under this lock.
+        # threads) and read by live_count() — all under this lock. Telemetry now, not
+        # an abort trigger: no live count, however low, ends the run by itself.
         self._lock = threading.Lock()
         self._live: Dict[int, bool] = {
             c.arena_id: c.alive for c in self._collectors
         }
 
-        # Abort state. Latched once; the supervisor sets it, stop()/raise_if_aborted
-        # surface it.
+        # Abort state. Latched once; the supervisor or a collector sets it,
+        # stop()/raise_if_aborted surface it.
         self._aborted = threading.Event()
         self._abort_error: Optional[PoolAbortedError] = None
 
@@ -659,34 +1028,43 @@ class ActorPool:
         relaunch_backoff_max_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_MAX_SECONDS,
         reset_reconnect_attempts: int = _DEFAULT_RESET_RECONNECT_ATTEMPTS,
         sleep: Optional[Callable[[float], None]] = None,
+        jvm_probe: Optional[JvmProbe] = None,
+        mc_host: str = MC_HOST,
+        mc_port: int = MC_PORT,
+        jvm_poll_seconds: float = _DEFAULT_JVM_POLL_SECONDS,
+        shutdown: Optional[ShutdownSignal] = None,
     ) -> "ActorPool":
         """Build a pool of ``cfg.arenas`` collectors sharing one transport/store/counter.
 
-        ``env_factory_for(arena_id)`` returns that arena's zero-arg env factory (so a
-        relaunch rebuilds a fresh client to the same bridge); ``policy_for(arena_id)``
-        returns that arena's :class:`~distributed.weights.SnapshotPolicy`. The GLOBAL
+        ``env_factory_for(arena_id)`` returns that pad's zero-arg env factory (so a
+        restart rebuilds a fresh client to the same bridge); ``policy_for(arena_id)``
+        returns that pad's :class:`~distributed.weights.SnapshotPolicy`. The GLOBAL
         ε counter is shared across all collectors (created here if not injected) so the
         ε schedule advances over the combined stream.
 
         Args:
-            cfg: Training config (``arenas`` count + fault knobs).
+            cfg: Training config (``arenas`` count + ``fault_relaunch``).
             env_factory_for: ``arena_id -> EnvFactory`` (fresh-client builder).
-            policy_for: ``arena_id -> RolloutPolicy`` (per-arena snapshot policy).
+            policy_for: ``arena_id -> RolloutPolicy`` (per-pad snapshot policy).
             transport: Shared actor->learner channel.
             weight_store: Shared snapshot store.
-            launcher: Shared :class:`ArenaLauncher`.
+            launcher: Shared :class:`ArenaLauncher` (bridge lifecycle only).
             counter: Optional shared :class:`GlobalEpisodeCounter`; created if ``None``.
             max_episode_steps / relaunch_backoff_* / reset_reconnect_attempts / sleep:
                 Forwarded to every :class:`Collector` (see its docstring).
+            jvm_probe / mc_host / mc_port: The tier-2 detector, given to the pool AND
+                to every collector so the two agree on what "the JVM" means.
+            jvm_poll_seconds / shutdown: See :class:`ActorPool`.
 
         Returns:
             A constructed :class:`ActorPool` (not yet started).
         """
         shared_counter = counter if counter is not None else GlobalEpisodeCounter()
 
-        # on_state_change is left None here and bound in start(): the pool wires its
-        # own _mark callback onto every collector (built or injected) when it starts,
-        # so there is no need to reference a half-constructed pool from a closure.
+        # on_state_change / on_jvm_down are left None here and bound in start(): the
+        # pool wires its own callbacks onto every collector (built or injected) when it
+        # starts, so there is no need to reference a half-constructed pool from a
+        # closure. The JVM probe IS passed here (it is plain data, not a back-reference).
         collectors = [
             Collector(
                 arena_id=arena_id,
@@ -697,6 +1075,9 @@ class ActorPool:
                 cfg=cfg,
                 launcher=launcher,
                 counter=shared_counter,
+                jvm_probe=jvm_probe,
+                mc_host=mc_host,
+                mc_port=mc_port,
                 max_episode_steps=max_episode_steps,
                 relaunch_backoff_seconds=relaunch_backoff_seconds,
                 relaunch_backoff_max_seconds=relaunch_backoff_max_seconds,
@@ -705,17 +1086,30 @@ class ActorPool:
             )
             for arena_id in range(cfg.arenas)
         ]
-        return cls(collectors, cfg)
+        return cls(
+            collectors,
+            cfg,
+            jvm_probe=jvm_probe,
+            mc_host=mc_host,
+            mc_port=mc_port,
+            jvm_poll_seconds=jvm_poll_seconds,
+            shutdown=shutdown,
+        )
 
     # -- liveness bookkeeping ----------------------------------------------
 
     def _mark(self, arena_id: int, alive: bool) -> None:
-        """Record an arena's live/dead transition (collector-thread callback)."""
+        """Record a pad's live/dead transition (collector-thread callback)."""
         with self._lock:
             self._live[arena_id] = alive
 
     def live_count(self) -> int:
-        """Number of arenas currently holding a working connection."""
+        """Number of pads currently holding a working connection.
+
+        TELEMETRY, not a fault trigger. Under the two-tier policy a low live count
+        means "some pads are being repaired", which is a normal transient state; only
+        a dead JVM ends the run.
+        """
         with self._lock:
             return sum(1 for alive in self._live.values() if alive)
 
@@ -734,12 +1128,25 @@ class ActorPool:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Start every collector daemon and the supervisor that watches liveness."""
-        # Bind the pool's callback onto any collectors that were injected without one
-        # (so externally-built/fake collectors still update the aggregate count).
+        """Start every collector daemon and the supervisor that watches the JVM."""
+        # Bind the pool's callbacks onto any collectors that were injected without
+        # them (so externally-built/fake collectors still update the aggregate count
+        # and can still escalate a dead JVM), and push the pool's JVM probe onto any
+        # collector that has none.
         for collector in self._collectors:
             if collector._on_state_change is None:
                 collector._on_state_change = self._mark
+            if collector._on_jvm_down is None:
+                collector._on_jvm_down = self._abort
+            if collector._jvm_probe is None and self._jvm_probe is not None:
+                collector._jvm_probe = self._jvm_probe
+            # THE POOL OWNS WHAT "THE JVM" MEANS. One JVM serves the whole fleet, so
+            # a supervised collector never has a different one to watch — and a
+            # collector left on the default port while the pool watched another would
+            # probe the wrong port and then name the wrong port in its abort. Aligning
+            # here covers externally-built collectors; build() already passes these.
+            collector._mc_host = self._mc_host
+            collector._mc_port = self._mc_port
             # Re-seed the live map from the (possibly updated) current state.
             with self._lock:
                 self._live[collector.arena_id] = collector.alive
@@ -755,35 +1162,71 @@ class ActorPool:
         self._supervisor.start()
 
     def _supervise(self) -> None:
-        """Watch the aggregate live count; abort the run if it falls below the floor.
+        """Watch the SHARED Paper JVM; abort the WHOLE run the moment it is gone.
 
-        Polls liveness on a short cadence. The abort threshold is the AGGREGATE
-        ``fault_min_live_arenas`` — NOT "any arena down" — so a single arena that is
-        slowly relaunching (30-60s+) does not abort a pool that still has enough live
-        arenas feeding the learner.
+        This is the tier-2 watchdog, and the pool's only reason to abort. It exists
+        alongside the collectors' own pre-restart probe because the two catch
+        different timings: a collector notices only when ITS pad faults, while a JVM
+        that dies between episodes would otherwise go unnoticed until every pad had
+        independently failed.
+
+        The loop is a no-op when no probe is configured (an offline pool of fake envs
+        has no JVM to watch), and a single ``False`` aborts — no confirmation retry,
+        because a survivor policy is exactly what this task deleted.
+
+        THE WATCHDOG MAY NOT DIE QUIETLY. This runs on a daemon thread, so an
+        unexpected exception out of the probe would otherwise end the thread, leave
+        ``aborted()`` False forever, and let the run continue completely unsupervised
+        — the one failure mode this design exists to prevent, arrived at silently.
+        The shipped :func:`jvm_alive` swallows only ``OSError`` and so cannot trigger
+        this, but a custom probe can, so a watchdog failure is itself an abort AND is
+        re-raised so the thread excepthook prints it. Loud twice, silent never.
         """
-        floor = self._cfg.fault_min_live_arenas
-        while not self._stopping.is_set():
-            if self.live_count() < floor:
-                self._abort(
-                    f"actor pool aborting: only {self.live_count()} live arena(s) "
-                    f"remain, below the required floor of {floor} "
-                    f"(fault_min_live_arenas); the surviving arenas cannot sustain "
-                    f"the run. Relaunch attempts did not restore enough arenas."
-                )
-                return
-            # Short poll so an abort is detected promptly without busy-spinning.
-            if self._stopping.wait(timeout=0.05):
-                return
+        probe = self._jvm_probe
+        if probe is None:
+            return
+        try:
+            while not self._stopping.is_set():
+                if not probe(self._mc_host, self._mc_port):
+                    self._abort(
+                        f"actor pool aborting: the SHARED Paper JVM stopped answering "
+                        f"on minecraft port {self._mc_host}:{self._mc_port} "
+                        f"(jvm_alive() probe). Every pad in the fleet lives in that "
+                        f"one JVM, so there are no survivors to continue on. The run "
+                        f"stops here rather than training against a world that no "
+                        f"longer exists."
+                    )
+                    return
+                # Poll on the JVM cadence; the wait returns at once on stop().
+                if self._stopping.wait(timeout=self._jvm_poll_seconds):
+                    return
+        except BaseException as exc:  # noqa: BLE001 - see the docstring: never silent
+            self._abort(
+                f"actor pool aborting: the JVM watchdog itself failed while probing "
+                f"minecraft port {self._mc_host}:{self._mc_port} "
+                f"({type(exc).__name__}: {exc}). Tier 2 of the fault policy is no "
+                f"longer being enforced, and a run that is not watching its JVM must "
+                f"not keep training. Fix the probe, not this abort."
+            )
+            raise
 
     def _abort(self, message: str) -> None:
-        """Latch the abort error and signal shutdown (idempotent)."""
+        """Latch the abort error and signal shutdown (idempotent).
+
+        Also the ``on_jvm_down`` callback bound onto every collector, so a pad that
+        discovers the dead JVM during recovery aborts the run through the same path
+        as the supervisor. Safe to call from any thread.
+        """
         if self._aborted.is_set():
             return
         self._abort_error = PoolAbortedError(message)
         self._aborted.set()
         # Tell every collector to wind down — the run is over.
         self._stopping.set()
+        # Release anything parked inside a launcher's bounded relaunch wait, so the
+        # abort is not held up by a bridge that is never coming back.
+        if self._shutdown is not None:
+            self._shutdown.set()
         for collector in self._collectors:
             collector.stop()
 
@@ -791,26 +1234,32 @@ class ActorPool:
         """Raise :class:`PoolAbortedError` if the pool has aborted (else no-op).
 
         Lets a driver poll the pool's health between learner steps and stop the run
-        loudly the moment the live floor is breached.
+        loudly the moment the shared JVM is gone.
         """
         if self._aborted.is_set() and self._abort_error is not None:
             raise self._abort_error
 
     def aborted(self) -> bool:
-        """True once the pool has aborted below the live floor."""
+        """True once the pool has aborted (i.e. the shared Paper JVM died)."""
         return self._aborted.is_set()
 
     def stop(self) -> None:
         """Stop all collectors and the supervisor cleanly, then surface any abort.
 
         Idempotent. Signals every collector to wind down after its current episode,
-        joins the supervisor, and — if the pool aborted below the live floor — raises
-        :class:`PoolAbortedError` so a degraded run can never end silently.
+        releases any in-flight bridge relaunch, joins the supervisor, and — if the
+        pool aborted on a dead JVM — raises :class:`PoolAbortedError` so a run whose
+        world disappeared can never end silently.
 
         Raises:
-            PoolAbortedError: if the pool aborted below ``fault_min_live_arenas``.
+            PoolAbortedError: if the shared Paper JVM died during the run.
         """
         self._stopping.set()
+        # Before joining anything: unblock a collector parked inside a launcher's
+        # bounded wait (up to ~135 s with a plain time.sleep), so shutdown is not
+        # hostage to a bridge relaunch nobody is waiting for any more.
+        if self._shutdown is not None:
+            self._shutdown.set()
         for collector in self._collectors:
             collector.stop()
         # Join the supervisor first (it no longer needs to poll), then the collectors.

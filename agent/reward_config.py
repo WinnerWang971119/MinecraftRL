@@ -17,8 +17,8 @@ signal was designed. Current table:
     | c_step              | per-step penalty (decisiveness)         | 0.005  |
     | c_aim               | aim shaping, visibility-gated, tiny     | 0.01   |
     | R_terminal_win      | +W on win                               | 50.0   |
-    | R_terminal_loss     | −L on loss (stored positive; negated)   | 8.0    |
-    | R_terminal_timeout  | timeout penalty (anti-kiting)           | -30.0  |
+    | R_terminal_loss     | −L on loss (stored positive; negated)   | 30.0   |
+    | R_terminal_timeout  | timeout penalty (mild, anti-kiting)     | -15.0  |
     | gamma               | discount (also the potential-shaping γ) | 0.99   |
     | c_approach          | potential-shaping weight for Φ          | 0.0    |
 
@@ -27,7 +27,13 @@ Reward-shape rationale (why these values)
 An earlier symmetric shape (dealt and taken both 1.0/HP, win +8, timeout a 0.0
 draw) taught the agent to AVOID combat: a single bad exchange (~19 HP taken)
 booked −19, dwarfing the +8 win, so kiting to a 0-reward timeout was the
-safest policy. The current shape flips that:
+safest policy. A later shape (win +50, loss −8, timeout −30) fixed that but
+introduced a new failure: ``timeout(−30) < loss(−8)`` made deliberate death
+strictly better than running out the clock. That was harmless against a dummy
+opponent that cannot attack, but becomes actively harmful the moment the
+opponent (M3's scripted bot and beyond) can kill the agent — it would learn to
+suicide rather than survive to the clock. The current shape fixes both
+failures at once:
 
   - **Winning dominates** — ``R_terminal_win = 50`` makes a kill worth far more
     than any damage-trade bookkeeping, so winning stays "the most important
@@ -35,9 +41,11 @@ safest policy. The current shape flips that:
   - **Combat is net-positive** — dealing is rewarded twice as much per heart as
     taking is penalized (``+2/heart`` vs ``−1/heart``); an even trade nets
     positive, so engaging beats disengaging.
-  - **Kiting is the worst outcome** — ``R_terminal_timeout = -30`` (below even a
-    loss) directly punishes running out the clock. Dying while fighting (−8) is
-    strictly better than timing out, so the agent has no incentive to stall.
+  - **Timeout is strictly the mildest terminal penalty** — ``R_terminal_timeout
+    = −15`` sits strictly between ``−R_terminal_loss`` (−30) and
+    ``R_terminal_win`` (50), so running out the clock is worse than winning but
+    always strictly better than a scored loss. Dying is never the safer option;
+    the agent has no incentive to suicide to end an episode early.
 
 Anti-hacking notes for the tuner (T17):
   - ``c_step`` is the single most important knob. Too large → suicide-rushing;
@@ -52,13 +60,16 @@ Anti-hacking notes for the tuner (T17):
     tune down if it trades recklessly to end episodes.
   - ``c_aim`` is deliberately tiny and **visibility-gated** (see ``compute_reward``)
     so the agent cannot spin in place to farm an always-on aim bonus.
-  - ``R_terminal_win`` (50) is kept well above the loss penalty (8) on purpose:
+  - ``R_terminal_win`` (50) is kept well above the loss penalty (30) on purpose:
     the agent should chase the win, not play it safe to avoid the loss. Raising
     the loss penalty back toward the win would re-teach the timid, avoid-combat
-    behavior this shape was built to fix. ``R_terminal_timeout`` (−30) is set
-    below the loss so a timeout is strictly the worst outcome — the anti-kiting
-    lever; make it less negative only if the agent starts trading recklessly to
-    end episodes fast.
+    behavior this shape was built to fix. ``R_terminal_timeout`` (−15) is kept
+    strictly BETWEEN ``−R_terminal_loss`` and ``R_terminal_win`` — a timeout is
+    a real penalty (worse than winning) but is never worse than a scored loss,
+    so the agent has no incentive to suicide to dodge the clock. Make the
+    timeout penalty larger in magnitude (more negative, but never at or below
+    ``−R_terminal_loss``) only if the agent starts kiting; make it smaller if it
+    starts trading recklessly to end episodes fast.
   - ``c_approach`` defaults to 0.0 so the potential-based positional shaping is a
     no-op until T17 tunes Φ — it can never change the optimal policy regardless
     of its value (that is the point of potential-based shaping), but starting at
@@ -69,6 +80,7 @@ Owner: T5 (Reward/opponent track)
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 __all__ = ["RewardConfig"]
@@ -96,14 +108,20 @@ class RewardConfig:
             under the crosshair. Deliberately tiny and visibility-gated to block
             spin-to-farm. ``TUNE`` (0.01).
         R_terminal_win: Terminal reward added on a win. ``TUNE`` (50.0). Kept
-            large so winning dominates every other term.
+            large so winning dominates every other term. Must be strictly
+            positive and strictly greater than ``R_terminal_timeout``.
         R_terminal_loss: Magnitude of the terminal penalty on a loss, stored
-            **positive** and subtracted by ``compute_reward``. ``TUNE`` (8.0).
-            Deliberately small vs. the win so fear of losing does not deter the
-            agent from engaging.
-        R_terminal_timeout: Terminal penalty on a timeout. No longer a 0.0 draw:
-            timing out means the agent kited / avoided combat, so it is the worst
-            outcome (−30.0, below even a loss) to kill that behavior. ``TUNE``.
+            **positive** and subtracted by ``compute_reward`` (i.e. applied as
+            ``-R_terminal_loss``). ``TUNE`` (30.0). Must be strictly positive.
+            ``-R_terminal_loss`` is the worst achievable terminal value, strictly
+            below ``R_terminal_timeout`` — a scored loss must always be worse
+            than running out the clock.
+        R_terminal_timeout: Terminal penalty on a timeout, applied as-is (already
+            signed). ``TUNE`` (−15.0). Must be strictly negative, and strictly
+            between ``-R_terminal_loss`` and ``R_terminal_win`` — a timeout is a
+            real penalty (worse than winning) but never the worst outcome (a
+            scored loss is always worse), so the agent has no incentive to
+            suicide rather than survive to the clock.
         gamma: Discount factor γ. Also the γ used in the potential-based shaping
             term ``F(s, s') = gamma·Φ(s') − Φ(s)`` so the discount lives in ONE
             place (the learner reads the same value). ``TUNE`` (0.99).
@@ -122,11 +140,67 @@ class RewardConfig:
     c_step: float = 0.005
     c_aim: float = 0.01
 
-    # --- terminal (win >> loss; timeout is the worst outcome to punish kiting) ---
+    # --- terminal (win > timeout > loss; a scored loss is always the worst
+    # outcome so the agent never prefers dying to running out the clock) ---
     R_terminal_win: float = 50.0
-    R_terminal_loss: float = 8.0
-    R_terminal_timeout: float = -30.0
+    R_terminal_loss: float = 30.0
+    R_terminal_timeout: float = -15.0
 
     # --- discount / potential-based positional shaping ---
     gamma: float = 0.99
     c_approach: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Enforce the terminal-reward invariant: finiteness, signs, ordering.
+
+        The three terminal fields interact (``R_terminal_loss`` is stored
+        positive and negated at the call site in :func:`env.reward._terminal_reward`)
+        so their validity cannot be checked field-by-field — a config that
+        passes each field's own sanity check in isolation can still encode a
+        nonsense ordering (e.g. a timeout worse than a loss). This guards the
+        combined invariant at construction time so a bad config fails loudly
+        instead of silently teaching the wrong policy:
+
+          - all three finite (no inf/-inf/nan — they poison every downstream sum),
+          - ``R_terminal_win > 0`` and ``R_terminal_loss > 0`` (sign semantics:
+            both are stored as positive magnitudes; ``R_terminal_loss`` is
+            negated at the point of use),
+          - ``R_terminal_timeout < 0`` (stored and applied pre-signed, unlike
+            loss),
+          - ``-R_terminal_loss < R_terminal_timeout < R_terminal_win`` (a scored
+            loss is always the worst terminal outcome, strictly worse than
+            timing out; winning is always the best).
+        """
+        for name in ("R_terminal_win", "R_terminal_loss", "R_terminal_timeout"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"RewardConfig.{name} must be finite, got {value!r}"
+                )
+
+        if self.R_terminal_win <= 0.0:
+            raise ValueError(
+                "RewardConfig.R_terminal_win must be strictly positive "
+                f"(a win must always be rewarded), got {self.R_terminal_win!r}"
+            )
+        if self.R_terminal_loss <= 0.0:
+            raise ValueError(
+                "RewardConfig.R_terminal_loss must be strictly positive "
+                "(it is stored as a positive magnitude and negated at the "
+                f"call site), got {self.R_terminal_loss!r}"
+            )
+        if self.R_terminal_timeout >= 0.0:
+            raise ValueError(
+                "RewardConfig.R_terminal_timeout must be strictly negative "
+                f"(it is applied pre-signed), got {self.R_terminal_timeout!r}"
+            )
+        if not (-self.R_terminal_loss < self.R_terminal_timeout < self.R_terminal_win):
+            raise ValueError(
+                "RewardConfig terminal ordering violated: require "
+                "-R_terminal_loss < R_terminal_timeout < R_terminal_win, got "
+                f"-R_terminal_loss={-self.R_terminal_loss!r}, "
+                f"R_terminal_timeout={self.R_terminal_timeout!r}, "
+                f"R_terminal_win={self.R_terminal_win!r} "
+                "(a scored loss must remain the worst outcome, and winning "
+                "must remain the best)"
+            )

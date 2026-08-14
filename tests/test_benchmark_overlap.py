@@ -468,8 +468,10 @@ def _tiny_multi_cfg(n_arenas: int = 2) -> TrainConfig:
         min_replay=1,
         replay_capacity=2_000,
         weight_sync_every_k_steps=1,
+        # No bridge restarts: these fakes never die, and a restart attempt here would
+        # only reach a fake launcher. The JVM watchdog stays unwired (jvm_probe=None),
+        # so nothing in this test ever touches a socket looking for Paper.
         fault_relaunch=False,
-        fault_min_live_arenas=1,
         seed=0,
     )
 

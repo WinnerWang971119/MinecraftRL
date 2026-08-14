@@ -14,17 +14,18 @@
 //     process. The M1 bar is zero crashes over >=100 episodes, so socket and
 //     bot errors are logged and the Python side reconnects/retries.
 //
-// PER-ARENA CONFIG (T10): one bridge process serves ONE arena, so to run N
-// arenas the launcher (T11) starts N of these, each with distinct ports and
-// usernames. parseBridgeConfig reads those from argv/env and forwards them to
+// PER-PAD CONFIG (T9): one bridge process serves ONE pad, so to run N pads the
+// launcher (T10) starts N of these, each with its own bridge port, usernames and
+// pad ANCHOR. parseBridgeConfig reads those from argv/env and forwards them to
 // ArenaBots; with no flags and no env the behavior is byte-identical to the
-// single-arena default (MC port 25565, bridge port 5555, learner_bot/dummy_bot).
+// single-arena default (MC port 25565, bridge port 5555, learner_bot/dummy_bot,
+// anchor 0,0).
 //
-// Owner: RUNBOOK Step 0 (go-live wiring) / T10 (per-arena config)
+// Owner: RUNBOOK Step 0 (go-live wiring) / T9 (per-pad config)
 
 'use strict';
 
-const { ArenaBots } = require('./bot');
+const { ArenaBots, assertMacroUsername } = require('./bot');
 
 // Fire-and-forget Mineflayer calls (lookAt, attack) reject outside any await
 // chain, and an unhandled rejection is process-fatal in Node — one killed the
@@ -35,9 +36,9 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ---------------------------------------------------------------------------
-// Per-arena config parsing (T10). PURE: reads argv + env, returns a plain
-// config object, no Mineflayer and no socket. Kept pure so `node --test` can
-// drive it without a live server (see run.test.js).
+// Per-pad config parsing (T9). PURE: reads argv + env, returns a plain config
+// object, no Mineflayer and no socket. Kept pure so `node --test` can drive it
+// without a live server (see run.test.js).
 //
 // Only keys that were ACTUALLY provided are returned, so any key the caller
 // omits falls through to bot.js DEFAULT_BOT_CONFIG (ArenaBots merges
@@ -52,22 +53,129 @@ process.on('unhandledRejection', (reason) => {
 
 /**
  * The argv flag <-> env var <-> config key mapping. Each entry declares how one
- * config field is sourced. `port: true` marks a field that must parse as a
- * finite positive integer (the two ports); the rest are passed through as
- * trimmed strings (hosts, usernames).
+ * config field is sourced, via `kind`:
+ *   'port'      finite integer in 1..65535 (the two ports);
+ *   'text'      trimmed non-empty string (hosts, usernames);
+ *   'padOrigin' "<x>,<z>" -> the padOriginX / padOriginZ pair;
+ *   'padIndex'  a 0-based non-negative integer.
  *
  * Forwarded into ArenaBots(config) -> { ...DEFAULT_BOT_CONFIG, ...config }, so
  * the config keys here MUST match bot.js DEFAULT_BOT_CONFIG names exactly.
  */
 const CONFIG_SPECS = Object.freeze([
-  { key: 'port', flag: '--port', env: 'MC_PORT', port: true },
-  { key: 'bridgePort', flag: '--bridge-port', env: 'BRIDGE_PORT', port: true },
-  { key: 'learnerUsername', flag: '--learner-username', env: 'LEARNER_USERNAME', port: false },
-  { key: 'dummyUsername', flag: '--dummy-username', env: 'DUMMY_USERNAME', port: false },
+  { key: 'port', flag: '--port', env: 'MC_PORT', kind: 'port' },
+  { key: 'bridgePort', flag: '--bridge-port', env: 'BRIDGE_PORT', kind: 'port' },
+  { key: 'learnerUsername', flag: '--learner-username', env: 'LEARNER_USERNAME', kind: 'text' },
+  { key: 'dummyUsername', flag: '--dummy-username', env: 'DUMMY_USERNAME', kind: 'text' },
   // Optional extras for completeness; the four above are the required ones.
-  { key: 'host', flag: '--mc-host', env: 'MC_HOST', port: false },
-  { key: 'bridgeHost', flag: '--bridge-host', env: 'BRIDGE_HOST', port: false },
+  { key: 'host', flag: '--mc-host', env: 'MC_HOST', kind: 'text' },
+  { key: 'bridgeHost', flag: '--bridge-host', env: 'BRIDGE_HOST', kind: 'text' },
+  // Pad topology (T9). PROCESS-LOCAL: neither value ever reaches the wire.
+  { key: 'padOrigin', flag: '--pad-origin', env: 'PAD_ORIGIN', kind: 'padOrigin' },
+  { key: 'padIndex', flag: '--pad-index', env: 'PAD_INDEX', kind: 'padIndex' },
 ]);
+
+/**
+ * A NON-NEGATIVE PLAIN INTEGER, as a string, and nothing else.
+ *
+ * Deliberately stricter than Number(): the pad anchor is pasted TEXTUALLY into
+ * the `arena:setup_pad` / `arena:reset_pad` macro arguments, and the datapack
+ * builds `$(x).5` from it. `512L`, `0b`, `512.0`, `"512"` would each yield a
+ * non-coordinate, and `-512` would silently land the bot half a block off the
+ * anchor with no error at all — the dangerous case. A bad value inside a
+ * `$`-macro aborts instantiation of the WHOLE function (no command in it runs,
+ * nothing appears in the log), so it is validated HERE, at the boundary, rather
+ * than trusted to complain downstream. `+5`, `5e2` and `0x10` are rejected for
+ * the same reason: one canonical form. (Surrounding whitespace is trimmed off
+ * before the test — a launcher's `"512, 1024"` is a formatting choice, not an
+ * ambiguous value.)
+ */
+const PLAIN_NON_NEGATIVE_INT = /^\d+$/;
+
+/** Render a raw value inside an error message without losing its type. */
+function showRaw(raw) {
+  return typeof raw === 'string' ? JSON.stringify(raw) : String(raw);
+}
+
+/**
+ * Parse a `--pad-origin` value ("<x>,<z>") into the pad ANCHOR.
+ *
+ * The anchor is the learner SPAWN CELL, not the floor origin: learner feet land
+ * at (x+0.5, 64, z+0.5) and the dummy at (x+3.5, 64, z+0.5). This function only
+ * PARSES the value it is handed — it never derives an anchor from a pad index
+ * (`padAnchor(i)` is T10's sole implementation and is deliberately not mirrored
+ * here).
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error ('--pad-origin' / 'PAD_ORIGIN').
+ * @returns {{x:number, z:number}} The parsed anchor.
+ * @throws {Error} Naming the offending string, never defaulting silently.
+ */
+function parsePadOrigin(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  const requirement =
+    `${source} must be "<x>,<z>" with two non-negative plain integers ` +
+    `(e.g. "0,0" or "512,1024"; no sign, decimal point or NBT type suffix), got ${showRaw(raw)}`;
+  if (typeof text !== 'string') {
+    throw new Error(requirement);
+  }
+  const parts = text.split(',');
+  if (parts.length !== 2) {
+    throw new Error(requirement);
+  }
+  const coords = parts.map((part) => part.trim());
+  for (const coord of coords) {
+    if (!PLAIN_NON_NEGATIVE_INT.test(coord)) {
+      throw new Error(requirement);
+    }
+  }
+  const [x, z] = coords.map((coord) => Number(coord));
+  // Beyond Number.MAX_SAFE_INTEGER the value stops round-tripping through
+  // arithmetic (the +0.5 spawn offset in particular); a pad that far out is a
+  // typo, not a topology.
+  if (!Number.isSafeInteger(x) || !Number.isSafeInteger(z)) {
+    throw new Error(requirement);
+  }
+  return { x, z };
+}
+
+/**
+ * Parse a `--pad-index` value: a 0-based non-negative plain integer. Used for
+ * usernames and logging only — never for coordinates.
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error.
+ * @returns {number} The parsed index.
+ */
+function parsePadIndex(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  if (typeof text !== 'string' || !PLAIN_NON_NEGATIVE_INT.test(text)) {
+    throw new Error(`${source} must be a non-negative plain integer, got ${showRaw(raw)}`);
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${source} must be a non-negative plain integer, got ${showRaw(raw)}`);
+  }
+  return value;
+}
+
+/**
+ * The bot usernames implied by a pad index.
+ *
+ * `i == 0` is DELIBERATELY `learner_bot` / `dummy_bot` and not `learner_0`, so
+ * the manual single-arena path (server/ops.json, the datapack's arena:reset
+ * wrapper, every existing runbook step) stays byte-identical. This changes PR
+ * #21's launcher default, which used `learner_0` at `i == 0`.
+ *
+ * @param {number} index 0-based pad index.
+ * @returns {{learnerUsername:string, dummyUsername:string}}
+ */
+function usernamesForPad(index) {
+  if (index === 0) {
+    return { learnerUsername: 'learner_bot', dummyUsername: 'dummy_bot' };
+  }
+  return { learnerUsername: `learner_${index}`, dummyUsername: `dummy_${index}` };
+}
 
 /**
  * Parse the leading process arguments into a { flag: value } map. Accepts both
@@ -114,8 +222,9 @@ function parseFlags(argv) {
 /**
  * Coerce a raw port string to a finite positive integer, or throw a clear
  * error naming the source. TCP ports are 1..65535; reject anything outside that
- * (0 is not a usable bind target for a fixed per-arena port, and the launcher
- * always assigns 5555+i / 25565+i).
+ * (0 is not a usable bind target for a fixed per-pad port; the launcher assigns
+ * bridge port 5555+i, while the Minecraft port stays 25565 — one JVM serves all
+ * pads).
  *
  * @param {string} raw The raw value from a flag or env var.
  * @param {string} source A human label for the error (e.g. '--port' or 'MC_PORT').
@@ -143,6 +252,7 @@ function coercePort(raw, source) {
 function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
   const flags = parseFlags(argv);
   const config = {};
+  const provided = new Set();
   for (const spec of CONFIG_SPECS) {
     // Precedence: explicit CLI flag > env var > (omitted -> default).
     let raw;
@@ -156,9 +266,19 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
     } else {
       continue; // not provided -> fall through to DEFAULT_BOT_CONFIG
     }
+    provided.add(spec.key);
 
-    if (spec.port) {
+    if (spec.kind === 'port') {
       config[spec.key] = coercePort(raw, source);
+    } else if (spec.kind === 'padOrigin') {
+      // Flat keys, not a nested object: DEFAULT_BOT_CONFIG is only shallowly
+      // frozen and ArenaBots merges with a spread, so a shared nested default
+      // would be one mutation away from leaking across instances.
+      const anchor = parsePadOrigin(raw, source);
+      config.padOriginX = anchor.x;
+      config.padOriginZ = anchor.z;
+    } else if (spec.kind === 'padIndex') {
+      config[spec.key] = parsePadIndex(raw, source);
     } else {
       // Hosts / usernames pass through as trimmed strings. Reject an
       // all-whitespace value rather than connecting a blank username.
@@ -169,6 +289,37 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
       config[spec.key] = trimmed;
     }
   }
+
+  if (provided.has('padIndex')) {
+    // A pad index with no anchor would silently stack pad i on top of pad 0 —
+    // two bot pairs sharing one arena, cross-crediting every hit. The anchor is
+    // NOT derived from the index here: padAnchor(i) is T10's sole
+    // implementation and this process only ever parses what it is handed.
+    if (!provided.has('padOrigin') && config.padIndex !== 0) {
+      throw new Error(
+        `--pad-index ${config.padIndex} requires an explicit --pad-origin "<x>,<z>" ` +
+          '(the anchor comes from the launcher; defaulting it to 0,0 would stack this pad on pad 0)',
+      );
+    }
+    // Usernames follow the index unless explicitly overridden.
+    const implied = usernamesForPad(config.padIndex);
+    if (!provided.has('learnerUsername')) {
+      config.learnerUsername = implied.learnerUsername;
+    }
+    if (!provided.has('dummyUsername')) {
+      config.dummyUsername = implied.dummyUsername;
+    }
+  }
+
+  // Usernames are pasted into the reset macro's NBT arguments, so validate them
+  // at STARTUP rather than at the first reset (where a bad name would abort the
+  // whole macro function silently, server-side).
+  for (const key of ['learnerUsername', 'dummyUsername']) {
+    if (config[key] !== undefined) {
+      assertMacroUsername(config[key], key);
+    }
+  }
+
   return config;
 }
 
@@ -185,8 +336,13 @@ async function main() {
   }
 
   // ArenaBots merges this over DEFAULT_BOT_CONFIG; an empty config reproduces
-  // today's BridgeServer on 127.0.0.1:5555 with learner_bot/dummy_bot on 25565.
+  // today's BridgeServer on 127.0.0.1:5555 with learner_bot/dummy_bot on 25565
+  // at pad anchor (0,0).
   const bots = new ArenaBots(config);
+  console.error(
+    `[bridge] pad ${bots.padIndex} @ anchor ${bots.padOrigin.x},${bots.padOrigin.z} ` +
+      `(${bots.config.learnerUsername} / ${bots.config.dummyUsername})`,
+  );
 
   bots.transport.on('error', (err) => console.error('[bridge] transport error:', err));
   bots.transport.on('connection', () => console.error('[bridge] env connected'));
@@ -230,4 +386,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseBridgeConfig };
+module.exports = { parseBridgeConfig, parsePadOrigin, parsePadIndex, usernamesForPad };

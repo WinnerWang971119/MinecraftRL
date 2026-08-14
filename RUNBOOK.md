@@ -1,9 +1,8 @@
 # Go-Live Runbook — from green tests to M1 + M2
 
-**What we have:** the full kickoff foundation (T0–T20) is built and the offline
-suite is green — `pytest` reports **353 passed**. But every offline test runs
-against fakes and fixtures. Nothing has touched a live Paper server yet, so the
-two questions the project exists to answer are still open:
+**What we have:** the full kickoff foundation plus the damage-channel repair, and
+the offline suite is green. But every offline test runs against fakes and
+fixtures. The two questions the project exists to answer are still open:
 
 - **M1 — does the plumbing work?** (AC3 zero-crash slice + AC4 the measured number)
 - **M2 — does the RL stack learn?** (AC6 greedy win-rate ≥95% vs the dummy)
@@ -12,25 +11,96 @@ This runbook takes the stack live and collects those acceptances, in dependency
 order. Everything below the line needs the real game running; none of it is
 covered by `pytest`.
 
+> **Just want to look at the bots with your own eyes?** That is a different, shorter
+> procedure with its own traps (you join in **survival**, at **world spawn**, which is
+> **inside pad 0**). Follow [`docs/spectate.md`](docs/spectate.md) instead, and read
+> its "Before you join" section before you press Join.
+
+---
+
+## Read this first — what changed on this branch
+
+**The opponent-damage channel was dead for the entire life of the project, and is
+now repaired.** `damage_dealt` was computed from the *learner's entity view* of the
+dummy (`entity.health`), and mineflayer never populates `health` on a non-self
+entity — only on the bot's own connection. So the value was always `undefined`, the
+drop was always `0`, and **landing a hit had never once paid a reward**. Opponent
+damage now comes from the dummy bot's **own** connection (`dummy.on('health')`), and
+the old entity-view path is deleted so the two can never double-count. This is the
+single most important thing to know about this branch: every number from before it
+was collected in a regime where the one action that mattered paid nothing. The
+archive analysis that confirms it is
+[`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md).
+
+Riding along with the repair:
+
+- **Terminal rewards are re-ordered:** win **+50**, timeout **−15**, loss **30**
+  (stored positive, applied as `−30`). `RewardConfig.__post_init__` now enforces
+  `−R_terminal_loss < R_terminal_timeout < R_terminal_win` plus sign semantics and
+  finiteness, so a config where running out the clock beats dying is rejected rather
+  than trained on.
+- **Every arena is enclosed.** A pad is a 25×25 floor at `y=63` over a bedrock
+  sub-floor at `y=62`, ringed by bedrock from `y=64` to `y=71` including all four
+  corners. No ceiling. Reachable interior is `x ∈ [anchor−7, anchor+15]`,
+  `z ∈ [anchor−11, anchor+11]`.
+- **The dummy's health is stationary across episodes.** `naturalRegeneration` is off
+  (set by the datapack, not `server.properties`), and the reset restores food and
+  saturation as well as health — previously only health was restored, so the dummy's
+  regeneration rate silently decayed run over run.
+- **The topology is one Paper JVM hosting N enclosed pads**, not N JVMs. The
+  PowerShell N-JVM orchestrator is gone. Pads are 512 blocks apart and addressed by
+  datapack **macro functions** (`arena:setup_pad {x,z}`,
+  `arena:reset_pad {x,z,learner,dummy,nonce}`).
+- **The datapack is the sole reset authority.** The bridge no longer issues its own
+  `/tp` + `/effect clear` + regear sequence; it sends exactly one
+  `/function arena:reset_pad {…}` and then runs its read-back gate.
+
+Two open defects to keep in mind while reading live results:
+
+- **Issue #27 — a pad's geometry can be silently absent.** A `/fill` into an unloaded
+  chunk no-ops without an error, and a reset ack does not prove walls exist. Fixed by
+  forceloading the pad footprint inside `arena:setup_pad`; **not yet live-verified**.
+- **Issue #28 — the episode-start attack-cooldown observable.** The wire used to read
+  `attack_cooldown = 1.0` at episode start even though the reset's regear re-zeroed
+  the server-side attack meter. Fixed bridge-side (the reported value is now the
+  minimum of the last-swing ramp and the reset-boundary ramp); **also pending live
+  verification**. It is the known first-cycle false-fail in `eval/combat_probe.py` —
+  read that module's docstring before rationalizing a red probe run.
+
 ---
 
 ## Prereqs (one-time)
 
 | Need | Check | Source |
 |------|-------|--------|
-| Java 21+ (machine has 25) | `java -version` | Paper requires it |
-| Node v24 (≥22) | `node -v` | `bridge/package.json` |
-| Python 3.11+ (machine has 3.14) | `python --version` | `torch` works here per memory |
-| Python deps incl. torch | `python -c "import torch"` | `pip install -e .` |
+| **Java 21 exactly** | `java -version` | Paper 1.21.1 boots on newer JDKs and then SIGSEGVs inside spark's native profiler. `start.sh` pins 21 and refuses anything else. |
+| Node ≥22 (v24.13.0 pinned) | `node -v` | `bridge/package.json` |
+| Python ≥3.11 in a venv | `.venv/bin/python --version` | System python on this Mac is 3.9.6, below the floor |
+| Python deps incl. torch | `.venv/bin/python -c "import torch"` | `requirements.txt` |
 
-```powershell
-python -m pip install -e .     # agent package + deps
-cd bridge; npm install; cd ..  # mineflayer + plugins (pinned)
+```bash
+# Python side. NOTE: `pip install -e .` alone installs NOTHING — pyproject declares
+# no dependencies. requirements.txt is mandatory.
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .          # optional: puts the packages on the path by name
+
+# Node side.
+cd bridge && npm install && cd ..   # mineflayer + plugins (pinned)
+```
+
+Missing Java 21 on macOS: `brew install --cask temurin@21`.
+
+Prove the checkout before going live:
+
+```bash
+.venv/bin/python -m pytest          # Python unit + integration
+cd bridge && npm test && cd ..      # Node bridge suite
 ```
 
 ---
 
-## Step 0 — close the one gap: the bridge launcher
+## Step 0 — the bridge launcher
 
 **DONE — `bridge/run.js` + `npm start` exist.** The Python side connects to a
 Node TCP bridge on `127.0.0.1:5555`. The bridge logic all lives in
@@ -41,41 +111,88 @@ that does the four-call wiring (construct → `wireTransport()` → `connect()` 
 - **Bots connect before the port opens** (`connect()` before `listen()`), so
   the Python env can only ever reach a bridge that is ready to serve a reset.
   If Paper is down, `npm start` exits 1 with `ECONNREFUSED 127.0.0.1:25565`
-  instead of opening a port that leads nowhere (verified offline).
+  instead of opening a port that leads nowhere. This is also what makes "pad `i`'s
+  port is open" mean exactly "pad `i`'s two bots joined and spawned", which is how
+  `start-pads.sh` gates its stagger.
 - **`'error'` listeners on the transport and both bots** — an unlistened
   `'error'` event on an EventEmitter kills the Node process, and the M1 bar
   is zero crashes. Socket/bot errors are logged; the Python side retries.
 
-This is the first real integration point — expect to debug the live handshake
-here (bot spawn order, op timing), which is exactly what `server/compat_check.md`
-flags as the human follow-up.
+`run.js` also takes `--pad-origin "<x>,<z>"` and `--pad-index <i>` (process-local,
+never on the wire). Both default to pad 0 at anchor `0,0`, so a bare `npm start` is
+byte-identical to the historical single-arena path.
 
-> Run order matters: **start Paper first** (Step 1), then the bridge (Step 2) so
-> the two bots have a server to join, then the Python driver (Steps 3+).
+> Run order matters and is a hard rule: **Paper first** (Step 1), then the bridge
+> (Step 2) so the two bots have a server to join, then the Python driver (Steps 3+).
 
 ---
 
 ## Step 1 — boot the Paper server
 
-```powershell
-pwsh -NoProfile -File server/setup/setup.ps1   # downloads jar, writes config, installs datapack (idempotent)
-pwsh -NoProfile -File server/setup/start.ps1   # --nogui console; type 'stop' to shut down
+```bash
+bash server/setup/setup.sh    # downloads + sha256-verifies the jar, writes config, installs the datapack (idempotent)
+bash server/setup/start.sh    # --nogui console; type 'stop' to shut down
 ```
+
+`setup.sh` re-copies `server/arena/` into `world/datapacks/arena/` on every run.
+Paper only ever loads that copy, so **re-run setup after any datapack change** or the
+world keeps running the old functions. `start-pads.sh` checks for this and refuses to
+launch on a stale copy.
 
 First-boot checklist (from `server/README.md` / `compat_check.md`):
 - world generates flat, no mobs, `online-mode=false`.
-- the arena datapack loads (`arena:setup` runs on load).
+- the arena datapack loads (`arena:setup` runs on load, sets the gamerules including
+  `naturalRegeneration false`, and builds pad 0).
 - `learner_bot` and `dummy_bot` are opped at level 4 (`server/ops.json`).
-- after a bot joins, `/attribute dummy_bot minecraft:knockback_resistance get`
-  resolves and the dummy stays put when hit (the 1.21 attribute-ID fix).
+- after a bot joins, `/attribute dummy_bot minecraft:generic.knockback_resistance get`
+  resolves and the dummy stays put when hit. The `generic.` infix is **required**
+  on the pinned Paper 1.21.1 stack — the flattening that removed it landed in
+  1.21.2. A wrong attribute id inside a macro function aborts the **whole** function
+  at instantiation, silently voiding the entire reset with nothing in the boot log.
+  See `server/README.md` before changing this form.
+
+The console noise on a healthy Java 21 boot (offline-mode banner ×4, no advanced
+terminal features, the pinned-build nag, and `ERROR: No key layers in MapLike[{}]` at
+world creation) is expected and itemized in `server/compat_check.md`.
+
+**Do not "fix" `generator-settings={}`.** It does not parse, Paper falls back to the
+default flat preset, and that fallback **is** the intended, verified world: solid
+ground at `y=−61` with bedrock at `y=−64` everywhere. Combined with
+`fallDamage false`, walking off a pad **strands the agent alive at `y≈−60` and is
+never a death** — it shows up as a timeout, not a loss. Column scan and consequences:
+`server/compat_check.md`.
 
 ## Step 2 — start the bridge
 
-```powershell
-cd bridge; npm start   # the Step-0 launcher
+```bash
+cd bridge && npm start   # the Step-0 launcher, single arena at anchor 0,0
 ```
 
-Both bots should spawn and the bridge should print `listening on 5555`.
+Both bots should spawn and the bridge should print
+`[bridge] listening on 127.0.0.1:5555, both bots spawned`.
+
+For anything multi-pad, use `server/setup/start-pads.sh` instead (Step 4b) — it owns
+`ops.json`, the stagger, and the prime barrier.
+
+---
+
+## Step 2b — the damage-channel gate (AC8) before you trust anything
+
+This is the go/no-go gate for the whole branch. It drives deterministic reset/kill
+cycles and asserts the exact per-hit sequence against a 20 HP dummy with regeneration
+off, cross-checked against the wire's privileged `state.opponent.health`:
+
+```bash
+.venv/bin/python -m eval.combat_probe --cycles 10
+```
+
+Pass is exit code 0. Per cycle it requires the recorded per-hit `damage_dealt`
+sequence `6, 6, 6, 2`, cumulative exactly 20, exactly one death, a clean post-respawn
+baseline, and reconciliation with the wire at ±1 window. Exit code 2 means "no
+verdict" (a transport abort), never "pass".
+
+`--expect-anchor 512,0` points it at a non-zero pad. Read the module docstring before
+concluding anything from a red first cycle — see issue #28 above.
 
 ---
 
@@ -85,26 +202,29 @@ Random policy, ≥100 full episodes vs the idle dummy, end to end. The bar is
 **zero crashes** and combined-process RSS growth **< ~200 MB** (sampled every 10
 episodes).
 
-```powershell
-python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555
+```bash
+.venv/bin/python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555
 ```
 
-Read the printed summary: episodes completed, win/loss/timeout split, RSS growth.
-This is the first proof the whole loop (rollout → store → sample → no-op update)
-survives the real bridge.
+Read the printed summary: episodes completed, win/loss/timeout split, RSS growth
+(`crashes=` is on the first of the two `[done]` lines). This is the first proof the
+whole loop (rollout → store → sample → no-op update) survives the real bridge.
+
+**Budget the time.** An episode is capped at `MAX_EPISODE_STEPS = 400` decisions at
+`DECISION_INTERVAL_MS = 200` — 80 seconds — and a random policy mostly times out, so
+100 episodes is on the order of **2¼ hours** plus reset overhead. The 20-episode
+version (~25–30 min) is **AC10**, and is what
+[`docs/spectate.md`](docs/spectate.md) uses to give you something to watch.
 
 ## Step 4 — M1 the number (AC4 / TC12)
 
 The bridge spike's exit criterion is a *measured number*, not a green check:
 transitions/s, p99 Node→Python round-trip at the 200 ms interval, damage-event
-boundary correctness, and max arenas sustaining ≥19 TPS over a ≥10-min run.
+boundary correctness, and max pads sustaining ≥19 TPS over a ≥10-min run.
 
-```powershell
-python -m eval.benchmark --duration 600 --arenas 1   # then sweep --arenas 2,3,4 for the max-arenas figure
+```bash
+.venv/bin/python -m eval.benchmark --duration 600 --arenas 1
 ```
-
-Record CPU package power / thermals alongside — the Core Ultra 7 figure is a
-lower-bound smoke number, not fleet capacity. Expect ~2–4 stable arenas, not 8.
 
 > **What "TPS" measures here.** The benchmark's server TPS is the REAL server
 > tick rate, read from the learner bot's world age (`bot.time.age`, set only by
@@ -112,161 +232,203 @@ lower-bound smoke number, not fleet capacity. Expect ~2–4 stable arenas, not 8
 > (Paper's own `/tps` is likewise a rolling average). It is decoupled from the
 > client-side Mineflayer `physicsTick` timer, so a healthy ~20 TPS server reads
 > ~20 even though `update_time` arrives only ~once per second. Raw collection
-> throughput (transitions/s) is a SEPARATE number and is still capped on Windows
-> by Mineflayer's `setInterval(50ms)` physics loop firing at ~60ms under the
-> ~15.6ms system timer resolution; raise it later with `timeBeginPeriod(1)` or by
-> running the bridge on Linux/WSL.
+> throughput (transitions/s) is a SEPARATE number.
 
 ---
 
-## Step 4b — AC4 multi-arena live run (issue #4, ~10 min)
-
-This step confirms `distributed/` is wired correctly and measures peak throughput
-under N concurrent arenas. It is a follow-up to Step 4, run after the single-arena
-benchmark already passes.
+## Step 4b — the pad fleet (one JVM, N enclosed pads)
 
 **NOTE on `--arenas` flags.** Two different commands have an `--arenas` flag that
-means different things. `eval.benchmark --arenas N` (Step 4 above) measures
-throughput from N arenas as a **benchmark** (it does not train). The
-`agent.train --arenas N` flag below runs **training** from N concurrent arenas.
-Do not confuse them.
+means different things. `eval.benchmark --arenas N` (Step 4) **measures** throughput
+from N pads and does not train. `agent.train --arenas N` (below) runs **training**
+from N pads. Do not confuse them.
 
-### Caveats (read before starting a long run)
+**Topology.** One Paper JVM, one Minecraft port (`25565`), N enclosed pads in one flat
+world. Pad `i` gets bridge port `5555+i`, anchor `((i % 5) * 512, (i // 5) * 512)`,
+and bots `learner_bot`/`dummy_bot` at `i == 0`, `learner_<i>`/`dummy_<i>` above.
+`padAnchor(i)` has exactly one implementation, in `distributed/launcher.py`; nothing
+else in the repo may compute an anchor.
 
-- **Windows Update auto-reboots this box at ~03:30** with no warning and no
-  checkpoint save. Pause Windows Update (Start → Windows Update → Advanced options →
-  Pause, or set Active Hours to cover your run window) before any run expected to
-  last more than a few hours. Prefer launching in the morning so Active Hours carry
-  you through.
+### Caveats (read before a long run)
 
-- **First boot of N fresh Paper worlds is slow.** World generation, plugin load,
-  bot re-op, and re-teleport each take tens of seconds per arena. The first reset per
-  arena will be noticeably slower than steady-state; let it settle before judging
-  throughput. Relaunch of a dead arena (fault recovery) is similarly slow (30–60 s+).
-
-- **Cores and thermals bind before RAM** on this 8c/8t / 32 GB box. Around 2–4
-  arenas is the realistic range; 8 is not achievable. The throughput goal is
-  ≥19 TPS sustained across all running arenas.
-
-- **Do not shrink the JVM heap to fit more arenas.** RAM is not the ceiling here:
-  4 arenas at the default `-Xms2G -Xmx2G` is ~10–12 GB of 32 GB. The single-threaded
-  Paper tick runs out of cores first, and cutting heap only invites GC pauses that
-  burn CPU and *drop* TPS — the opposite of what you want. Leave heap at 2G. Only
-  touch `-Xms/-Xmx` (both, kept equal) if a GC log shows real pressure, and then
-  *raise* it, never lower it.
+- **First boot is slow.** World generation, datapack load, bot joins, and the prime
+  barrier each take real time. The first reset per pad is noticeably slower than
+  steady state; let it settle before judging throughput.
+- **`FLEET READY` does not mean the arena was verified.** It means 2N bots were
+  placed at their anchors. A reset ack cannot see walls (issue #27).
+- **Do not shrink the JVM heap to fit more pads.** RAM is not the ceiling; the
+  single-threaded Paper tick is. Cutting heap only invites GC pauses that burn CPU and
+  *drop* TPS. Leave `-Xms2G -Xmx2G` (kept equal). Only change it if a GC log shows
+  real pressure, and then *raise* it.
+- **Nothing else should be running.** The AC14 gate is a TPS floor, and background
+  contention on a laptop is what moves it.
 
 ### Launch procedure
 
-**1. Dry-run first** to print the full plan and sanity-check ports, usernames, and
-arena roots before anything goes live:
+**1. Dry-run first** to print the plan and sanity-check ports, usernames, and anchors
+before anything goes live:
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -DryRun
+```bash
+bash server/setup/start-pads.sh --pads 2 --dry-run
 ```
 
-Check the output: each arena should show distinct MC ports (25565, 25566, ...),
-distinct bridge ports (5555, 5556, ...), distinct learner/dummy usernames
-(`learner_0`/`dummy_0`, `learner_1`/`dummy_1`, ...), and separate server roots
-under `server/arenas/arena-N`.
+Check the output: one shared MC port (25565), distinct bridge ports (5555, 5556, …),
+distinct anchors (`0,0`, `512,0`, …) and distinct usernames (`learner_bot`/`dummy_bot`,
+`learner_1`/`dummy_1`, …).
 
-You can also verify the Python-side plan without touching any process:
+You can also verify the Python-side plan alone:
 
-```powershell
-python -m distributed.launcher --arenas 2 --dry-run
+```bash
+.venv/bin/python -m distributed.launcher --pads 2 --dry-run
 ```
 
-**2. Run `setup.ps1` once** (idempotent; downloads the Paper jar into the canonical
-root that `start-arenas.ps1` copies from):
+**2. Run `setup.sh` once with the pad count** (idempotent; sizes `max-players` to
+`2N+10` and refreshes the installed datapack):
 
-```powershell
-pwsh -NoProfile -File server/setup/setup.ps1
+```bash
+PADS=2 bash server/setup/setup.sh
 ```
 
-**3. Start N arenas** (Paper servers + bridges). This blocks and keeps all processes
-alive until Ctrl-C:
+**3. Start the fleet** (Paper + N bridges + the prime barrier). This blocks and keeps
+every process alive until Ctrl-C:
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2
+```bash
+bash server/setup/start-pads.sh --pads 2
 ```
 
-Wait for each bridge to print `listening on 127.0.0.1:555N` before proceeding. First boot is
-slow; give it a minute per arena. If a bridge fails to connect, the script will
-show the process exit; Paper was not ready. Stop everything (Ctrl-C), wait for the
-JVMs to finish world-gen, and re-run.
+`--check` runs only the preflight gates (node, datapack currency, `max-players`,
+ports, ops) and exits. `--help` lists every flag. The script starts Paper, then each
+bridge one at a time — a pad's bridge port opens only after both of its bots have
+joined, so the port coming up *is* the join gate — then resets every pad once before
+printing `FLEET READY`.
 
-**4. Confirm each bridge is listening** (from a second terminal, while
-`start-arenas.ps1` is still running):
+**Do not start the Python driver until `FLEET READY` is printed.** Until every pad has
+been reset, all 2N bots are stacked at the shared world spawn inside pad 0, and a
+stepping pad will hit foreign bots and credit the damage to the wrong policy.
 
-```powershell
-# Arena 0 (bridge port 5555)
-python -c "import socket; s=socket.create_connection(('127.0.0.1',5555),2); s.close(); print('5555 up')"
-# Arena 1 (bridge port 5556)
-python -c "import socket; s=socket.create_connection(('127.0.0.1',5556),2); s.close(); print('5556 up')"
+**4. Confirm each bridge is listening.** Use the non-connecting check — it answers the
+same question and is safe at any time, including mid-run:
+
+```bash
+lsof -nP -iTCP:5555 -sTCP:LISTEN
+lsof -nP -iTCP:5556 -sTCP:LISTEN
 ```
 
-**5. Sweep `--arenas` to find the max** (in a third terminal). The ceiling is set
-by cores + thermal, not RAM, so this is the measurement that actually finds it.
-The answer is the highest N where **every** arena holds ≥19 TPS for the **full**
-10 min *and* aggregate transitions/s is still rising. Because the live benchmark
-opens one real `TcpBridgeClient` on `port + i` per arena, N real servers must be
-up first — relaunch `start-arenas.ps1 -Arenas N` (step 3) to match before each run:
+**Do not reach for a connect probe here.** `BridgeServer` accepts exactly **one** TCP
+client and resolves a second connection by destroying the incumbent, so a
+`socket.create_connection` against a bridge a driver is attached to silently kills
+that driver's connection while the port stays open and everything looks fine. The
+window between `FLEET READY` and starting the driver is the only one where it is
+harmless, and `lsof` already covers that window too.
 
-```powershell
-python -m eval.benchmark --duration 600 --arenas 1
-python -m eval.benchmark --duration 600 --arenas 2
-python -m eval.benchmark --duration 600 --arenas 3
-python -m eval.benchmark --duration 600 --arenas 4
-# keep stepping (5, 6, ...) until the stop rule below trips
+**5. Measure the ladder** (see the next section for what to record). Because the live
+benchmark opens one real `TcpBridgeClient` on `port + i` per arena, N pads must be up
+first — relaunch `start-pads.sh --pads N` to match before each rung:
+
+```bash
+.venv/bin/python -m eval.benchmark --duration 600 --arenas 4 --pad-log-dir server/logs/pads
 ```
 
-**Watch thermals for the whole run, not just the start.** A thin-and-light
-throttles minutes in, so an N that looks fine at second 30 can fall under 19 TPS
-by minute 8. Keep CPU package power / core temps (HWiNFO or Task Manager) in view
-next to the per-arena TPS the benchmark prints.
+`--pad-log-dir` engages the AC13 cross-pad isolation check: per-pad reconciliation of
+cumulative `damage_dealt` against each pad's own dummy health loss, plus consumption
+of the bridge-side `foreign_players` scan. Any foreign username in a pad's log, or a
+reconciliation mismatch, means bots are reaching each other and the run is void.
 
-**Stop rule — back off one when either trips at N:**
-- any arena's sustained TPS drops below 19 across the 10-min window, or
-- aggregate transitions/s stops rising (or falls) versus N−1.
+> **A benchmark-only run has ZERO foreign-scan coverage.** The scan fires from exactly
+> one call site — the end of `handleReset` — and `run_benchmark` never resets; it drives
+> a continuous step loop. So a benchmark run collects the *damage-reconciliation* half
+> of AC13 and proves **nothing** about the scan half, while still looking clean.
+> **Collect AC13 against a fleet that is actually resetting** — alongside or as part of
+> a training run — with `--pad-log-dir` pointed at the same per-pad logs.
 
-The max usable arena count is the last N *before* the trip. Record each run:
+> **One spurious pad failure at the tail of a timed run is expected and benign.** The
+> run stops on a wall-clock deadline, so if a pad's final decision window happens to
+> contain a landed hit, there is no window+1 for that hit's ±1-skewed wire-health drop
+> to arrive in, and per-window reconciliation flags it as "no matching wire-health
+> drop" on a perfectly healthy fleet. At 8–25 pads with one shot per rung this will
+> happen. The **only** benign signature is: a single unmatched hit in a pad's **very
+> last** recorded window, with the aggregate residual within that one hit's own size.
+> Re-run the rung. Anything else — an unmatched hit in a non-final window, more than
+> one unmatched hit, or a negative residual — is real, and the run is void. The
+> per-window flag is deliberately not trimmed (trimming would drop a window of genuine
+> coverage); the aggregate check already forgives exactly this case and only this case.
 
-| N | aggregate transitions/s | min sustained per-arena TPS | peak pkg power / temp | verdict |
-|---|-------------------------|-----------------------------|-----------------------|---------|
-| 1 |                         |                             |                       | base    |
-| 2 |                         |                             |                       |         |
-| 3 |                         |                             |                       |         |
-| 4 |                         |                             |                       |         |
+**6. Run multi-arena training** with the promoted N. Keep `start-pads.sh` running (or
+relaunch it), wait for `FLEET READY`, then in a separate terminal:
 
-The real AC4 number is measured live here; it could not be measured in-session.
-
-**6. Run multi-arena training** with the winning N (once you know it from step 5).
-Keep `start-arenas.ps1` running (or relaunch it), then in a separate terminal:
-
-```powershell
-python -m agent.train --arenas 2 --max-episodes 10000 `
-  --eval-every-grad-steps 1000 --eval-episodes 100 `
+```bash
+.venv/bin/python -m agent.train --arenas 2 --port 5555 --max-episodes 10000 \
+  --eval-every-grad-steps 1000 --eval-episodes 100 \
   --checkpoint runs/m2_multi.pt --run-name m2_multi
 ```
 
-The `--arenas N` flag on `agent.train` (not on `eval.benchmark`) is what engages
-the multi-arena `ActorPool` + decoupled learner. Arena `i` connects to bridge port
-`--port + i` (default base 5555, so arena 0 → 5555, arena 1 → 5556, ...). The
-N bridges must already be listening before this command runs.
+The `--arenas N` flag on `agent.train` engages the multi-arena `ActorPool` +
+decoupled learner. Arena `i` connects to bridge port `--port + i`. The N bridges must
+already be listening and primed before this command runs.
+
+**Fault policy.** Two tiers, and the tier matters. One pad's bridge dying affects that
+pad only — it is reported with its log tail, and the driver's `ActorPool` restarts
+exactly that bridge. The **JVM** dying aborts the whole run loudly, because every pad
+went with it. There is no survivor floor: the run never silently continues on fewer
+arenas.
 
 **Stopping.** Ctrl-C on `agent.train` cleanly stops the collector threads. The
-multi-arena path writes a checkpoint during the run whenever a greedy eval
-improves the win-rate (not on exit), so the latest best-eval checkpoint is
-already on disk. Then Ctrl-C on `start-arenas.ps1` tears down all Paper servers
-and bridges.
+multi-arena path writes a checkpoint during the run whenever a greedy eval improves
+the win-rate (not on exit), so the latest best-eval checkpoint is already on disk.
+Then Ctrl-C on `start-pads.sh` tears down every bridge and the Paper JVM.
 
-**Fast relaunch** (if you need to restart training without re-generating worlds):
+**Fast relaunch** (restart the bridges against a Paper JVM that is already up):
 
-```powershell
-pwsh -NoProfile -File server/setup/start-arenas.ps1 -Arenas 2 -SkipSetup
+```bash
+bash server/setup/start-pads.sh --pads 2 --no-server
 ```
 
-`-SkipSetup` skips the per-arena `setup.ps1` call, so existing worlds and
-`ops.json` files are reused. Relaunch is still 30–60 s+ per arena for JVM startup.
+`--no-server` attaches to the running JVM instead of starting one, so you skip the
+world load. It requires `ops.json` to already op all 2N bots (a running server will
+not re-read that file) and still runs the prime barrier. This is also the mode
+[`docs/spectate.md`](docs/spectate.md) uses, so that Paper keeps an interactive
+console.
+
+---
+
+## The measured scale ladder (AC14) — NOT YET RUN
+
+> **TODO(T13): fill this table from `eval.benchmark` runs on the pad fleet.**
+> Nothing below has been measured. **Do not put a number in this table that did not
+> come out of a run**, and do not carry over any figure from the Windows machine —
+> that hardware is gone and its arena topology no longer exists.
+
+Rungs: **1, 2, 4, 8, 12, 16, 20, 25** pads. Each rung is a ≥10-minute run at
+`--duration 600`. Record all five metrics per rung. **Promoted N is the largest rung
+that meets every one of them** — not four out of five:
+
+| Metric | Gate | Where it comes from |
+|---|---|---|
+| World-age server TPS | **≥ 19.0** | `eval.benchmark` (real world age, not the physics timer) |
+| p99 step round-trip | **≤ 250 ms** | `eval.benchmark` (25% over the 200 ms decision budget) |
+| Paper RSS growth over the rung | **< 200 MB** | sample the Paper JVM's PID; identify it before the run starts |
+| Max GC pause | **< 50 ms** | one tick; JVM GC log |
+| Reset success rate | **≥ 99.5%** | `eval.benchmark` / per-pad bridge logs |
+
+| N | world-age TPS | p99 round-trip (ms) | Paper RSS growth (MB) | max GC pause (ms) | reset success | verdict |
+|---:|---|---|---|---|---|---|
+| 1 | TODO | TODO | TODO | TODO | TODO | |
+| 2 | TODO | TODO | TODO | TODO | TODO | |
+| 4 | TODO | TODO | TODO | TODO | TODO | |
+| 8 | TODO | TODO | TODO | TODO | TODO | |
+| 12 | TODO | TODO | TODO | TODO | TODO | |
+| 16 | TODO | TODO | TODO | TODO | TODO | |
+| 20 | TODO | TODO | TODO | TODO | TODO | |
+| 25 | TODO | TODO | TODO | TODO | TODO | |
+
+**Promoted N: TODO.** N is an empirical result, not a target. Stop climbing once a
+rung fails, and record the failing metric — a rung that fails on GC pause tells you
+something different from one that fails on TPS.
+
+Also worth recording alongside each rung, though not gated: aggregate transitions/s,
+CPU package power, and thermals. A thin-and-light throttles minutes in, so an N that
+looks fine at second 30 can fall under 19 TPS by minute 8. Keep them in view for the
+whole window, not just the start.
 
 ---
 
@@ -276,27 +438,25 @@ M2's dummy is stationary and always visible, so a green M2 says **nothing** abou
 whether the LSTM works — a feed-forward encoder alone would pass it. Confirm the
 memory-dependent fixture is green so recurrence is actually exercised:
 
-```powershell
-python -m pytest tests/test_dqn.py -k "memory or burn_in or recurr" -v
+```bash
+.venv/bin/python -m pytest tests/test_dqn.py -k "memory or burn_in or recurr" -v
 ```
 
 ## Step 6 — M2 learning (AC6 / TC13)
-
-### Before you run this
-
-Multi-arena training (`distributed/`, issue #4) is now built. Run Step 4b first
-to find the max stable N on this machine, then pass `--arenas N` here for faster
-throughput. If you are short on time or skipping 4b, the single-arena path below
-works as-is.
 
 Train the Dueling-DRQN vs the stationary dummy until the greedy (ε=0) eval clears
 the gate: **win-rate ≥95% over 100 eps, aim-bonus-while-invisible == 0, mean
 episode length < timeout cap**. The process exits `0` iff the gate passes.
 
-```powershell
-python -m agent.train --max-episodes 10000 --eval-every-episodes 50 `
+Single arena:
+
+```bash
+.venv/bin/python -m agent.train --max-episodes 10000 --eval-every-episodes 50 \
   --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train
 ```
+
+For the multi-pad version, run Step 4b first to get the promoted N, then pass
+`--arenas N`.
 
 A **live status bar** (on a TTY) plus a periodic **progress line** report
 throughput and an ETA so you can estimate how long the run will take:
@@ -307,15 +467,24 @@ throughput and an ETA so you can estimate how long the run will take:
 ```
 
 The ETA is to the full `--max-episodes` budget — a worst-case upper bound, since
-the loop stops the moment a greedy eval clears the gate. Throughput is measured
-over a sliding window so it tracks the *current* pace, not the slow replay
-warm-up. The progress line lands in the redirected log every `--progress-interval`
-seconds (default 30; pass `--no-progress` to silence it), and the same numbers are
-written to `runs/<run-name>/metrics.jsonl` under `progress/*` keys for plotting.
+the loop stops the moment a greedy eval clears the gate. The progress line lands in
+the redirected log every `--progress-interval` seconds (default 30; `--no-progress`
+silences it), and the same numbers are written to `runs/<run-name>/metrics.jsonl`
+under `progress/*` keys.
 
-Watch the **per-component reward log** from episode 1 — if win-rate stalls or the
-agent spins/runs away, the components catch hacking before you blame the learner.
-If Q diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
+**Watch `r_damage_dealt` from episode 1.** It was identically zero for the entire
+history of this project; a run where it is still zero means the repair regressed, and
+the whole reward shape is back to having no gradient on the one action that matters.
+The complementary watch is TC16: with regeneration off, **any episode with
+`damage_dealt > 20` is a defect, not noise** — 20 HP is all the dummy has.
+
+Also watch the per-component reward log — if win-rate stalls or the agent spins or
+runs away, the components catch reward hacking before you blame the learner. If Q
+diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
+
+**Any checkpoint currently in `runs/` is from the dead-damage-channel era.** Do not
+use one as a baseline, a warm start, or a demo. The post-repair re-baseline (T14, 3
+pinned seeds) is the first trustworthy reference point.
 
 ---
 
@@ -323,12 +492,16 @@ If Q diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
 
 | Milestone | Command | Pass condition | AC |
 |-----------|---------|----------------|-----|
+| Damage-channel gate | `eval.combat_probe --cycles 10` | per-hit `6,6,6,2`, cumulative 20, one death, reconciles with wire health | AC8 |
 | M1 plumbing | `eval.run_random --episodes 100` | ≥100 eps, 0 crashes, RSS < 200 MB | AC3 |
-| M1 number | `eval.benchmark --duration 600` | transitions/s, p99, damage-exact, max-arenas@19TPS | AC4 |
-| Multi-arena live run | `start-arenas.ps1 -Arenas N` + `eval.benchmark --arenas N` | max N sustaining ≥19 TPS (live-measured); `agent.train --arenas N` runs training | AC4 follow-up |
+| M1 smoke + spectate | `eval.run_random --episodes 20` | 0 crashes, damage actually lands | AC10 |
+| M1 number | `eval.benchmark --duration 600` | transitions/s, p99, damage-exact, TPS | AC4 |
+| Pad fleet boot | `start-pads.sh --pads N` | 2N bots joined, opped, staggered, primed | AC12 |
+| Cross-pad isolation | `eval.benchmark --arenas N --pad-log-dir …` **against a resetting fleet** | per-pad damage reconciles, zero foreign usernames — the scan half needs resets, so a benchmark-only run does not collect it | AC13 |
+| Scale ladder | the eight rungs above | all five metrics per rung; promoted N recorded | AC14 |
 | Recurrence | `pytest tests/test_dqn.py -k memory` | memory fixture green, ablation fails | TC8b |
 | M2 learning | `agent.train --checkpoint runs/m2.pt` | win ≥95%, aim-while-invisible == 0, len < cap | AC6 |
 
 After M2 passes, the M3/M4 ladder (scripted bot → self-play/PFSP/Elo) is the
-next horizon. `distributed/` is now built (issue #4); `deploy/` and `study/`
+next horizon. `distributed/` is built (issue #4); `deploy/` and `study/`
 remain skeleton-only and out of kickoff scope.

@@ -151,8 +151,9 @@ class TermInfo:
         lost: True iff the episode ended with the learner losing (learner died).
             Adds ``−R_terminal_loss``. Takes precedence over ``won``.
         timeout: True iff the episode ended on the step/time cap. Adds
-            ``R_terminal_timeout`` — a penalty by default (kiting/avoiding combat
-            is the worst outcome), not a neutral draw. See ``RewardConfig``.
+            ``R_terminal_timeout`` — a real penalty by default, not a neutral
+            draw, but strictly milder than a scored loss: running out the
+            clock is never worse than dying. See ``RewardConfig``.
     """
 
     done: bool = False
@@ -395,7 +396,8 @@ def compute_reward(
         (guards AC6 / TC6 spin-farming).
       - **Terminal**: applied only when ``terminal.done``; loss ``−R_terminal_loss``
         (precedence over win), win ``+R_terminal_win``, timeout
-        ``R_terminal_timeout`` (a penalty by default — kiting is the worst outcome).
+        ``R_terminal_timeout`` (a real penalty by default, not a draw, but
+        strictly milder than a scored loss — see ``RewardConfig``).
       - **Positional shaping**: potential-based ``F = γ·Φ(gated_obs) − Φ(prev_obs)``
         with ``γ = cfg.gamma``; a no-op while ``cfg.c_approach == 0.0`` and
         provably policy-invariant for any Φ.

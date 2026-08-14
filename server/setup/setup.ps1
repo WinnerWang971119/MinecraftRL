@@ -6,8 +6,9 @@
   Prepares server/ to run a Paper 1.21.1 build 133 instance tuned for the PvP
   RL training arena:
 
-    1. Downloads paper-1.21.1-133.jar from the PaperMC v2 API (skipped if the
-       jar already exists, unless -Force is passed).
+    1. Downloads paper-1.21.1-133.jar from PaperMC and verifies its SHA-256
+       (download skipped if the jar already exists unless -Force is passed, but
+       the digest is checked on every run either way).
     2. Writes eula.txt with eula=true (accepting Mojang's EULA — this is a
        deliberate, recorded action; running the server implies acceptance).
     3. Writes server.properties tuned for headless, deterministic, low-overhead
@@ -30,7 +31,8 @@
 
 .PARAMETER McPort
   Minecraft server-port written into server.properties. Defaults to 25565 (the
-  single-arena default). Multi-arena callers pass 25565+i (see start-arenas.ps1).
+  single-arena default). The pad topology keeps ONE JVM on 25565; this parameter
+  survives for a hand-stamped alternate root.
 
 .PARAMETER WorldName
   level-name / world directory written into server.properties. Defaults to
@@ -57,14 +59,21 @@
       -LearnerUsername learner_1 -DummyUsername dummy_1 -ArenaId 1
 
 .NOTES
-  Prerequisites: Java 21+ (this machine has Java 25 — see server/compat_check.md).
+  Prerequisites: Java 21 for start.ps1 — NOT a newer JDK. Paper 1.21.1 boots on
+  Java 26 and then dies with a native SIGSEGV in the bundled spark profiler
+  seconds after it reports "Done". See server/compat_check.md.
   Pinned by Tv: Paper 1.21.1 build 133, channel STABLE.
+
+  NOTE: unlike setup.sh, this script does not yet write bukkit.yml
+  (connection-throttle: -1). That matters only for a cross-host bridge fleet;
+  loopback is exempt from the throttle regardless. See setup.sh.
 
   Backward compatibility: with NO new args this script behaves exactly as
   before (single arena, port 25565, world 'world', usernames learner_bot /
   dummy_bot, plus the jar download, eula, and datapack install). The new
-  parameters and the ops.json write are ADDITIVE; start-arenas.ps1 reuses this
-  script to stamp each per-arena root.
+  parameters and the ops.json write are ADDITIVE. NOTE: the N-JVM orchestrator
+  that used to drive them (start-arenas.ps1) is gone -- the pad fleet runs ONE JVM
+  and is launched from server/setup/start-pads.sh on macOS/Linux.
 #>
 
 [CmdletBinding()]
@@ -85,7 +94,18 @@ $ErrorActionPreference = 'Stop'
 $PaperVersion = '1.21.1'
 $PaperBuild   = '133'
 $JarName      = "paper-$PaperVersion-$PaperBuild.jar"
-$DownloadUrl  = "https://api.papermc.io/v2/projects/paper/versions/$PaperVersion/builds/$PaperBuild/downloads/$JarName"
+
+# PaperMC retired the v2 download API — it now answers 410 Gone, so the old
+# api.papermc.io/v2/... URL simply does not work any more. The v3 "fill" API
+# replaces it and serves content-addressed artifacts. The pin is unchanged:
+# same project, same version, same build 133, same STABLE channel, same jar
+# name. The URL and digest below are exactly what this endpoint reports:
+#   https://fill.papermc.io/v3/projects/paper/versions/1.21.1/builds/133
+# (metadata commit 3cb8529bd..., matching the server's own 1.21.1-133-ver
+# /1.21.1@3cb8529 boot banner). Pinning the digest is strictly stronger than
+# the old build-number URL: the jar either hashes to this value or setup fails.
+$PaperSha256  = '39bd8c00b9e18de91dcabd3cc3dcfa5328685a53b7187a2f63280c22e2d287b9'
+$DownloadUrl  = "https://fill-data.papermc.io/v1/objects/$PaperSha256/$JarName"
 
 # Bot accounts that must be opped (mirror bridge/bot.js DEFAULT_BOT_CONFIG and
 # server/ops.json). Recorded here only for the operator-facing summary.
@@ -163,8 +183,21 @@ Write-Host "[setup] Paper jar        : $JarName"
 Write-Host "[setup] Download URL     : $DownloadUrl"
 
 # --- 1. Download the Paper jar (idempotent) --------------------------------
+# The digest is checked on EVERY run, not only the run that downloads. A jar
+# that is already on disk can be corrupt, a leftover from the old (now dead) v2
+# URL, hand-copied, or tampered with — and start.ps1 would execute it either way.
 if ((Test-Path -LiteralPath $JarPath) -and (-not $Force)) {
-    Write-Host "[setup] Jar already present, skipping download (use -Force to refresh)."
+    $existingHash = (Get-FileHash -LiteralPath $JarPath -Algorithm SHA256).Hash
+    if ($existingHash -ne $PaperSha256) {
+        Write-Host "[setup] SHA-256 MISMATCH on the existing $JarName - refusing to use it."
+        Write-Host "[setup]   expected $($PaperSha256.ToUpperInvariant())"
+        Write-Host "[setup]   actual   $existingHash"
+        Write-Host "[setup]   path     $JarPath"
+        Write-Host "[setup] This jar is not Paper $PaperVersion build $PaperBuild. Delete it, or"
+        Write-Host "[setup] re-run with -Force to replace it with the pinned build."
+        throw "Paper jar checksum mismatch at $JarPath"
+    }
+    Write-Host "[setup] Jar already present, sha256 verified (use -Force to refresh)."
 }
 else {
     Write-Host "[setup] Downloading Paper jar ..."
@@ -172,8 +205,16 @@ else {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
     $tmp = "$JarPath.partial"
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $tmp -UseBasicParsing
+    $actualHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    if ($actualHash -ne $PaperSha256) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Write-Host "[setup] SHA-256 mismatch for $JarName."
+        Write-Host "[setup]   expected $($PaperSha256.ToUpperInvariant())"
+        Write-Host "[setup]   actual   $actualHash"
+        throw "Paper jar download failed checksum verification"
+    }
     Move-Item -LiteralPath $tmp -Destination $JarPath -Force
-    Write-Host "[setup] Saved $JarName ($([math]::Round((Get-Item -LiteralPath $JarPath).Length / 1MB, 1)) MB)."
+    Write-Host "[setup] Saved $JarName ($([math]::Round((Get-Item -LiteralPath $JarPath).Length / 1MB, 1)) MB, sha256 verified)."
 }
 
 # --- 2. eula.txt -----------------------------------------------------------
@@ -207,6 +248,15 @@ prevent-proxy-connections=false
 enforce-secure-profile=false
 
 # --- World generation (flat, deterministic) ---
+# DO NOT "FIX" generator-settings={}. It does not parse; Paper logs
+#   ERROR: No key layers in MapLike[{}]
+# at world creation and falls back to the DEFAULT flat preset. That fallback is
+# the intended, empirically verified world: grass_block y=-61, dirt y=-62/-63,
+# bedrock y=-64 everywhere, including outside the arena pad. With
+# `gamerule fallDamage false` that is why walking off the y=63 platform STRANDS
+# the agent alive at y=-60 instead of killing it. Column scan and consequences:
+# server/compat_check.md. Supplying real layers would change world topology and
+# invalidate that analysis. Leave it exactly as it is.
 level-name=$WorldName
 level-type=minecraft:flat
 level-seed=$LevelSeed

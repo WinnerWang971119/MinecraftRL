@@ -965,45 +965,64 @@ def _patch_main_for_live(monkeypatch, ticks, *, wall_per_step):
 
 
 def test_main_tps_gate_reflects_real_dip(monkeypatch, capsys):
-    """main() exits non-zero on a real TPS dip — the gate is NOT silently true.
+    """main() exits non-zero on a real, SUSTAINED TPS dip.
 
-    Scripts a tick cadence that stalls for one window (dtick=0 -> 0 TPS) so the
-    live tick-delta provider produces a genuine sub-19 reading. main() must exit
-    1 and the damage gate must be reported INERT (loud banner), proving exit code
-    reflects gates that actually ran rather than defaulting to pass.
+    main() hardcodes ``TickDeltaTpsProvider`` with its DEFAULT rolling window
+    (``TPS_ROLL_WINDOW_S`` == 5s), so a scripted dip must actually span that
+    long to stop reading as warm-up -- a short stall (as this test used to
+    script, together with a tiny ``--duration``) never leaves warm-up and
+    reads a neutral 19.0 the whole run, so this scenario used to pass exit 1
+    only because an inert damage gate ALSO forced a failure regardless of
+    what the TPS gate saw. Now that an inert gate no longer forces a failure
+    (see ``test_main_damage_inert_gate_does_not_force_failure``), the TPS gate
+    has to be the genuine reason -- so the world age here is a frozen tick
+    held long enough to clear the rolling window, driving a real ``0.0`` TPS
+    reading once the window fills.
     """
-    # Healthy then a stall: 1,2,3,3,4 -> the repeat is a real dip.
-    clock = _patch_main_for_live(
-        monkeypatch, ticks=[1, 2, 3, 3, 4], wall_per_step=0.050
-    )
-    # Tiny duration: the wall clock (advanced 50 ms per recv) trips the deadline
-    # after a few decisions, so the run terminates without a real-time wait.
-    rc = main(["--duration", "0.18", "--arenas", "1"])
+    # Constant tick forever (a frozen world age -- the clamp in
+    # _ScriptedLiveBridge.recv repeats the last scripted value once exhausted,
+    # so a single-element list is a permanent stall).
+    clock = _patch_main_for_live(monkeypatch, ticks=[1], wall_per_step=0.050)
+    # 6 fake-seconds at 50ms/step is ~120 decisions -- comfortably past the 5s
+    # rolling window, and still instant in real wall time: the scripted bridge
+    # never sleeps, only the FakeClock advances.
+    rc = main(["--duration", "6.0", "--arenas", "1"])
     err = capsys.readouterr().err
     assert rc == 1
     assert "FAIL" in err
-    # The TPS gate caught the dip OR the inert-damage gate forced the failure;
-    # either way exit is non-zero and the damage gate is explicitly inert.
+    assert "did not sustain >=19 TPS" in err
+    # The damage gate is ALSO inert here (this entry point never scripts it);
+    # the banner still fires, but per the fix it must not be why this failed.
     assert "INERT" in err
 
 
-def test_main_damage_gate_not_silently_true(monkeypatch, capsys):
-    """Even with healthy TPS, main() never exits 0 on the inert damage gate.
+def test_main_damage_inert_gate_does_not_force_failure(monkeypatch, capsys):
+    """Healthy TPS + an inert damage gate exits 0 -- the banner explains why.
 
-    The live run cannot script a known-N-hit exchange, so the damage-boundary
-    gate does not run. main() must NOT default it to pass: it prints a LOUD inert
-    banner and exits 1, so exit 0 can never falsely imply the damage check ran.
+    This entry point can never script a known-N-hit exchange (there is no
+    ``expected_hits`` CLI flag -- a live run cannot know N a priori), so the
+    damage-boundary gate is ALWAYS inert here. The gate used to be forced to
+    "failed" whenever it was inert, which made exit 0 unreachable from this
+    entry point at all -- directly contradicting the banner's own text ("Exit
+    0 here reflects the TPS gate ONLY"). A gate that never ran cannot be
+    graded, so it is now EXCLUDED from the pass/fail decision rather than
+    forced to fail: the loud banner still prints, and the printed JSON stamps
+    ``damage_boundary.inert = true`` explicitly, so the artifact still records
+    that the check did not run even though it no longer blocks a pass. A gate
+    that DID run and failed is a different case, covered by
+    ``test_main_damage_gate_not_silently_true``'s sibling in
+    tests/test_pad_isolation.py's exit-code coverage.
     """
     # A perfectly healthy cadence: +1 tick per 50 ms -> 20 TPS sustained.
     clock = _patch_main_for_live(
         monkeypatch, ticks=[1, 2, 3, 4, 5, 6], wall_per_step=0.050
     )
     rc = main(["--duration", "0.18", "--arenas", "1"])
-    err = capsys.readouterr().err
-    # TPS sustained, but the damage gate is inert -> NOT a pass.
-    assert rc == 1
-    assert "INERT" in err
-    assert "damage-boundary gate did not run" in err
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert "INERT" in err  # the banner still fires
+    assert "FAIL" not in err  # but no longer forces a failure
+    assert '"inert": true' in out  # explicit, machine-readable, in the JSON
 
 
 # ===========================================================================

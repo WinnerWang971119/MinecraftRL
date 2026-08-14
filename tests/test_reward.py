@@ -2,7 +2,13 @@
 
 These tests pin the finalized reward (spec §7 / training-spec §3):
 
-  TC5 — reward matches the formula on hand-authored event dicts + obs vectors,
+  NOTE on TC5 numbering: this module label predates the damage-channel-fix /
+  pad-topology plan and its own TC5 (the terminal-invariant tests near the
+  "TC5 — terminal invariant" section below, added for that later plan's AC6).
+  The two TC5s are unrelated test cases from different plans that happen to
+  share a label; neither has been renumbered.
+
+  TC5 (this plan) — reward matches the formula on hand-authored event dicts + obs vectors,
         and the aim bonus is added ONLY when visible AND in_crosshair (all four
         combinations of visible × in_crosshair are checked).
 
@@ -81,8 +87,9 @@ def test_default_config_reproduces_combat_reward_shape():
     """The frozen defaults are the tuned combat-reward shape (see RewardConfig).
 
     Win dominates (+50), damage dealt is weighted 2x damage taken so combat is
-    net-positive (1.0 vs 0.5 per HP = +2 vs -1 per heart), and a timeout is the
-    worst outcome (-30) to punish kiting.
+    net-positive (1.0 vs 0.5 per HP = +2 vs -1 per heart), and a timeout (-15)
+    is a real penalty but always strictly better than a scored loss (-30), so
+    the agent never prefers dying to running out the clock.
     """
     cfg = RewardConfig()
     assert cfg.c_dmg_out == 1.0
@@ -91,10 +98,10 @@ def test_default_config_reproduces_combat_reward_shape():
     assert cfg.c_step == 0.005  # finalized step penalty (T17)
     assert cfg.c_aim == 0.01
     assert cfg.R_terminal_win == 50.0
-    assert cfg.R_terminal_loss == 8.0
-    assert cfg.R_terminal_timeout == -30.0
+    assert cfg.R_terminal_loss == 30.0
+    assert cfg.R_terminal_timeout == -15.0
     assert cfg.R_terminal_win > cfg.R_terminal_loss  # winning beats fear of losing
-    assert cfg.R_terminal_timeout < -cfg.R_terminal_loss  # timeout worse than a loss
+    assert cfg.R_terminal_timeout > -cfg.R_terminal_loss  # timeout beats a scored loss
     assert cfg.gamma == 0.99
     assert cfg.c_approach == 0.0  # shaping is a no-op by default
 
@@ -425,7 +432,15 @@ def test_compute_reward_equals_sum_of_components_random():
             c_aim=float(rng.uniform(0.0, 0.05)),
             R_terminal_win=float(rng.uniform(5.0, 10.0)),
             R_terminal_loss=float(rng.uniform(5.0, 10.0)),
-            R_terminal_timeout=0.0,
+            # Must stay strictly between -R_terminal_loss and 0. The binding
+            # lower bound is -5.0, not -10.0: R_terminal_loss is drawn from
+            # uniform(5.0, 10.0) above, so -R_terminal_loss is at most -5.0
+            # (its least negative possible value), which is what actually
+            # constrains this draw. -4.99 clears that bound with margin
+            # regardless of which R_terminal_loss value was drawn; widening
+            # the loss range's lower bound below 5.0 would require narrowing
+            # this range's lower bound too.
+            R_terminal_timeout=float(rng.uniform(-4.99, -0.01)),
             gamma=float(rng.uniform(0.9, 1.0)),
             c_approach=float(rng.choice([0.0, rng.uniform(0.1, 1.0)])),
         )
@@ -486,3 +501,101 @@ def test_nonfinite_position_does_not_poison_shaping():
     # Φ(obs) is guarded to 0 (non-finite) → shaping = γ·0 − Φ(prev), finite.
     assert np.isfinite(comps["r_shaping"])
     assert np.isfinite(compute_reward(_events(), obs, prev, _nonterminal(), cfg))
+
+
+# ---------------------------------------------------------------------------
+# TC5 (damage-channel-fix / pad-topology plan) — terminal invariant: ordering,
+# sign semantics, finiteness (AC6). Distinct from the module-docstring TC5
+# above, which is this file's older, unrelated numbering.
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_invariant_accepts_the_default_config():
+    """The frozen defaults satisfy the terminal invariant without raising."""
+    cfg = RewardConfig()
+    assert cfg.R_terminal_win == 50.0
+    assert cfg.R_terminal_loss == 30.0
+    assert cfg.R_terminal_timeout == -15.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"R_terminal_win": 0.0}, r"R_terminal_win must be strictly positive"),
+        ({"R_terminal_win": -1.0}, r"R_terminal_win must be strictly positive"),
+        ({"R_terminal_loss": 0.0}, r"R_terminal_loss must be strictly positive"),
+        ({"R_terminal_loss": -1.0}, r"R_terminal_loss must be strictly positive"),
+        ({"R_terminal_timeout": 0.0}, r"R_terminal_timeout must be strictly negative"),
+        ({"R_terminal_timeout": 1.0}, r"R_terminal_timeout must be strictly negative"),
+    ],
+    ids=[
+        "win_zero",
+        "win_negative",
+        "loss_zero",
+        "loss_negative",
+        "timeout_zero",
+        "timeout_positive",
+    ],
+)
+def test_terminal_invariant_rejects_sign_violations(kwargs, match):
+    """Sign semantics are enforced independently of ordering: win/loss must be
+    strictly positive, timeout must be strictly negative. ``match`` pins each
+    case to its own sign clause so this test would fail if the ordering clause
+    fired instead (they are checked in sequence and raise independently)."""
+    with pytest.raises(ValueError, match=match):
+        dataclasses.replace(RewardConfig(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        # timeout at or below -R_terminal_loss: a scored loss must stay the
+        # worst outcome, so a deliberate death must never look preferable to
+        # simply running out the clock. (Note: win > timeout is already
+        # implied by the sign checks alone, since win is forced strictly
+        # positive and timeout strictly negative — so the only genuinely
+        # independent ordering edge is this lower bound.) ``match`` pins each
+        # case to the ordering clause specifically (not a sign clause) and to
+        # the offending timeout value, so this would fail if a sign check
+        # fired instead or the wrong operand tripped it.
+        (
+            {"R_terminal_loss": 8.0, "R_terminal_timeout": -30.0},
+            r"RewardConfig terminal ordering violated.*R_terminal_timeout=-30\.0",
+        ),
+        (
+            {"R_terminal_loss": 15.0, "R_terminal_timeout": -15.0},
+            r"RewardConfig terminal ordering violated.*R_terminal_timeout=-15\.0",
+        ),
+    ],
+    ids=["timeout_below_neg_loss", "timeout_equals_neg_loss"],
+)
+def test_terminal_invariant_rejects_ordering_violations(kwargs, match):
+    """-R_terminal_loss < R_terminal_timeout < R_terminal_win must hold strictly."""
+    with pytest.raises(ValueError, match=match):
+        dataclasses.replace(RewardConfig(), **kwargs)
+
+
+def test_terminal_invariant_rejects_the_old_configuration():
+    """Regression guard: the superseded (win=50, loss=8, timeout=-30) shape must
+    now raise, since it let a deliberate death beat running out the clock.
+    ``match`` confirms the ordering clause fired specifically (loss=8 and
+    timeout=-30 each pass their own sign check in isolation), not a sign
+    check, and ties it to the offending values."""
+    with pytest.raises(
+        ValueError,
+        match=r"RewardConfig terminal ordering violated.*R_terminal_timeout=-30\.0.*R_terminal_win=50\.0",
+    ):
+        RewardConfig(R_terminal_win=50.0, R_terminal_loss=8.0, R_terminal_timeout=-30.0)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize(
+    "field", ["R_terminal_win", "R_terminal_loss", "R_terminal_timeout"]
+)
+def test_terminal_invariant_rejects_non_finite_values(field, bad):
+    """inf, -inf, and nan are all rejected for every terminal field. ``match``
+    ties this to the finiteness clause specifically (not a sign or ordering
+    clause) and to the named field, since bad is non-finite in all three
+    directions and could otherwise coincidentally satisfy a sign check."""
+    with pytest.raises(ValueError, match=rf"RewardConfig\.{field} must be finite"):
+        dataclasses.replace(RewardConfig(), **{field: bad})

@@ -1,19 +1,23 @@
-# arena:setup — one-time arena preparation (datapack namespace "arena").
+# arena:setup — one-shot GLOBAL world preparation (datapack namespace "arena").
 #
-# Run ONCE per server boot (or whenever the arena needs re-flattening). It:
-#   - sets the world rules that keep the MDP fully-observed and deterministic,
-#   - clears any ambient entities,
-#   - lays a clean flat play surface around spawn so both bots stand on solid
-#     ground and never fall into the void.
+# Takes NO arguments. Run ONCE per server boot. It sets only WORLD-WIDE state:
+# gamerules, time, weather, and the world spawn. Per-pad geometry lives in the
+# arena:setup_pad macro and is NOT world-wide.
 #
-# The bridge's reset RPC (bridge/bot.js handleReset / T7a) does NOT call this
-# every episode — it calls arena:spawn_learner and arena:spawn_dummy. This file
-# is the once-per-boot scaffolding. Invoke from the console or from arena:load:
-#     /function arena:setup
+# For backward compatibility with the single-arena path (plan AC11) this also
+# builds pad 0 at anchor (0, 0), which is exactly what this file did before the
+# pad topology existed and is exactly padAnchor(0).
 #
-# Coordinates: spawn template is learner [0.5,64,0.5], dummy [3.5,64,0.5]
-# (matches bridge/bot.js resetTemplate.position and the +3 X offset for dummy).
-# The floor is y=63 (one block below feet at y=64).
+# Fleet boot sequence (N pads):
+#     /function arena:setup                     # once: gamerules + pad 0
+#     /function arena:setup_pad {x:..,z:..}     # once per pad i > 0
+#
+# Every anchor passed above comes from T10's padAnchor(i), which is the SOLE
+# coordinate source. No anchor value and no coordinate formula is reproduced
+# anywhere in this datapack, deliberately — they would be a copy of a number
+# T10 owns, free to drift.
+#
+# arena:load invokes this automatically on datapack load / /reload.
 
 # --- World rules: fully-observed, deterministic, no surprises ---
 gamerule doMobSpawning false
@@ -25,7 +29,11 @@ gamerule keepInventory true
 gamerule doImmediateRespawn true
 gamerule announceAdvancements false
 gamerule showDeathMessages false
-gamerule naturalRegeneration true
+# naturalRegeneration MUST stay false. With it on, the dummy heals between
+# cooled hits, which (a) makes a dummy that cannot die net-positive to farm and
+# (b) turns the combat probe's exact per-hit deltas into false negatives on a
+# CORRECT implementation. See plan AC8/AC18.
+gamerule naturalRegeneration false
 gamerule randomTickSpeed 0
 gamerule spawnRadius 0
 gamerule fallDamage false
@@ -37,20 +45,12 @@ gamerule freezeDamage false
 time set day
 weather clear 1000000
 
-# --- Clear stray entities (anything that is not a player) near the arena ---
-# Radius 64 around the learner spawn covers the whole play area.
-kill @e[type=!minecraft:player,x=0,y=64,z=0,distance=..64]
-
-# --- Lay a clean flat floor + clear the air above it around both spawns ---
-# Floor at y=63, a 24x24 pad centered between the two spawns; air for 8 blocks up.
-fill -8 63 -12 16 63 12 minecraft:smooth_stone replace
-fill -8 64 -12 16 71 12 minecraft:air replace
-
-# --- Optional bedrock under-floor so nothing can dig/fall through to the void ---
-fill -8 62 -12 16 62 12 minecraft:bedrock replace
-
-# --- Set the world spawn to the learner spawn so fresh joins land in-arena ---
+# --- World spawn = pad 0's anchor, so a fresh join lands in a real arena. ---
+#     Per-bot spawnpoints are set every reset by arena:reset_pad; this is only
+#     the fallback for a bot that joins before its first reset.
 setworldspawn 0 64 0
 
-# Audit line in the server console / ops chat.
-tellraw @a {"text":"[arena] setup complete: floor laid, gamerules set, entities cleared.","color":"green"}
+# --- Build pad 0 (anchor 0,0). Idempotent; safe to re-run. ---
+function arena:setup_pad {x:0,z:0}
+
+tellraw @a {"text":"[arena] setup complete: gamerules set (naturalRegeneration OFF), pad 0 built and enclosed.","color":"green"}

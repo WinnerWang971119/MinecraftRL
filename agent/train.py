@@ -1456,7 +1456,9 @@ def _close_quietly(env: Any) -> None:
 #     + N SnapshotPolicy collectors, one per arena, each over its own MCPvPEnv
 #       on bridge port base+i (the N bridges/servers are started by the human;
 #       T8 only connects clients)
-#     + an ActorPool supervising the N collector daemons (relaunch via launcher)
+#     + an ActorPool supervising the N collector daemons under the two-tier fault
+#       policy (a dead pad's bridge is restarted via the launcher; a dead shared
+#       Paper JVM aborts the whole run — there is no survivor floor)
 #     + a LearnerLoop on a background thread (the SOLE replay mutator)
 #
 # Periodic GREEDY eval runs on ONE designated arena (arena 0) via the collector
@@ -1618,6 +1620,10 @@ def train_multi_arena(
     relaunch_backoff_max_seconds: Optional[float] = None,
     sleep: Optional[Callable[[float], None]] = None,
     watchdog: Optional[Any] = None,
+    jvm_probe: Optional[Callable[[str, int], bool]] = None,
+    mc_host: Optional[str] = None,
+    mc_port: Optional[int] = None,
+    launcher_shutdown: Optional[Any] = None,
 ) -> MultiArenaResult:
     """Train one learner from ``cfg.arenas`` concurrent collectors (Ape-X-lite).
 
@@ -1645,7 +1651,9 @@ def train_multi_arena(
         cfg: Training hyperparameters. ``cfg.arenas`` (> 1) sets the collector count;
             ``cfg.weight_sync_every_k_steps`` the publish cadence;
             ``cfg.collector_queue_max`` the transport bound (0 == unbounded);
-            ``cfg.fault_relaunch`` / ``cfg.fault_min_live_arenas`` the fault policy.
+            ``cfg.fault_relaunch`` arms tier 1 of the fault policy (restart a dead
+            pad's own bridge). Tier 2 — a dead shared JVM aborts the run — is armed
+            by ``jvm_probe``, not by config; there is no survivor floor.
         env_factory_for: ``arena_id -> (zero-arg env builder)``; the builder returns a
             fresh connected env on that arena's bridge (see :data:`EnvFactoryFor`).
         launcher: The :class:`~distributed.actor.ArenaLauncher` the pool relaunches a
@@ -1684,6 +1692,20 @@ def train_multi_arena(
             sleeping; ``None`` uses the actor module defaults).
         watchdog: Optional :class:`~distributed.learner.LearnerWatchdog` for the
             learner loop; ``None`` uses a default watchdog so a wedged learner aborts.
+        jvm_probe: Optional ``(host, port) -> bool`` liveness check for the SHARED
+            Paper JVM — tier 2 of the fault policy. ``None`` (the default) means no
+            JVM supervision, which is what an offline pool of fake envs wants; the
+            live path passes :func:`distributed.actor.jvm_alive`. A ``False`` from it
+            aborts the whole run with :class:`~distributed.actor.PoolAbortedError`.
+            REQUIRED when ``is_live`` — an unsupervised live run is rejected.
+        mc_host / mc_port: Where that JVM listens. Defaults come from
+            ``distributed.actor``; pass the SAME values the ``launcher`` was built
+            with so the probe and the launcher can never watch different ports.
+        launcher_shutdown: Optional
+            :class:`~distributed.actor.ShutdownSignal` whose ``sleep`` was injected
+            into the ``launcher``. The pool sets it on stop/abort so a collector
+            parked inside a bridge relaunch unwinds at once instead of holding
+            shutdown for the launcher's full bounded wait.
 
     Returns:
         A :class:`MultiArenaResult` with the trainer, the gate verdict, the grad-step
@@ -1691,9 +1713,11 @@ def train_multi_arena(
 
     Raises:
         ValueError: if ``cfg.arenas`` < 2 (use ``train_vs_dummy`` for N=1), or
-            ``designated_arena`` is out of range, or ``eval_episodes`` <= 0.
+            ``designated_arena`` is out of range, or ``eval_episodes`` <= 0, or
+            ``is_live`` is set without a ``jvm_probe``.
         LearnerError: if the background learner thread aborts (re-raised loudly).
-        PoolAbortedError: if live arenas drop below ``cfg.fault_min_live_arenas``.
+        PoolAbortedError: if the shared Paper JVM dies mid-run (tier 2). A dead pad
+            never raises: its bridge is restarted in place.
     """
     import threading as _threading
     import time
@@ -1723,6 +1747,18 @@ def train_multi_arena(
     if eval_every_grad_steps < 0:
         raise ValueError(
             f"eval_every_grad_steps must be >= 0, got {eval_every_grad_steps}"
+        )
+    if is_live and jvm_probe is None:
+        # A LIVE run with no tier 2 is a configuration the fault policy says must not
+        # exist: the shared Paper JVM could die and every pad would sit restarting
+        # bridges into nothing, forever, while the learner trained on a world that is
+        # gone. Refuse at construction rather than discover it during the incident.
+        raise ValueError(
+            "train_multi_arena(is_live=True) requires a jvm_probe: a live fleet has "
+            "a shared Paper JVM whose death must abort the run (tier 2 of the fault "
+            "policy). Pass jvm_probe=distributed.actor.jvm_alive together with the "
+            "mc_port the launcher was built with. jvm_probe=None is for OFFLINE runs "
+            "over fake envs, which have no JVM to lose."
         )
 
     def _emit(message: str) -> None:
@@ -1792,6 +1828,17 @@ def train_multi_arena(
         actor_kwargs["relaunch_backoff_max_seconds"] = relaunch_backoff_max_seconds
     if sleep is not None:
         actor_kwargs["sleep"] = sleep
+    # Two-tier fault policy (T11). Each of these is omitted rather than passed as
+    # None so the pool keeps its own documented defaults; jvm_probe=None there means
+    # "no JVM supervision", which is exactly right for a pool of fake envs.
+    if jvm_probe is not None:
+        actor_kwargs["jvm_probe"] = jvm_probe
+    if mc_host is not None:
+        actor_kwargs["mc_host"] = mc_host
+    if mc_port is not None:
+        actor_kwargs["mc_port"] = mc_port
+    if launcher_shutdown is not None:
+        actor_kwargs["shutdown"] = launcher_shutdown
     pool = ActorPool.build(**actor_kwargs)
 
     # --- the decoupled learner loop (the SOLE replay mutator) ----------------
@@ -1833,10 +1880,11 @@ def train_multi_arena(
         logger.log({"train/epsilon_mean": float(global_eps)}, step=int(grad_step))
 
     _emit(
-        f"[multi] starting {cfg.arenas} arenas - "
+        f"[multi] starting {cfg.arenas} pads - "
         f"weight_sync_every_k={cfg.weight_sync_every_k_steps}, "
         f"queue_max={cfg.collector_queue_max}, "
-        f"fault_min_live={cfg.fault_min_live_arenas}, "
+        f"bridge_restart={'on' if cfg.fault_relaunch else 'OFF'}, "
+        f"jvm_watch={'on' if jvm_probe is not None else 'off'}, "
         + (
             f"eval every {eval_every_grad_steps} grad steps on arena {designated_arena}"
             if do_eval
@@ -1966,6 +2014,14 @@ def train_multi_arena(
 # proved by tests/test_integration_m2.py; this entry point is the LIVE run.
 # ---------------------------------------------------------------------------
 
+#: The SHARED Minecraft port: ONE JVM serves every pad, so this is a port, not a
+#: base. Declared here rather than imported because ``distributed.actor`` imports
+#: FROM this module (a top-level import back would be a cycle) and the parser is
+#: built on the single-arena path too, which must not pay for the distributed
+#: stack. It MUST equal ``distributed.actor.MC_PORT`` and ``server.properties``'
+#: ``server-port``; tests/test_actor_pool.py pins the two against each other.
+_DEFAULT_MC_PORT: int = 25565
+
 
 def _build_parser() -> "Any":
     import argparse
@@ -2015,13 +2071,22 @@ def _build_parser() -> "Any":
         "this is the BASE port: arena i connects to port + i.",
     )
     parser.add_argument(
+        "--mc-port", type=int, default=_DEFAULT_MC_PORT,
+        help=f"the SHARED Minecraft port for --arenas >1 (default: {_DEFAULT_MC_PORT}). One JVM "
+        "serves every pad, so this is a single port, not a base. It is used for "
+        "two things that must agree: the launcher's precondition check before it "
+        "restarts a pad's bridge, and the jvm_alive() watchdog whose failure aborts "
+        "the whole run.",
+    )
+    parser.add_argument(
         "--arenas", type=int, default=1,
         help="number of parallel Minecraft arenas to train from (default: 1). "
         "1 == today's exact single-env path (no threading, no weight sync). "
         ">1 engages the multi-arena ActorPool + decoupled learner: arena i "
-        "connects to bridge port (--port)+i. The N bridges/servers must already "
-        "be started (server/setup/start-arenas.ps1). This is the agent.train "
-        "TRAINING flag, distinct from eval.benchmark's measurement --arenas.",
+        "connects to bridge port (--port)+i. The N pads must already be booted "
+        "and PRIMED (server/setup/start-pads.sh --pads N, wait for FLEET READY). "
+        "This is the agent.train TRAINING flag, distinct from eval.benchmark's "
+        "measurement --arenas.",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -2075,6 +2140,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from eval.logging import MetricsLogger
 
+    from agent.reward_config import RewardConfig
     from env.mc_pvp_env import TcpBridgeClient
 
     args = _build_parser().parse_args(argv)
@@ -2084,6 +2150,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = dataclasses.replace(
         TrainConfig(), seed=int(args.seed), arenas=int(args.arenas)
     )
+
+    # Reward coefficients go into the run's own config so the run stays readable
+    # without them. `code_version` cannot stand in for this: its SHA half has no
+    # `--dirty`, and its `cfg` half hashes only version pins and timing constants,
+    # so two runs with different coefficients fingerprint identically. Every
+    # archived run paid for that — their coefficients had to be recovered by
+    # inverting logged component values. The env builds `RewardConfig()` itself
+    # (env/mc_pvp_env.py:438) and nothing overrides it, so these ARE the values
+    # this run scores with; if an override is ever added, read it from there.
+    reward_cfg = {
+        f"reward.{k}": v for k, v in dataclasses.asdict(RewardConfig()).items()
+    }
 
     logger = MetricsLogger(
         run_name=args.run_name,
@@ -2096,6 +2174,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_episodes": args.max_episodes,
             "eval_episodes": args.eval_episodes,
             "code_version": code_version(),
+            **reward_cfg,
         },
     )
 
@@ -2174,23 +2253,66 @@ def _main_multi_arena(
 ) -> int:
     """Live multi-arena (N>1) run: wire real clients + the subprocess launcher.
 
-    Constructs, per arena ``i``, an env factory that opens a
+    Constructs, per pad ``i``, an env factory that opens a
     :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port ``--port + i`` and wraps
     it in an :class:`~env.mc_pvp_env.MCPvPEnv`, then runs :func:`train_multi_arena`.
-    The N bridges/servers must ALREADY be started by the human
-    (``server/setup/start-arenas.ps1``); T8 only connects clients. The
+    The N pads must ALREADY be booted AND PRIMED by the human
+    (``server/setup/start-pads.sh --pads N``, which resets every pad before any pad
+    may step); T8 only connects clients. The
     :class:`~distributed.launcher.SubprocessArenaLauncher` is imported lazily here so
     the import is paid only on the N>1 path; if it is unavailable the run fails with a
-    clear message (the launcher is needed only to RELAUNCH a dead arena).
+    clear message (the launcher is needed only to RESTART a dead pad's bridge).
+
+    This is where the TWO-TIER FAULT POLICY is armed for a live run, and the only
+    place the two tiers are wired to the same numbers:
+
+      * ``--mc-port`` is handed to BOTH the launcher (which refuses to spawn a bridge
+        against an unreachable JVM) and the pool's :func:`~distributed.actor.jvm_alive`
+        watchdog (whose ``False`` aborts the run). One value, one meaning.
+      * A :class:`~distributed.actor.ShutdownSignal` is created HERE, before the
+        launcher, because the launcher takes its ``sleep`` at construction. The pool
+        sets it on stop/abort, so a shutdown that lands while a collector is inside
+        the launcher's bounded relaunch wait unwinds immediately rather than holding
+        the thread for the full wait.
 
     Returns the process exit code (0 == passed the M2 gate).
     """
     import sys
 
+    # Function-local, like the other distributed imports on this path:
+    # distributed.actor imports FROM agent.train, so a module-level import here
+    # would be a cycle.
+    from distributed.actor import ShutdownSignal, jvm_alive
+
     from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
 
     base_port = int(args.port)
     host = str(args.host)
+    mc_port = int(getattr(args, "mc_port", _DEFAULT_MC_PORT))
+
+    # THE MC PORT MUST NOT BE A BRIDGE PORT. Everything that probes the mc port
+    # CONNECTS to it — the tier-2 watchdog every few seconds, and the launcher's own
+    # precondition check before every bridge restart — and that is safe only because
+    # Paper is an ordinary multi-client server. BridgeServer is the opposite: it
+    # accepts exactly ONE TCP client and resolves a second by DESTROYING the
+    # incumbent. Point --mc-port at pad i's bridge and the watchdog evicts that pad's
+    # collector on a timer: it faults, recovers, is evicted again, forever, with
+    # nothing in the logs naming the cause. The launcher would also "confirm the JVM"
+    # by connecting to a bridge. The defaults (25565 vs 5555+i) are far apart; this
+    # closes the one hand-edited way to bring them together.
+    bridge_ports = range(base_port, base_port + int(cfg.arenas))
+    if mc_port in bridge_ports:
+        print(
+            f"[multi] FATAL: --mc-port {mc_port} falls inside the bridge port range "
+            f"{bridge_ports.start}..{bridge_ports.stop - 1} that --arenas "
+            f"{cfg.arenas} uses (pad i listens on --port + i). The Minecraft port and "
+            f"the bridge ports must be disjoint: a bridge accepts ONE client and "
+            f"destroys the incumbent when a second connects, so the JVM watchdog "
+            f"would silently evict pad {mc_port - base_port}'s collector on every "
+            f"probe. Aborting.",
+            file=sys.stderr,
+        )
+        return 1
 
     def _env_factory_for(arena_id: int) -> Callable[[], Any]:
         port = base_port + arena_id
@@ -2222,8 +2344,14 @@ def _main_multi_arena(
         )
         return 1
 
+    # The shutdown signal must exist BEFORE the launcher: the launcher takes its
+    # polling sleep as a constructor argument, and that sleep is the only hook that
+    # can interrupt its bounded wait from outside.
+    launcher_shutdown = ShutdownSignal()
     launcher = SubprocessArenaLauncher(
         bridge_base_port=base_port,
+        mc_port=mc_port,
+        sleep=launcher_shutdown.sleep,
     )
 
     def _log(message: str) -> None:
@@ -2244,6 +2372,13 @@ def _main_multi_arena(
         checkpoint_hook=checkpoint_hook,
         is_live=True,
         log=_log,
+        # Tier 2: the shared JVM, on the same port the launcher just got. The host
+        # is deliberately NOT --host (that is the BRIDGE host): the launcher spawns
+        # bridges as local child processes and probes the JVM on 127.0.0.1, so the
+        # watchdog uses actor.MC_HOST, which is the same loopback address.
+        jvm_probe=jvm_alive,
+        mc_port=mc_port,
+        launcher_shutdown=launcher_shutdown,
     )
 
     report = result.last_report
