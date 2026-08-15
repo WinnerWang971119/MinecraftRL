@@ -119,6 +119,34 @@ const DEFAULT_READBACK = Object.freeze({
   pollIntervalMs: 50,
 });
 
+// ---------------------------------------------------------------------------
+// OPPONENT SOURCE (T1). The bridge has exactly two kinds of opponent:
+//
+//   'bot'   — this pad's dummy Mineflayer bot (the training path). It has its
+//             OWN connection, so its health is readable and the damage channel
+//             works.
+//   'human' — a challenger who joined on their own client (the exhibition
+//             path). It is a player ENTITY in the learner's view and nothing
+//             more: there is no second connection, and mineflayer NEVER
+//             populates `entity.health` for anyone but the connected bot, so
+//             its health is simply not readable here.
+//
+// `healthSource` on the handle states which of those two worlds a call site is
+// in, so nobody "reads" a health that silently resolves to undefined.
+// ---------------------------------------------------------------------------
+
+/** Opponent is this pad's dummy Mineflayer bot (the M2/training default). */
+const OPPONENT_MODE_BOT = 'bot';
+
+/** Opponent is a human challenger's player entity (exhibition mode). */
+const OPPONENT_MODE_HUMAN = 'human';
+
+/** Health is readable from the opponent's own Mineflayer connection. */
+const OPPONENT_HEALTH_OWN_CONNECTION = 'own-connection';
+
+/** Health is NOT readable: the opponent has no connection of its own. */
+const OPPONENT_HEALTH_UNAVAILABLE = 'unavailable';
+
 /** Default offline-mode connection + identity config for the two bots. */
 const DEFAULT_BOT_CONFIG = Object.freeze({
   host: '127.0.0.1',
@@ -147,6 +175,13 @@ const DEFAULT_BOT_CONFIG = Object.freeze({
   // anchor is handed to this process on argv; padAnchor(i) lives in T10's
   // launcher and is deliberately not mirrored here.
   padIndex: 0,
+  // OPPONENT SOURCE (T1). Process-local, never on the wire. 'bot' is the
+  // training path and the default, so an omitted key reproduces today's
+  // behavior exactly. T3 (exhibition mode) is what sets 'human' in practice.
+  opponentMode: OPPONENT_MODE_BOT,
+  // The challenger's username in 'human' mode. null => the first player in the
+  // learner's entity view that is not one of THIS pad's own bots.
+  challengerUsername: null,
 });
 
 // ---------------------------------------------------------------------------
@@ -719,7 +754,13 @@ class ArenaBots {
 
     /** @type {object|null} The learner Mineflayer bot. */
     this.learner = null;
-    /** @type {object|null} The idle dummy Mineflayer bot. */
+    /**
+     * @type {object|null} The idle dummy Mineflayer bot. Stays null for the
+     * whole run in 'human' opponent mode — the challenger joins on their own
+     * client and there is no second connection to make. Read it directly only
+     * for BOT-lifecycle work (spawn, reset read-back, quit); every BEHAVIORAL
+     * read goes through _opponentHandle().
+     */
     this.dummy = null;
 
     // PAD IDENTITY (T9). Validated HERE, at construction, so a malformed anchor
@@ -733,6 +774,43 @@ class ArenaBots {
     });
     assertMacroUsername(this.config.learnerUsername, 'learnerUsername');
     assertMacroUsername(this.config.dummyUsername, 'dummyUsername');
+
+    // OPPONENT SOURCE (T1). Validated HERE, with the rest of the identity
+    // config, so a typo ('humans', 'HUMAN') fails at process start instead of
+    // silently resolving every behavioral read to the dummy bot for a whole
+    // exhibition — or to null for a whole training run.
+    const opponentMode =
+      this.config.opponentMode === undefined ? OPPONENT_MODE_BOT : this.config.opponentMode;
+    if (opponentMode !== OPPONENT_MODE_BOT && opponentMode !== OPPONENT_MODE_HUMAN) {
+      throw new Error(
+        `opponentMode must be "${OPPONENT_MODE_BOT}" or "${OPPONENT_MODE_HUMAN}", got ` +
+          `${JSON.stringify(opponentMode)}`,
+      );
+    }
+    /** @type {'bot'|'human'} Which kind of opponent this pad is fighting. */
+    this.opponentMode = opponentMode;
+
+    // The challenger's username in 'human' mode, or null for "whoever is here
+    // that is not one of our own bots". A light type check is enough: unlike
+    // the bot usernames this value never reaches a datapack macro (T1 resolves
+    // the challenger from the learner's own entity view). Should a later task
+    // put it in a macro, it must go through assertMacroUsername first.
+    const challengerUsername =
+      this.config.challengerUsername === undefined || this.config.challengerUsername === null
+        ? null
+        : this.config.challengerUsername;
+    if (
+      challengerUsername !== null &&
+      (typeof challengerUsername !== 'string' || challengerUsername.length === 0)
+    ) {
+      throw new Error(
+        `challengerUsername must be a non-empty string or null, got ${JSON.stringify(
+          challengerUsername,
+        )}`,
+      );
+    }
+    /** @type {string|null} Pinned challenger name, or null for "first here". */
+    this.challengerUsername = challengerUsername;
 
     // The reset template the read-back gate checks against — the bridge's
     // independent VERIFICATION of what the datapack's arena:reset_pad macro
@@ -869,14 +947,26 @@ class ArenaBots {
       version: this.config.version,
       auth: this.config.auth,
     });
-    this.dummy = createBot({
-      host: this.config.host,
-      port: this.config.port,
-      username: this.config.dummyUsername,
-      version: this.config.version,
-      auth: this.config.auth,
-    });
-    await Promise.all([waitForSpawn(this.learner), waitForSpawn(this.dummy)]);
+    // BOT LIFECYCLE — no-op for a human opponent (T1). The dummy is a second
+    // Mineflayer CONNECTION; in exhibition mode the opponent is a person on
+    // their own client, so spawning it would park an extra, unwanted combatant
+    // in the pad. this.dummy stays null there and every behavioral read
+    // resolves through _opponentHandle() to the challenger's player entity.
+    if (this._opponentIsBot()) {
+      this.dummy = createBot({
+        host: this.config.host,
+        port: this.config.port,
+        username: this.config.dummyUsername,
+        version: this.config.version,
+        auth: this.config.auth,
+      });
+    }
+    // waitForSpawn(null) would throw on `.once` — only wait for bots that exist.
+    const spawns = [waitForSpawn(this.learner)];
+    if (this.dummy !== null) {
+      spawns.push(waitForSpawn(this.dummy));
+    }
+    await Promise.all(spawns);
 
     // Bind the macro executor to the learner now that it exists.
     if (this.executor === null) {
@@ -933,6 +1023,12 @@ class ArenaBots {
    * We track the previous health of each bot so each event contributes a single
    * non-negative delta (a heal is not negative damage). Mineflayer fires a
    * bot's `health` event on every own-health change.
+   *
+   * T1 SPLIT: the opponent's health/death channel follows the OPPONENT HANDLE
+   * (it exists only for an opponent with its own connection, so nothing is
+   * wired for a human), while the dummy's `message` beacon follows the BOT (it
+   * is reset-causality lifecycle, and _resetWasConfirmed('dummy') waits for it
+   * whenever that bot is connected, whoever the opponent is).
    */
   wireDamageEvents() {
     // IDEMPOTENCY (W1a): remove any previously registered handlers before
@@ -950,6 +1046,11 @@ class ArenaBots {
         this.learner.off('message', this._boundOnLearnerMessage);
       }
     }
+    // Removal is keyed on this.dummy, NOT on _opponentBot(): the dummy is the
+    // only bot these handlers can ever have been added to, and if the opponent
+    // mode flipped to 'human' between two wires, a handle-keyed off() would
+    // skip removal and leave the dummy still feeding damage_dealt into a human
+    // match. Removing from where they were added cannot leak (T1).
     if (this.dummy && typeof this.dummy.off === 'function') {
       if (this._boundOnOpponentHealth !== null) {
         this.dummy.off('health', this._boundOnOpponentHealth);
@@ -970,10 +1071,10 @@ class ArenaBots {
       this.learner && typeof this.learner.health === 'number' && Number.isFinite(this.learner.health)
         ? this.learner.health
         : MAX_HEALTH;
-    this._prevOpponentHealth =
-      this.dummy && typeof this.dummy.health === 'number' && Number.isFinite(this.dummy.health)
-        ? this.dummy.health
-        : MAX_HEALTH;
+    // Routed through the handle (T1): a human challenger reports no health at
+    // all, which lands on the same MAX_HEALTH fallback an unspawned bot uses.
+    const opponentHealth = this._opponentHealth();
+    this._prevOpponentHealth = opponentHealth !== null ? opponentHealth : MAX_HEALTH;
 
     // Create fresh bound references for this wire so they can be removed on
     // the next call.
@@ -995,12 +1096,25 @@ class ArenaBots {
       this.learner.on('death', this._boundOnLearnerDeath);
       this.learner.on('message', this._boundOnLearnerMessage);
     }
+    // The reset causality BEACON is lifecycle, not a behavioral opponent read:
+    // it proves the datapack's reset ran for the dummy bot, and
+    // _resetWasConfirmed('dummy') waits for it whenever that bot exists. So it
+    // follows the BOT in every opponent mode. Routing it through the handle
+    // would leave the latch unlatched in exhibition mode while the dummy is
+    // still connected, and every reset would then fail confirmation (T1).
     if (this.dummy && typeof this.dummy.on === 'function') {
       this.dummy.on('message', this._boundOnDummyMessage);
-      // damage_dealt comes from the dummy's OWN health channel (see the doc
-      // block above); its death event is authoritative for opponent_died too.
-      this.dummy.on('health', this._boundOnOpponentHealth);
-      this.dummy.on('death', this._boundOnDummyDeath);
+    }
+    // The DAMAGE channel follows the OPPONENT HANDLE. damage_dealt comes from
+    // the opponent's OWN health channel (see the doc block above) and its death
+    // event is authoritative for opponent_died — both exist only for an
+    // opponent that has its own connection. A human challenger has none, so
+    // nothing is wired here and neither signal has a source; T2 sources the
+    // human's death from the scoreboard instead.
+    const opponentBot = this._opponentBot();
+    if (opponentBot && typeof opponentBot.on === 'function') {
+      opponentBot.on('health', this._boundOnOpponentHealth);
+      opponentBot.on('death', this._boundOnDummyDeath);
     }
   }
 
@@ -1056,13 +1170,13 @@ class ArenaBots {
       // dummy read-back gate before clearing the flag.
       return;
     }
-    const now =
-      this.dummy && typeof this.dummy.health === 'number' && Number.isFinite(this.dummy.health)
-        ? this.dummy.health
-        : null;
+    // Routed through the handle (T1). Same finite-only predicate as before; the
+    // added case is an opponent with no connection of its own (a human), which
+    // reports null and therefore records nothing.
+    const now = this._opponentHealth();
     if (now === null) {
-      // Not yet populated (bot not spawned) or garbage: record nothing, leave
-      // the baseline untouched.
+      // Not yet populated (bot not spawned), garbage, or an opponent with no
+      // readable health: record nothing, leave the baseline untouched.
       return;
     }
     const drop = this._prevOpponentHealth - now;
@@ -1137,6 +1251,10 @@ class ArenaBots {
    * @returns {boolean}
    */
   _resetWasConfirmed(role) {
+    // BOT LIFECYCLE, deliberately still keyed on this.dummy (T1): the beacon
+    // belongs to the dummy CONNECTION, not to whoever the opponent is. With a
+    // human opponent this.dummy is null, so the dummy half auto-confirms via
+    // the missing-`on` branch below and the reset turns on the learner alone.
     const bot = role === 'learner' ? this.learner : this.dummy;
     if (!bot || typeof bot.on !== 'function') {
       return true;
@@ -1355,9 +1473,19 @@ class ArenaBots {
       // the dummy read-back gate re-seeds the baseline.
       this._suppressOpponentEvents = true;
 
+      // The dummy gate is BOT LIFECYCLE and no-ops for a human opponent (T1):
+      // it verifies a Mineflayer connection's read-back, and a challenger has
+      // none — runReadbackGate(null, ...) would poll the FULL timeout and then
+      // fail every reset. Skipped as vacuously ok there, which falls through to
+      // the readback===null branch below and leaves the opponent baseline at
+      // MAX_HEALTH. Keyed on the opponent MODE and not on this.dummy being
+      // null, so in 'bot' mode a missing dummy still fails the gate exactly as
+      // it does today.
       [result, dummyResult] = await Promise.all([
         runReadbackGate(this.learner, this.resetTemplate, this._readbackOptions),
-        runReadbackGate(this.dummy, this.dummyResetTemplate, this._readbackOptions),
+        this._opponentIsBot()
+          ? runReadbackGate(this.dummy, this.dummyResetTemplate, this._readbackOptions)
+          : Promise.resolve({ ok: true, readback: null }),
       ]);
 
       // STALE-EPOCH GUARD: a retry reset superseded this invocation while its
@@ -1691,7 +1819,23 @@ class ArenaBots {
     }
 
     const windowStartTick = this._currentTick;
-    const opponentEntity = this._opponentEntity();
+
+    // ONE opponent resolution for the WHOLE decision window. _opponentHandle()
+    // is stateless and re-resolves from the live entity map on every call, so
+    // resolving it separately at window START (the attack target) and at window
+    // END (the last-seen memory, the observation) can land on two DIFFERENT
+    // people in 'human' mode with challengerUsername = null: the entity map
+    // changes mid-window and Object.keys hands back a different first player.
+    // The agent would then swing at one person and turn toward another. Resolve
+    // once here and thread that single handle through every read below. A null
+    // handle is passed through as "no opponent this window" — the reads honor
+    // it rather than re-resolving (only an OMITTED argument re-resolves).
+    //
+    // This is intra-step CONSISTENCY only, not a claim on the slot: the handle
+    // dies with the window, so a challenger who disconnects is null on the very
+    // next step. The first-claimant latch is T3's.
+    const opponentHandle = this._opponentHandle();
+    const opponentEntity = this._opponentEntity(opponentHandle);
 
     // 2. Begin the macro for this window (gated swing happens here, at tick 0).
     if (this.executor !== null) {
@@ -1706,7 +1850,7 @@ class ArenaBots {
     //    every hit into this.events during the wait; we update the last-seen
     //    memory from perception as the opponent is observed.
     await this._waitTicks(ACTION_REPEAT);
-    this._updateLastSeen();
+    this._updateLastSeen(opponentHandle);
 
     // 4. Release the transient control states held for the window.
     if (this.executor !== null) {
@@ -1719,7 +1863,7 @@ class ArenaBots {
     const events = this.events.drain();
     const stateMsg = assembleStateMsg({
       self: this._snapshotSelf(),
-      opponent: this._snapshotOpponent(),
+      opponent: this._snapshotOpponent(opponentHandle),
       events,
       wallDistances: this._probeWallDistances(),
       tick: this._serverTick(),
@@ -1728,16 +1872,177 @@ class ArenaBots {
     this._trySend(stateMsg);
   }
 
-  /** The opponent (dummy) Mineflayer entity, the bot.attack target, or null. */
-  _opponentEntity() {
-    if (this.dummy && this.dummy.entity) {
-      return this.dummy.entity;
+  // -------------------------------------------------------------------------
+  // OPPONENT HANDLE (T1) — the single seam every BEHAVIORAL opponent read goes
+  // through: ATTACK's target, TURN_TO_LAST_SEEN's memory, the observation
+  // snapshot, and the damage channel. Before this seam existed those sites read
+  // `this.dummy` directly, which silently assumed the opponent always has a
+  // Mineflayer connection of its own — false for a human challenger, who is a
+  // player entity and nothing more.
+  //
+  // BOT-LIFECYCLE work (spawning, the reset read-back gate, quitting, the reset
+  // causality beacon) deliberately does NOT go through here: it acts on the
+  // dummy CONNECTION, so it stays bot-specific and no-ops for a human.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether the opponent is this pad's dummy bot rather than a human.
+   *
+   * Keyed on the configured MODE, not on `this.dummy` being populated: the
+   * lifecycle sites that ask this must behave identically to today while the
+   * dummy is merely not connected YET (pre-connect, or a failed spawn).
+   *
+   * @returns {boolean}
+   */
+  _opponentIsBot() {
+    return this.opponentMode === OPPONENT_MODE_BOT;
+  }
+
+  /**
+   * WHO this pad is fighting, or null when there is no opponent at all.
+   *
+   * `entity` may be null inside a NON-null handle: in 'bot' mode the dummy
+   * exists but has not spawned yet. That distinction is load-bearing —
+   * _snapshotOpponent reports a bot's health even before its entity appears.
+   *
+   * `healthSource` states whether health can be read at all, rather than
+   * letting a caller "read" one that resolves to undefined. Mineflayer never
+   * populates `entity.health` for anyone but the connected bot, so a human
+   * challenger's health is 'unavailable', full stop — do not synthesize one
+   * from the player entity (it is always undefined, and a fabricated reading
+   * becomes phantom damage_dealt).
+   *
+   * @returns {{entity: object|null, isBot: boolean, username: string|null,
+   *            healthSource: 'own-connection'|'unavailable'}|null}
+   */
+  _opponentHandle() {
+    if (this.opponentMode === OPPONENT_MODE_HUMAN) {
+      const entity = this._resolveChallengerEntity();
+      if (entity === null) {
+        // Nobody has joined yet, or the challenger left mid-match. Every call
+        // site treats this exactly like "no opponent": no attack target, no
+        // memory update, a zeroed opponent block on the wire.
+        return null;
+      }
+      return {
+        entity,
+        isBot: false,
+        // No fallback: _resolveChallengerEntity only returns an entity whose
+        // `username` is already a string, so a `this.challengerUsername`
+        // fallback here would stand for a state that cannot occur.
+        username: entity.username,
+        healthSource: OPPONENT_HEALTH_UNAVAILABLE,
+      };
+    }
+    if (!this.dummy) {
+      return null;
+    }
+    return {
+      entity: this.dummy.entity ? this.dummy.entity : null,
+      isBot: true,
+      username:
+        typeof this.dummy.username === 'string' ? this.dummy.username : this.config.dummyUsername,
+      healthSource: OPPONENT_HEALTH_OWN_CONNECTION,
+    };
+  }
+
+  /**
+   * The opponent's OWN Mineflayer connection, or null when the opponent has
+   * none (a human) — the only thing that can source health/death events.
+   *
+   * @returns {object|null}
+   */
+  _opponentBot() {
+    return this._opponentIsBot() && this.dummy ? this.dummy : null;
+  }
+
+  /**
+   * The opponent's current health, or null when it cannot be read.
+   *
+   * Null means "no reading", NEVER "0 health": a human challenger has no
+   * connection to read from, and treating that as 0 would fabricate a kill.
+   * T2 sources a human's death from the `rl_deaths` scoreboard instead.
+   *
+   * @returns {number|null} A finite health value, or null.
+   */
+  _opponentHealth() {
+    const handle = this._opponentHandle();
+    if (handle === null || handle.healthSource !== OPPONENT_HEALTH_OWN_CONNECTION) {
+      return null;
+    }
+    const bot = this._opponentBot();
+    return bot && typeof bot.health === 'number' && Number.isFinite(bot.health) ? bot.health : null;
+  }
+
+  /**
+   * The challenger's player entity in the learner's own view, or null.
+   *
+   * Resolved from `learner.entities` (the same source as _scanForeignPlayers)
+   * rather than the server-wide `bot.players` roster: the entity view is scoped
+   * to what is actually near this pad, so a neighbouring pad's bots 512 blocks
+   * away can never be mistaken for a challenger. This pad's own two bots are
+   * excluded by username.
+   *
+   * STATELESS by design: it re-resolves on every call, so a challenger who
+   * disconnects immediately reports null. The "first player claims the slot and
+   * later joiners are ignored until reset" protocol is exhibition policy and
+   * belongs to T3, which owns the latch on top of this primitive (as does any
+   * pad-entry gating).
+   *
+   * @returns {object|null} A Mineflayer player entity, or null.
+   */
+  _resolveChallengerEntity() {
+    const entities =
+      this.learner && this.learner.entities && typeof this.learner.entities === 'object'
+        ? this.learner.entities
+        : null;
+    if (entities === null) {
+      return null;
+    }
+    const own = new Set([this.config.learnerUsername, this.config.dummyUsername]);
+    for (const key of Object.keys(entities)) {
+      const entity = entities[key];
+      if (!entity || entity.type !== 'player') {
+        continue;
+      }
+      const name = typeof entity.username === 'string' ? entity.username : null;
+      if (name === null || own.has(name)) {
+        continue;
+      }
+      if (this.challengerUsername !== null && name !== this.challengerUsername) {
+        continue;
+      }
+      return entity;
     }
     return null;
   }
 
-  /** Update the last-seen opponent position from the dummy's current position. */
-  _updateLastSeen() {
+  /**
+   * The opponent Mineflayer entity, the bot.attack target, or null.
+   *
+   * @param {object|null} [handle] The handle already resolved for THIS decision
+   *   window (see handleStep). Only an OMITTED argument re-resolves; an explicit
+   *   `null` is the legitimate "no opponent" answer and is honored as one.
+   * @returns {object|null}
+   */
+  _opponentEntity(handle = this._opponentHandle()) {
+    if (handle !== null && handle.entity) {
+      return handle.entity;
+    }
+    return null;
+  }
+
+  /**
+   * Update the last-seen opponent position from the opponent's current position.
+   *
+   * @param {object|null} [handle] The handle already resolved for THIS decision
+   *   window, so the memory records the person the window's swing was aimed at
+   *   rather than whoever the entity map happens to yield now. The POSITION is
+   *   still read live off that entity here, at window end, exactly as before.
+   *   Only an OMITTED argument re-resolves; an explicit `null` means "no
+   *   opponent", which leaves the existing memory untouched.
+   */
+  _updateLastSeen(handle = this._opponentHandle()) {
     // LIVE: a real implementation reads the PerceptionFilter's visibility before
     // updating memory; for kickoff the bridge records the dummy's current world
     // position whenever it is known, which TURN_TO_LAST_SEEN then faces.
@@ -1748,7 +2053,11 @@ class ArenaBots {
     // view and not occluded — belongs to the PerceptionFilter (T12/env). Replace
     // this unconditional write with a PerceptionFilter.isVisible() guard when T12
     // lands.
-    const pos = this.dummy && this.dummy.entity ? this.dummy.entity.position : null;
+    // T1 changed WHERE the position comes from (the opponent handle, so a human
+    // challenger is tracked too) and NOTHING else. The write below stays
+    // UNCONDITIONAL — see the TODO(T12) note above: it is the agent's only way
+    // to re-acquire an opponent it cannot see, and gating it breaks the demo.
+    const pos = handle !== null && handle.entity ? handle.entity.position : null;
     if (pos && typeof pos.x === 'number' && typeof pos.y === 'number' && typeof pos.z === 'number') {
       // SNAPSHOT as a Vec3, not a plain {x,y,z}: bot.lookAt requires a Vec3
       // (it calls point.minus(...) — a plain object made the live lookAt throw
@@ -1776,10 +2085,33 @@ class ArenaBots {
     };
   }
 
-  /** Snapshot the opponent's RAW state (incl. PRIVILEGED health) for the wire. */
-  _snapshotOpponent() {
-    const bot = this.dummy;
-    const entity = bot && bot.entity ? bot.entity : null;
+  /**
+   * Snapshot the opponent's RAW state (incl. PRIVILEGED health) for the wire.
+   *
+   * @param {object|null} [handle] The handle already resolved for THIS decision
+   *   window, so the observation describes the same person the window's swing
+   *   and last-seen memory used. Only an OMITTED argument re-resolves (that is
+   *   handleReset's post-reset first observation, which is outside any window);
+   *   an explicit `null` yields the zeroed opponent block.
+   */
+  _snapshotOpponent(handle = this._opponentHandle()) {
+    const entity = handle !== null && handle.entity ? handle.entity : null;
+    // Health is readable ONLY from an opponent with its own connection (T1).
+    // For a human challenger the wire carries 0 here — the same zeroed block an
+    // absent opponent already produces, and explicitly NOT a health reading.
+    // It is deliberately not synthesized from the player entity: mineflayer
+    // leaves entity.health undefined for non-self players, so a "reading" taken
+    // there would be a fabricated one. The demo runs greedy with no learning,
+    // so nothing downstream consumes it; win detection is T2's scoreboard.
+    //
+    // The predicate below stays the LOOSE `typeof` this site has always used —
+    // deliberately not _opponentHealth()'s finite-only one. NOT because the two
+    // differ on the wire: they cannot. assembleStateMsg passes this value
+    // through finiteOr(opponent.health, 0), so a NaN/Infinity reading is
+    // already 0 on the wire under either predicate. They are left un-unified
+    // because unifying them is a cosmetic cleanup on a FROZEN training path,
+    // and "byte-identical on the training path" is the bar for this change.
+    const bot = this._opponentBot();
     return {
       pos: entity ? entity.position : null,
       yaw: entity ? entity.yaw : 0,
@@ -1843,6 +2175,8 @@ class ArenaBots {
     if (this.learner && typeof this.learner.quit === 'function') {
       this.learner.quit();
     }
+    // BOT LIFECYCLE — already a no-op for a human opponent: this.dummy is null
+    // there, and a challenger's client is not ours to disconnect (T1).
     if (this.dummy && typeof this.dummy.quit === 'function') {
       this.dummy.quit();
     }
@@ -1882,6 +2216,10 @@ module.exports = {
   MAX_HEALTH,
   DEFAULT_READBACK,
   DEFAULT_BOT_CONFIG,
+  OPPONENT_MODE_BOT,
+  OPPONENT_MODE_HUMAN,
+  OPPONENT_HEALTH_OWN_CONNECTION,
+  OPPONENT_HEALTH_UNAVAILABLE,
   // Pure, unit-testable logic.
   assertMacroInt,
   assertMacroUsername,

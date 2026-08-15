@@ -61,6 +61,8 @@ const {
   ArenaBots,
   MAX_HEALTH,
   ACTION_REPEAT,
+  OPPONENT_MODE_HUMAN,
+  OPPONENT_HEALTH_UNAVAILABLE,
   formatResetPadCommand,
   formatSetupPadCommand,
 } = require('./bot');
@@ -871,6 +873,172 @@ test('handleReset stamps the post-reset state.tick from the learner world-age wh
 });
 
 // ===========================================================================
+// THE OPPONENT HANDLE AGAINST A HUMAN (T1, AC2).
+//
+// ATTACK and TURN_TO_LAST_SEEN must work against a human PLAYER ENTITY, not
+// only against the dummy bot — "they must not silently no-op" is the whole of
+// AC2. Before the handle seam both read `this.dummy`, which stays null for the
+// entire run in 'human' mode, so both would have no-opped through a live
+// classroom demo with nothing in the log to say so. Code-tracing and a manual
+// rehearsal were the only cover; these tests are the automated half.
+//
+// The second half of TC13 pins the OTHER failure the seam can produce:
+// _opponentHandle() is stateless and re-resolves on every call, so a window
+// that resolves it separately at start and end can attack one person and turn
+// toward another the moment the entity map changes mid-window.
+//
+// MOCK FIDELITY: the challenger fake is a player ENTITY and carries NO health.
+// Mineflayer never populates it for anyone but the connected bot (see the note
+// at the top of this file), and a fake with health here would paper over
+// exactly the damage-channel gap the plan accepts for the demo.
+// ===========================================================================
+
+/** A Vec3-ish position: mineflayer entity positions carry clone(). */
+function livePosition(x, y, z) {
+  return {
+    x,
+    y,
+    z,
+    clone() {
+      return livePosition(this.x, this.y, this.z);
+    },
+  };
+}
+
+/** A challenger as the learner's own entity view carries one (no health). */
+function playerEntity(username, x, z) {
+  return {
+    type: 'player',
+    username,
+    position: livePosition(x, 64, z),
+    velocity: { x: 0, y: 0, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    onGround: true,
+  };
+}
+
+/** The x/y/z of a remembered position, without its Vec3 methods. */
+function coordsOf(pos) {
+  return { x: pos.x, y: pos.y, z: pos.z };
+}
+
+/**
+ * An exhibition arena: 'human' opponent mode, a learner that sees `entities`
+ * and records every bot.attack target, the REAL MacroExecutor, and the tick
+ * wait injected. `dummy` stays null — in 'human' mode there is no second
+ * connection to make, which is the condition under test.
+ */
+function exhibitionArena(sent, entities) {
+  const arena = new ArenaBots(
+    { opponentMode: OPPONENT_MODE_HUMAN },
+    { transport: { send: (msg) => sent.push(msg) } },
+  );
+  const learner = stepBot('learner_bot', { age: 100 });
+  learner.entities = entities;
+  // Record what the REAL executor swings at, the way chatLog records commands.
+  learner.attacked = [];
+  learner.attack = (entity) => learner.attacked.push(entity);
+  arena.learner = learner;
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+  return arena;
+}
+
+test('TC13: in exhibition mode ATTACK, the last-seen memory and the observation all follow the human entity (AC2)', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const bystander = playerEntity('classmate_2', -9.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: challenger });
+
+  // The handle IS the player entity, and it reports no health SOURCE — not a
+  // health of zero. A human's health is unreadable; T2's scoreboard owns wins.
+  assert.equal(arena.dummy, null, "'human' mode never spawns a second bot");
+  const handle = arena._opponentHandle();
+  assert.equal(handle.entity, challenger);
+  assert.equal(handle.isBot, false);
+  assert.equal(handle.username, 'classmate_1', 'the name comes off the entity itself');
+  assert.equal(handle.healthSource, OPPONENT_HEALTH_UNAVAILABLE);
+  assert.equal(arena._opponentEntity(), challenger);
+  assert.equal(arena._opponentHealth(), null, 'null is "no reading", never 0 health');
+
+  await arena.handleStep({ type: 'step', action: Macro.ATTACK });
+
+  // AC2, positively. A silent no-op here — the executor swinging at null — is
+  // the regression: the demo agent would flail at a human all match long.
+  assert.equal(arena.learner.attacked.length, 1, 'ATTACK must not no-op against a human');
+  assert.equal(arena.learner.attacked[0], challenger, 'the swing targets the PLAYER entity');
+  assert.equal(arena.executor.lastSwingTick, 0, 'the swing was stamped, not skipped');
+  // TURN_TO_LAST_SEEN's memory is written from that same entity.
+  assert.deepEqual(coordsOf(arena._lastSeenOpponentPos), { x: 5.5, y: 64, z: 0.5 });
+  // ...and so is the observation, with health 0 for want of a source.
+  const first = sent[sent.length - 1];
+  assert.doesNotThrow(() => validateOutbound(first));
+  assert.deepEqual(first.opponent.pos, [5.5, 64, 0.5]);
+  assert.equal(first.opponent.health, 0);
+
+  // ONE resolution per decision window. A second player is standing in the pad
+  // and the challenger leaves DURING the window: re-resolving at window end
+  // would hand back the bystander, and the agent would swing at one person and
+  // turn toward another inside a single step.
+  arena.learner.entities[22] = bystander;
+  arena._waitTicksImpl = async () => {
+    delete arena.learner.entities[11];
+  };
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+
+  assert.deepEqual(
+    coordsOf(arena._lastSeenOpponentPos),
+    { x: 5.5, y: 64, z: 0.5 },
+    'the memory stayed with whoever the window began against',
+  );
+  assert.deepEqual(
+    sent[sent.length - 1].opponent.pos,
+    [5.5, 64, 0.5],
+    'the observation describes the same person the window opened on',
+  );
+  // Stateless ACROSS windows, though: the next step resolves afresh, so the
+  // bystander only becomes the opponent now. (The first-claimant latch is T3's.)
+  assert.equal(arena._opponentHandle().entity, bystander);
+});
+
+test('TC22: a challenger who leaves mid-match zeroes the opponent block, keeps the memory, and never throws', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: challenger });
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.deepEqual(coordsOf(arena._lastSeenOpponentPos), { x: 5.5, y: 64, z: 0.5 });
+
+  // They quit mid-match: mineflayer drops them from the learner's entity view.
+  delete arena.learner.entities[11];
+
+  assert.equal(arena._opponentHandle(), null, 'no challenger, no handle');
+  assert.equal(arena._opponentEntity(), null);
+  assert.equal(arena._opponentHealth(), null);
+
+  await assert.doesNotReject(() => arena.handleStep({ type: 'step', action: Macro.ATTACK }));
+
+  const state = sent[sent.length - 1];
+  assert.doesNotThrow(() => validateOutbound(state));
+  // State keeps flowing with a ZEROED opponent block — the wire has no slot for
+  // a "waiting for challenger" status, so that goes to the bridge log only.
+  assert.deepEqual(state.opponent, {
+    pos: [0, 0, 0],
+    yaw: 0,
+    pitch: 0,
+    velocity: [0, 0, 0],
+    health: 0,
+  });
+  assert.equal(arena.learner.attacked.length, 0, 'nothing to swing at');
+  assert.equal(arena.executor.lastSwingTick, null, 'a swing at nobody never starts the cooldown');
+  // The memory is RETAINED, not cleared: TURN_TO_LAST_SEEN must still be able
+  // to face where the challenger was last seen (only handleReset clears it).
+  assert.deepEqual(coordsOf(arena._lastSeenOpponentPos), { x: 5.5, y: 64, z: 0.5 });
+});
+
+// ===========================================================================
 // THE DUMMY READ-BACK GATE (plan Error Handling: "reset-generated health
 // events").
 //
@@ -959,6 +1127,48 @@ test('handleReset seeds _prevOpponentHealth from the CONFIRMED dummy readback, n
   arena.dummy.emit('health');
   assert.deepEqual(spy.damageDealt, [6], 'exactly one recorder call, for the 6 that really landed');
   assert.equal(arena.events.drain().damage_dealt, 6, 'no phantom damage on the first hit');
+});
+
+test('in bot mode a NULL dummy still fails the dummy gate (the gate is keyed on MODE)', async () => {
+  // T1 made the dummy gate conditional so it can no-op for a human challenger,
+  // who has no connection to read back. Nothing pins the other direction: re-
+  // keying that condition from the opponent MODE to `this.dummy !== null` looks
+  // equivalent and would silently SKIP the gate whenever the dummy failed to
+  // spawn — acking a reset nobody verified, on the training path.
+  //
+  // Nothing downstream would catch that: _resetWasConfirmed('dummy') RETURNS
+  // TRUE when this.dummy is null (its missing-bot branch, deliberate so a human
+  // opponent's absent half auto-confirms), so the causality beacon cannot fail
+  // the reset either. This gate is the only thing left standing.
+  //
+  // ok:false alone is therefore not the tell (an unconfirmed reset is also
+  // ok:false). WHICH check rejected is: the "NOT confirmed by the datapack"
+  // diagnosis is emitted only when both gates MATCHED, so it must stay silent.
+  const sent = [];
+  const errors = [];
+  const arena = new ArenaBots({}, {
+    transport: { send: (msg) => sent.push(msg) },
+    readbackOptions: SINGLE_POLL_GATE,
+  });
+  arena.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  // The dummy never connected (a failed spawn, or a reset racing connect()).
+  arena.dummy = null;
+
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+  } finally {
+    console.error = realError;
+  }
+
+  assert.equal(sent.length, 1, 'ack only: an unverifiable dummy must not start the episode');
+  assert.equal(sent[0].type, 'reset_ack');
+  assert.equal(sent[0].ok, false);
+  assert.ok(
+    !errors.some((line) => line.includes('reset NOT confirmed by the datapack')),
+    'the DUMMY GATE rejected — a gate that had been skipped would fail later, at the beacon',
+  );
 });
 
 // ===========================================================================
