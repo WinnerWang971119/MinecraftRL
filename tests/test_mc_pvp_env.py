@@ -439,6 +439,18 @@ def test_tc16_no_timeout_never_truncates_past_the_frozen_horizon():
 
     assert env.step_count == MAX_EPISODE_STEPS + 1
 
+    # NO HIDDEN CEILING ANYWHERE IN THE COMPARISON — the property the loop above
+    # cannot bind. A mutant that reads `self._max_steps if ... is not None else
+    # 10_000_000` survives any loop-based test, because no test can afford to
+    # outrun a large sentinel. Jumping the counter costs O(1) and catches every
+    # finite ceiling, however large.
+    env._step_count = 10**9
+    bridge.push(_state(tick=1234))
+    _, _, done, info = env.step(Macro.IDLE)
+    assert done is False, "a horizon of None truncated at a hidden ceiling"
+    assert info["timeout"] is False
+    assert env.max_episode_steps is None
+
     # A death still ends it. Disabling the horizon must not disable termination —
     # otherwise the exhibition never reports a winner at all.
     bridge.push(_state(tick=9999, opponent_died=True))
@@ -522,8 +534,33 @@ def test_exhibition_config_refuses_an_auto_restart():
     # Nothing implements an auto-restart, so accepting the flag would be a
     # config that promises a behavior no code provides — and the failure would
     # only show up as a match that does not restart, in front of a classroom.
-    with pytest.raises(ValueError, match="auto_reset=True is not implemented"):
+    with pytest.raises(ValueError, match="auto_reset must be exactly False"):
         ExhibitionConfig(auto_reset=True)
+
+
+@pytest.mark.parametrize("bad", [0, 1, None, "", "False", "false"])
+def test_exhibition_config_refuses_a_non_bool_auto_reset(bad):
+    """The type strictness covers FALSY non-bools, and says so in the message."""
+    # `0`, `None` and `""` are all rejected by `is not False`, and the old
+    # message told the operator "auto_reset=True is not implemented" — which
+    # describes none of them and sends them looking for a True they never passed.
+    with pytest.raises(ValueError, match="auto_reset must be exactly False"):
+        ExhibitionConfig(auto_reset=bad)
+
+
+@pytest.mark.parametrize("bad", [0, 1, None, "", "false", "True", 1.0])
+def test_exhibition_config_refuses_a_non_bool_no_timeout(bad):
+    """``no_timeout`` is held to the same strictness as the rest of the class."""
+    # The dangerous value is a truthy stand-in: `no_timeout="false"` would
+    # DISABLE the horizon — the opposite of what it reads as — and a horizon
+    # that is silently off is indistinguishable from a match still in progress.
+    with pytest.raises(ValueError, match="no_timeout must be exactly True or False"):
+        ExhibitionConfig(no_timeout=bad)
+
+
+@pytest.mark.parametrize("good", [True, False])
+def test_exhibition_config_accepts_both_real_booleans_for_no_timeout(good):
+    assert ExhibitionConfig(no_timeout=good).no_timeout is good
 
 
 @pytest.mark.parametrize(

@@ -1841,8 +1841,17 @@ class ArenaBots {
     this._currentTick = 0;
     this._lastSeenOpponentPos = null;
     // A new match may be a new challenger, so the death-ATTRIBUTION memory is
-    // dropped alongside the last-seen memory; the first step of the episode
-    // rewrites it, and _isChallengerName resolves live until then.
+    // dropped alongside the last-seen memory; the episode's first step rewrites
+    // it (handleStep takes the claim and notes the identity in one synchronous
+    // prologue).
+    //
+    // WHAT THAT COSTS, stated because the first-claimant latch changed it: from
+    // this handler's ack until that first step, _isChallengerName has neither a
+    // memory nor a claim to match on — the slot is released at this handler's
+    // tail — so its live-resolve fallback answers false and a challenger death
+    // landing in that gap is DROPPED rather than credited. That gap is a few
+    // milliseconds, and dropping is the conservative direction: a missed win,
+    // never a fabricated one. See _isChallengerName for the full argument.
     //
     // DO NOT ADD `this._deathScores.clear()` HERE. The baseline map is a
     // different thing and must survive every reset: score packets are
@@ -2048,6 +2057,21 @@ class ArenaBots {
     // stray state would desync its request/reply stream. Skip it if the ack
     // didn't go out (the client disconnected during the gate): a state with no
     // matching reset_ack would desync the env's request/reply stream too.
+    //
+    // ONE FRAME WITH A ZEROED OPPONENT, BY CONSTRUCTION — not a bug (T3). The
+    // argument-less _snapshotOpponent() below re-resolves through
+    // _opponentHandle(), and the _releaseChallengerSlot() above just emptied the
+    // slot, so in 'human' mode this observation carries no opponent even while
+    // the challenger is standing in the pad. The next step's _claimChallenger()
+    // re-claims and the block populates from then on. Exhibition-only ('bot'
+    // mode resolves to the dummy and is unaffected) and cosmetic under a greedy
+    // no-learning policy, but it does feed one distorted prev_obs into the first
+    // step's reward computation.
+    //
+    // DO NOT reorder the claim/release to "fix" it: releasing AFTER
+    // _scanForeignPlayers is load-bearing (see the block above) and pinned by
+    // the test 'the exhibition challenger is NOT logged as cross-pad
+    // contamination', which drives the real handleReset for exactly that reason.
     if (acked && ok) {
       this._trySend(
         assembleStateMsg({
@@ -2976,8 +3000,29 @@ class ArenaBots {
     if (this._challengerDeathName !== null) {
       return name === this._challengerDeathName;
     }
-    // No memory yet (a death between the reset ack and the episode's first
-    // step): fall back to resolving the challenger live.
+    // DEFENCE IN DEPTH as well, and under the first-claimant latch no longer a
+    // second attribution path. Reaching this line needs BOTH an unpinned
+    // challengerUsername and an empty _challengerDeathName, and handleStep takes
+    // the claim and writes that memory in ONE synchronous prologue
+    // (_claimChallenger then _noteChallengerIdentity, no await between). So no
+    // STEP can leave a claim outliving the memory, and with no reset in flight
+    // this line is reached only with the slot null too: _challengerSlot() is
+    // null, _opponentHandle() returns null, and the answer is false.
+    //
+    // A RESET can. handleReset clears the memory at its top and releases the
+    // slot only at its tail, so the claim outlives the memory for as long as
+    // that reset is in flight — and a THROWN gate propagates past the tail
+    // without releasing, leaving the claim held for the retry. A score packet
+    // landing in that interval reaches this line with the outgoing challenger
+    // still claimed and can answer true; the opponent_died it records is
+    // discarded by the winning handleReset's events.reset(), before that reset
+    // acks (and where no reset ever wins, nothing is ever acked or drained).
+    //
+    // So the case this branch was written for — a death between the reset ack
+    // and the episode's first step — is now DROPPED rather than attributed. A
+    // few milliseconds, and dropping is the conservative direction: a missed
+    // win, never a fabricated one. The branch stays because every layer above it
+    // is one refactor from changing, and being wrong here costs a FABRICATED win.
     const handle = this._opponentHandle();
     return handle !== null && handle.isBot === false && handle.username === name;
   }

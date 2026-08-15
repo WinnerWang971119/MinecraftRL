@@ -405,10 +405,13 @@ class ExhibitionConfig:
             that ends mid-fight because 400 decision steps elapsed reads to a
             classroom as the agent giving up. See :attr:`env_max_episode_steps`
             for the form this takes — there is no sentinel and no large integer.
+            Must be exactly ``True`` or ``False``: a truthy stand-in such as the
+            string ``"false"`` would disable the horizon while reading, to
+            whoever passed it, as if it had been kept.
         auto_reset: Whether a finished match restarts by itself. **Must be
-            False** (AC4): the match ends, the result is reported, and the
-            operator arms the next challenger with the separate reset command.
-            Constructing with ``True`` raises rather than silently promising a
+            exactly False** (AC4): the match ends, the result is reported, and
+            the operator arms the next challenger with the separate reset
+            command. Any other value raises rather than silently promising a
             restart nothing implements.
         reflex_blind_steps: Consecutive blind decision steps before the
             exhibition-only reflex shield overrides the action with
@@ -416,8 +419,9 @@ class ExhibitionConfig:
             default of 8 is ~1.6 s at the frozen 200 ms decision interval.
 
     Raises:
-        ValueError: on a malformed username, a non-``False`` ``auto_reset``, or
-            a negative ``reflex_blind_steps``.
+        ValueError: on a malformed username, a ``no_timeout`` that is not
+            exactly ``True``/``False``, an ``auto_reset`` that is not exactly
+            ``False``, or a non-int / negative ``reflex_blind_steps``.
     """
 
     challenger_username: Optional[str] = None
@@ -437,11 +441,25 @@ class ExhibitionConfig:
                 "challenger_username must be a Minecraft username matching "
                 f"{_USERNAME_RE.pattern} or None, got {name!r}"
             )
-        if self.auto_reset is not False:
+        if self.no_timeout is not True and self.no_timeout is not False:
+            # `is not True/False` rather than a truthiness test: the string
+            # "false" is truthy, so a launcher that forwarded an unparsed flag
+            # would disable the horizon while its operator believed they had
+            # kept it — and a horizon that is silently off looks like a match
+            # that simply has not ended yet.
             raise ValueError(
-                "auto_reset=True is not implemented and would violate AC4 (after a "
-                "death the match must not auto-restart); the operator runs the "
-                "separate reset command between challengers"
+                f"no_timeout must be exactly True or False, got {self.no_timeout!r}"
+            )
+        if self.auto_reset is not False:
+            # The message names the VALUE requirement, not just the True case:
+            # this branch also rejects 0, None and "" — falsy non-bools that a
+            # "True is not implemented" message would describe wrongly.
+            raise ValueError(
+                "auto_reset must be exactly False, got "
+                f"{self.auto_reset!r}: an auto-restart is not implemented and "
+                "would violate AC4 (after a death the match must not "
+                "auto-restart); the operator runs the separate reset command "
+                "between challengers"
             )
         if not isinstance(self.reflex_blind_steps, int) or isinstance(
             self.reflex_blind_steps, bool
