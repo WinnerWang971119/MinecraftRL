@@ -68,7 +68,7 @@
 - [ ] **AC9** The training loop steps a Python opponent policy and sends `opp_action`; the M2 stationary-dummy path is unchanged and its tests still pass.
 - [ ] **AC10** The EASY/HARD mixture shifts on the win-rate gate, and a run where the gate never fires still trains to completion.
 - [ ] **AC11** A guard test fails if `_updateLastSeen()` is made visibility-gated before the demo, and the two comments that falsely assert memory-gating are corrected.
-- [ ] **AC12** Full offline suite green: `pytest` ≥ **647** passed, 2 deselected (the branch baseline post-#32; an earlier draft said 450, measured before the rebase), **and** the bridge suite reports 100 tests (see Testing Strategy — the naive command runs 1).
+- [ ] **AC12** Full offline suite green: `pytest` ≥ **647** passed, 2 deselected (the branch baseline post-#32; an earlier draft said 450, measured before the rebase), **and** the bridge suite reports **143** tests (see Testing Strategy — the naive command runs 1).
 - [ ] **AC13** `README.md`, `RUNBOOK.md`, and the demo-day guide describe the one-command flow accurately on macOS.
 - [ ] **AC14** The demo-day guide and `README.md` state plainly that the agent's turn is assisted, that its observation is nonetheless honestly FOV/LoS-gated, and that this is a placeholder scheduled for removal. Written to be said out loud to a classroom, not buried in a footnote.
 - [ ] **AC15** ε does not reach its floor before ~15% of the run's episodes at the chosen pad count, and the arenas explore at distinct rates rather than one shared schedule.
@@ -243,7 +243,7 @@ reflex_blind_steps  : int = 8      # exhibition-only, ~1.6s
 
 **Levels:** Unit (Python + Node), Integration (fake bridge), Manual (live rehearsal — the only way to cover AC1–AC5).
 
-> **Run command — the naive one gives a false green.** From the repo root `node --test bridge/` runs **1 test**; `cd bridge && node --test` runs **100** (verified empirically). Five tasks edit `bot.js`, so the wrong command would skip ~99% of the suite.
+> **Run command — the naive one gives a false green.** From the repo root `node --test bridge/` runs **1 test**; `cd bridge && node --test` runs **143** (verified empirically post-rebase; an earlier draft said 100, measured on the pre-#32 checkout). Six tasks edit `bot.js`, so the wrong command would skip >99% of the suite.
 
 ```bash
 .venv/bin/python -m pytest -q && (cd bridge && node --test)
@@ -279,7 +279,7 @@ reflex_blind_steps  : int = 8      # exhibition-only, ~1.6s
 | TC26 | `epsilon_for_episode` at the chosen pad count | Unit | ε still above floor at 15% of the planned episode budget (AC15) |
 | TC27 | Per-actor ε spread | Unit | With N arenas, ε values are distinct and monotonically ordered; **arena 0 is the most exploratory** (ε_0 = ε, largest — Ape-X convention) |
 | TC28 | Scripted opponent takes knockback | Manual/live | Hitting it displaces it (AC18) — the datapack cannot be trusted from logs alone |
-| TC29 | Full regression | Integration | `pytest` ≥ **647** passed, 2 deselected; bridge suite reports **100** tests (AC12) |
+| TC29 | Full regression | Integration | `pytest` ≥ **647** passed, 2 deselected; bridge suite reports **143** tests (AC12) |
 | TC30 | Live human rehearsal | Manual | AC1–AC5 confirmed by a real person on the existing checkpoint |
 
 **Test data:** Hand-authored `OpponentView` fixtures (no server, no numpy). Node tests use the existing fake-bot harness in `bridge/actions.test.js`. Seeded RNG for all probabilistic branches.
