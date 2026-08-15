@@ -198,8 +198,19 @@ function parseOpponentMode(raw, source) {
 }
 
 /**
- * Parse a `--challenger-username`: a Minecraft username, or the empty-ish
- * sentinel `auto` meaning "the first player to enter the pad claims the slot".
+ * Parse a `--challenger-username`: a Minecraft username, and nothing else.
+ *
+ * NO RESERVED VALUES — deliberately. This used to treat the literal `auto` as
+ * "no pin", which meant a classmate actually called `auto` could never be
+ * pinned, while `AUTO` could (the test was case-sensitive). Since T15 documents
+ * pinning the challenger as THE demo-day mitigation for the bystander bug, a
+ * pin that silently degrades to "whoever walks in first" is the one failure this
+ * flag must not have. The no-pin form is OMITTING the flag: every unprovided key
+ * falls through to DEFAULT_BOT_CONFIG's `challengerUsername: null`, which bot.js
+ * reads as "the first non-own player in the pad claims the slot". An empty
+ * `CHALLENGER_USERNAME` env var is already read as unset by parseBridgeConfig,
+ * so a launcher that always exports the variable can say "no pin" with `''`;
+ * an explicit `--challenger-username ""` is a mistake and still throws.
  *
  * Held to the same username grammar as the bot names even though this value
  * never reaches a datapack macro. It is compared against `entity.username`, so
@@ -209,15 +220,10 @@ function parseOpponentMode(raw, source) {
  *
  * @param {string} raw The raw flag/env value.
  * @param {string} source Human label for the error.
- * @returns {string|null} The pinned username, or null for "first claimant wins".
+ * @returns {string} The pinned username.
  */
 function parseChallengerUsername(raw, source) {
   const text = typeof raw === 'string' ? raw.trim() : raw;
-  if (text === 'auto') {
-    // An explicit way to say "no pin" from a launcher that always passes the
-    // flag; bot.js reads null as "first non-own player in the pad claims it".
-    return null;
-  }
   return assertMacroUsername(text, source);
 }
 
@@ -390,9 +396,11 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
   // in 'bot' mode the opponent is the dummy and the name is read by nothing at
   // all. Left to run, it produces a demo in which the agent fights a dummy the
   // audience cannot see while the operator believes they pinned the challenger.
+  //
+  // `!== undefined` is the whole test: providing the flag at all IS the pin now
+  // that parseChallengerUsername has no reserved values to degrade into.
   if (
     config.challengerUsername !== undefined &&
-    config.challengerUsername !== null &&
     (config.opponentMode === undefined || config.opponentMode === OPPONENT_MODE_BOT)
   ) {
     throw new Error(

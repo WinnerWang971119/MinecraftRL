@@ -352,14 +352,36 @@ test('parseBridgeConfig wires --opponent-mode and --challenger-username through 
   );
 });
 
-test('--challenger-username auto means "first claimant in the pad", not a player called auto', () => {
-  // A launcher that always passes the flag needs a way to say "no pin"; bot.js
-  // reads null as the first-claimant latch. Without this, `auto` would be taken
-  // as a literal username and NOBODY would ever be the challenger.
-  assert.deepEqual(parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', 'auto'], {}), {
+test('--challenger-username has NO reserved values: "auto" pins a player called auto', () => {
+  // This flag used to read the literal `auto` as "no pin". `auto` is a legal
+  // Minecraft username, so that made one classmate impossible to pin — while
+  // `AUTO` pinned fine, the check being case-sensitive. T15 documents pinning
+  // as THE demo-day mitigation for the bystander bug, so a pin that silently
+  // degrades to "whoever walks in first" is the one failure this flag must not
+  // have. Omitting the flag is the no-pin form.
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', 'auto'], {}),
+    { opponentMode: 'human', challengerUsername: 'auto' },
+  );
+  assert.deepEqual(parseBridgeConfig([], { OPPONENT_MODE: 'human', CHALLENGER_USERNAME: 'auto' }), {
     opponentMode: 'human',
-    challengerUsername: null,
+    challengerUsername: 'auto',
   });
+  // The no-pin form: the key stays ABSENT so it falls through to
+  // DEFAULT_BOT_CONFIG's null, which bot.js reads as the first-claimant latch.
+  // An empty env var is already read as unset, so a launcher that always
+  // exports CHALLENGER_USERNAME can still say "no pin".
+  assert.deepEqual(parseBridgeConfig(['--opponent-mode', 'human'], {}), {
+    opponentMode: 'human',
+  });
+  assert.deepEqual(parseBridgeConfig([], { OPPONENT_MODE: 'human', CHALLENGER_USERNAME: '' }), {
+    opponentMode: 'human',
+  });
+  // ...but an explicitly empty flag is a mistake, not a way to say "no pin".
+  assert.throws(
+    () => parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', ''], {}),
+    /--challenger-username must be a Minecraft username/,
+  );
 });
 
 test('parseBridgeConfig refuses a typo\'d opponent mode rather than falling back to training', () => {
@@ -405,10 +427,12 @@ test('a pinned challenger with no --opponent-mode human is refused, not silently
     () => parseBridgeConfig(['--opponent-mode', 'bot', '--challenger-username', 'classmate_1'], {}),
     /requires --opponent-mode human/,
   );
-  // `auto` is not a pin, so it is not caught by that rule.
-  assert.deepEqual(parseBridgeConfig(['--challenger-username', 'auto'], {}), {
-    challengerUsername: null,
-  });
+  // `auto` is a username like any other now, so it is caught by that rule too —
+  // it used to slip through as the "no pin" sentinel.
+  assert.throws(
+    () => parseBridgeConfig(['--challenger-username', 'auto'], {}),
+    /requires --opponent-mode human/,
+  );
 });
 
 test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher and tests', () => {
@@ -418,5 +442,7 @@ test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher
   assert.deepEqual(usernamesForPad(7), { learnerUsername: 'learner_7', dummyUsername: 'dummy_7' });
   assert.equal(parseOpponentMode('human', '--opponent-mode'), 'human');
   assert.equal(parseChallengerUsername('classmate_1', '--challenger-username'), 'classmate_1');
-  assert.equal(parseChallengerUsername('auto', '--challenger-username'), null);
+  // No reserved values: this returns a username or throws, never null.
+  assert.equal(parseChallengerUsername('auto', '--challenger-username'), 'auto');
+  assert.equal(parseChallengerUsername('AUTO', '--challenger-username'), 'AUTO');
 });
