@@ -40,6 +40,11 @@
 - **Scripted bot sees raw truth (omniscient)** — No FOV/LoS/memory gating on the opponent's own input. It is a training target, not a fair rival; gating it would make it weaker and flakier and buys nothing before the demo.
 - **Human replaces the opponent bot** — Reuses the existing two-combatant arena instead of modelling a third entity the observation has no slot for.
 - **Reward/obs contracts unchanged** — The reward reshape from `8b4c151` ships as-is. Retraining against a moving opponent already co-varies two factors (opponent + reward); adding a third would make any result unattributable.
+- **Ship the assisted turn, and disclose it** — Action 7 aims at the opponent's *live* position regardless of line of sight, so the agent's turn is assisted in a way a human player's is not. Two alternatives were considered and rejected for this deadline:
+  - *Scan fallback* — gate the memory to the genuinely last-seen position, and make action 7 rotate ~45° when that memory is stale. Honest, keeps `N_ACTIONS == 8`, no checkpoint churn. Rejected only on time: it changes bridge behavior the retrain must then learn against.
+  - *Full honest version* — resolve `TODO(T12)` and add real facing macros. Correct, but invalidates checkpoints and leaves one training run with no fallback.
+
+  **Chosen deliberately, not by omission.** The obligation this creates is disclosure: the demo-day guide and README must state plainly that the agent receives an assisted turn. Note the agent's *observation* remains honestly gated — it does not see the opponent's position out of FOV; only its turning is assisted. Revisit with the scan fallback immediately after the demo, alongside #23.
 
 ---
 
@@ -55,9 +60,10 @@
 - [ ] **AC8** Every branch of the spec-7.2 ladder (flee / attack / approach-strafe-jump / search) is unit-tested on fixtures.
 - [ ] **AC9** The training loop steps a Python opponent policy and sends `opp_action`; the M2 stationary-dummy path is unchanged and its tests still pass.
 - [ ] **AC10** The EASY/HARD mixture shifts on the win-rate gate, and a run where the gate never fires still trains to completion.
-- [ ] **AC11** A guard test fails if `_updateLastSeen()` is made visibility-gated before the demo.
+- [ ] **AC11** A guard test fails if `_updateLastSeen()` is made visibility-gated before the demo, and the three comments that falsely assert memory-gating (macro name aside) state what the code actually does.
 - [ ] **AC12** Full offline suite green (baseline: 450 passed, 2 deselected).
 - [ ] **AC13** `README.md`, `RUNBOOK.md`, and the demo-day guide describe the one-command flow accurately on macOS.
+- [ ] **AC14** The demo-day guide and `README.md` state plainly that the agent's turn is assisted (action 7 aims at the opponent's live position regardless of line of sight), that its observation is nonetheless honestly FOV/LoS-gated, and that this is a known placeholder scheduled for removal after the demo. Written so it can be said out loud to a classroom, not buried in a footnote.
 
 ---
 
@@ -71,7 +77,26 @@
 | Wire `action` range `0..7` | `bridge/schema.md`, `bridge/messages.py` | Unchanged. |
 | Observation spec | `env/observation_spec.py` | Unchanged — no new slots. |
 | Reward components | `agent/reward_config.py` | Unchanged (`8b4c151` ships as-is). |
-| **`TODO(T12)` un-gated memory** | `bridge/bot.js:951-976` | **MUST stay unconditional through 2026-08-20.** Gating it removes the agent's only re-acquire ability and breaks the demo. T15 adds a guard test. Revisit only after the demo, together with #23. |
+| **`TODO(T12)` un-gated memory** | `bridge/bot.js:951-976` | **MUST stay unconditional through 2026-08-20.** Gating it removes the agent's only re-acquire ability and breaks the demo. T14 adds a guard test. Revisit only after the demo, together with #23. |
+
+#### Known contract violation: `TURN_TO_LAST_SEEN` does not turn to the last *seen* position
+
+The macro's name is a statement of the **intended** contract. The implementation does
+not honor it: `_updateLastSeen()` writes the opponent's live position every step, so
+action 7 is an omniscient aim-snap, not a memory recall. Three separate places assert
+the memory-gated behavior that does not exist, and this is why the discrepancy went
+unnoticed for so long:
+
+1. the macro name `TURN_TO_LAST_SEEN` itself;
+2. `agent/actions.py` `MACRO_SEMANTICS[Macro.TURN_TO_LAST_SEEN]` — "the last-known opponent position stored in bridge memory";
+3. `bridge/bot.js:544-546` — "Updated from perception when the opponent is visible; null until the opponent has been seen at least once this episode" — **directly contradicted by the implementation 20 lines below it in the same file**.
+
+**Decision: do NOT rename the macro.** The name describes the contract we intend to
+honor once `TODO(T12)` is resolved; renaming it to match a placeholder bug would mean
+renaming it back afterwards, and it would churn the frozen `agent/actions.py` plus the
+bridge — files T1/T2/T3/T11b are already serialized on — for zero runtime benefit
+during a 4-day crunch. Instead, T14 corrects all three misleading comments to state
+what the code actually does and records the freeze.
 
 ### New — `opp_action` wire field (owner: T11a; consumers: T11b, T12)
 
@@ -244,8 +269,8 @@ reflex_blind_steps  : int = 8      # exhibition-only: force TURN_TO_LAST_SEEN af
 | T11b | Bridge applies `opp_action` | T1, T11a | high | `bridge/bot.js`, `bridge/actions.js` | Second `MacroExecutor` bound to the opponent handle; apply `opp_action` in the same window as the learner's. Silently ignore when no opponent bot. Satisfies AC9. |
 | T12 | Opponent stepping + curriculum | T9, T11b | high | `agent/train.py`, `agent/train_config.py` | Add the TrainConfig fields; step the opponent policy in Python and pass `opp_action` down (the loop currently never steps one — `train.py:1099`). Per-episode EASY/HARD mixture with the rolling win-rate gate; must not stall if the gate never fires. Satisfies AC9, AC10. |
 | T13 | Warm-start retrain + selection | T12 | med | `agent/train.py`, `eval/evaluate.py` | Honor `warm_start` to init from the existing checkpoint. Select the shipped checkpoint by scripted win-rate, not recency. Kick off overnight runs. |
-| T14 | Guard test for TODO(T12) | T1 | low | `bridge/actions.test.js` (or bot test) | TC14: assert `_updateLastSeen()` writes memory even when the opponent is out of FOV, with a comment explaining the freeze. Satisfies AC11. |
-| T15 | Docs | T8 | low | `README.md`, `RUNBOOK.md`, `docs/demo-day.md` | One-command flow on macOS, join instructions, one-challenger protocol, reset command, Java 21 note. Fix RUNBOOK's stale PowerShell/`pip install -e .`/Java-version content. Satisfies AC13. |
+| T14 | Guard test + truthful comments for the `TURN_TO_LAST_SEEN` violation | T1 | low | `bridge/actions.test.js` (or bot test), `bridge/bot.js`, `agent/actions.py` | TC14: assert `_updateLastSeen()` writes memory even when the opponent is out of FOV. Frame the test as documenting a KNOWN contract violation frozen until after the demo — not as asserting correct behavior. Also correct the three misleading assertions listed in Contracts: the `MACRO_SEMANTICS` entry for `TURN_TO_LAST_SEEN`, and the `bridge/bot.js:544-546` comment that contradicts the implementation 20 lines below it. Do NOT rename the macro. Satisfies AC11. |
+| T15 | Docs | T8 | low | `README.md`, `RUNBOOK.md`, `docs/demo-day.md` | One-command flow on macOS, join instructions, one-challenger protocol, reset command, Java 21 note. Fix RUNBOOK's stale PowerShell/`pip install -e .`/Java-version content. **Include the assisted-turn disclosure per AC14, in plain language near the top of the demo-day guide — not a footnote.** Satisfies AC13, AC14. |
 
 **Parallelism:** `bridge/bot.js` is edited by T1, T2, T3, T11b — strictly serial in that order. T4, T9, T11a start immediately in parallel with T1. T10 follows T9. T14 follows T1.
 
