@@ -148,7 +148,24 @@ Lifecycle sites (`872` spawn, `1140` role dispatch, `1340`/`1360` reset readback
 
 ### New — human death detection (owner: T2)
 
-`/scoreboard objectives add rl_deaths deathCount`, read via **mineflayer's scoreboard packet events** (`bot.on('scoreboardUpdate')` / `bot.scoreboard`), not chat-command scraping — the project has a history of silent command failures. An increment on the challenger's entry ⇒ `opponent_died`. Entity-gone is a secondary signal only.
+**Two commands are required, not one.** Both ship together:
+
+```
+/scoreboard objectives add rl_deaths deathCount
+/scoreboard objectives setdisplay list rl_deaths      <-- MANDATORY, not cosmetic
+```
+
+Read the objective from **raw client packets** on the learner's connection — `scoreboard_score`, `reset_score`, `scoreboard_objective`, `scoreboard_display_objective` — not from mineflayer's scoreboard plugin, and never from chat scraping. An increment on the challenger's entry ⇒ `opponent_died`.
+
+**Three corrections to an earlier draft of this section, each verified at primary source during T2 (do not "clean up" back toward the old form):**
+
+1. `bot.on('scoreboardUpdate')` **does not exist** — the mineflayer plugin emits `scoreUpdated`.
+2. `scoreUpdated` is **dead on 1.21.1**: the plugin gates the score path on `packet.action === 0` (`node_modules/mineflayer/lib/plugins/scoreboard.js:41-46`), but the 1.21.1 `scoreboard_score` packet has no `action` field — it is `{itemName, scoreName, value, display_name, number_format, styling}`, the field having been split into a separate `reset_score` packet in 1.20.3. The branch never runs, so the event never fires and `itemsMap` is never populated by score updates.
+3. **`objectives add` alone broadcasts nothing.** Decompiling the pinned `paper-1.21.1-133.jar` shows `ServerScoreboard.onScoreChanged` sending `ClientboundSetScorePacket` only inside `if (trackedObjectives.contains(objective))`, and the jar's sole caller of `startTrackingObjective` is `setDisplayObjective`. Without the `setdisplay`, the server counts deaths correctly and tells the bridge **nothing, with no error anywhere** — the project's signature silent-failure mode. Side effect for T15's docs: `rl_deaths` is visible in the tab player list during exhibitions.
+
+**Entity-gone is deliberately NOT used, even as a secondary signal** — it cannot distinguish a leaver from a death, and TC22 requires a mid-match leaver to hold IDLE. Using it would fabricate wins from disconnects.
+
+**What no fake can prove (for T8's live rehearsal):** that a live Paper actually broadcasts these packets to the learner's client. The live check is cheap — on first exhibition boot, the **absence** of `[bridge] pad N rl_deaths objective NOT confirmed` is the read-back confirming, and one real kill of a test human confirms the increment path end to end.
 
 **Status reporting:** the `state` message is `additionalProperties:false` on both validators and the env blocks on exactly one `state` per `step`. There is no wire slot for a status string. "Waiting for challenger" therefore means: **state keeps flowing with a zeroed opponent block; the status goes to the bridge log only.**
 
