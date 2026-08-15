@@ -64,6 +64,7 @@
 - [ ] **AC11** A guard test fails if `_updateLastSeen()` is made visibility-gated before the demo, and the three comments that falsely assert memory-gating (macro name aside) state what the code actually does.
 - [ ] **AC12** Full offline suite green (baseline: 450 passed, 2 deselected).
 - [ ] **AC13** `README.md`, `RUNBOOK.md`, and the demo-day guide describe the one-command flow accurately on macOS.
+- [ ] **AC15** ε does not reach its floor before ~15% of the run's episodes have elapsed at `arenas=16`, and the 16 arenas explore at distinct rates rather than one shared schedule.
 - [ ] **AC14** The demo-day guide and `README.md` state plainly that the agent's turn is assisted (action 7 aims at the opponent's live position regardless of line of sight), that its observation is nonetheless honestly FOV/LoS-gated, and that this is a known placeholder scheduled for removal after the demo. Written so it can be said out loud to a classroom, not buried in a footnote.
 
 ---
@@ -240,6 +241,8 @@ reflex_blind_steps  : int = 8      # exhibition-only: force TURN_TO_LAST_SEEN af
 | TC17 | Curriculum gate fires | Unit | Mixture shifts to `opponent_mix_easy_after` after the window clears the gate |
 | TC18 | Curriculum gate never fires | Unit | Run completes at the initial ratio (AC10) |
 | TC19 | Reflex shield | Unit | After `reflex_blind_steps` with `visible==0`, action is overridden to `TURN_TO_LAST_SEEN`; unchanged when visible |
+| TC22 | `epsilon_for_episode` at `arenas=16` | Unit | ε is still above the floor at 15% of the planned episode budget (AC15) |
+| TC23 | Per-actor ε spread | Unit | With N=16, arena ε values are distinct and monotonically ordered; arena 0 is the most greedy (AC15) |
 | TC20 | Full regression | Integration | `pytest` ≥ 450 passed; `node --test bridge/` green (AC12) |
 | TC21 | Live human rehearsal | Manual | AC1–AC5 confirmed by a real person on the existing checkpoint |
 
@@ -271,6 +274,7 @@ reflex_blind_steps  : int = 8      # exhibition-only: force TURN_TO_LAST_SEEN af
 | T12 | Opponent stepping + curriculum | T9, T11b | high | `agent/train.py`, `agent/train_config.py` | Add the TrainConfig fields; step the opponent policy in Python and pass `opp_action` down (the loop currently never steps one — `train.py:1099`). Per-episode EASY/HARD mixture with the rolling win-rate gate; must not stall if the gate never fires. Satisfies AC9, AC10. |
 | T13 | Warm-start retrain + selection | T12 | med | `agent/train.py`, `eval/evaluate.py` | Honor `warm_start` to init from the existing checkpoint. Select the shipped checkpoint by scripted win-rate, not recency. Kick off overnight runs. |
 | T14 | Guard test + truthful comments for the `TURN_TO_LAST_SEEN` violation | T1 | low | `bridge/actions.test.js` (or bot test), `bridge/bot.js`, `agent/actions.py` | TC14: assert `_updateLastSeen()` writes memory even when the opponent is out of FOV. Frame the test as documenting a KNOWN contract violation frozen until after the demo — not as asserting correct behavior. Also correct the three misleading assertions listed in Contracts: the `MACRO_SEMANTICS` entry for `TURN_TO_LAST_SEEN`, and the `bridge/bot.js:544-546` comment that contradicts the implementation 20 lines below it. Do NOT rename the macro. Satisfies AC11. |
+| T16 | Exploration sizing + per-actor ε (#15) | T12 | med | `agent/train_config.py`, `agent/train.py` | Two changes. (a) `eps_decay_episodes=200` is sized for the single-arena kickoff; all arenas share the GLOBAL episode counter (`train.py:1829`), so at 16 arenas ε floors after ~12 episodes/arena — ~1% of a one-day run against the config's own "~15% of total episodes" guidance. Resize to ~2500-3000 and make the docstring state the multi-arena math. (b) Implement Ape-X per-actor ε (#15): arena *i* of *N* explores at ε_i = ε^(1 + i/(N-1)·α), α≈7, instead of 16 identical schedules. No network change. Satisfies AC15. |
 | T15 | Docs | T8 | low | `README.md`, `RUNBOOK.md`, `docs/demo-day.md` | One-command flow on macOS, join instructions, one-challenger protocol, reset command, Java 21 note. Fix RUNBOOK's stale PowerShell/`pip install -e .`/Java-version content. **Include the assisted-turn disclosure per AC14, in plain language near the top of the demo-day guide — not a footnote.** Satisfies AC13, AC14. |
 
 **Parallelism:** `bridge/bot.js` is edited by T1, T2, T3, T11b — strictly serial in that order. T4, T9, T11a start immediately in parallel with T1. T10 follows T9. T14 follows T1.
