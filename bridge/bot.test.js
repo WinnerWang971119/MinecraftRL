@@ -63,7 +63,10 @@ const {
   ACTION_REPEAT,
   OPPONENT_MODE_HUMAN,
   OPPONENT_HEALTH_UNAVAILABLE,
+  PAD_INTERIOR_BOUNDS,
+  isInsidePad,
   formatResetPadCommand,
+  formatHumanResetCommands,
   formatSetupPadCommand,
   formatDeathObjectiveCommands,
   RL_DEATHS_OBJECTIVE,
@@ -328,6 +331,141 @@ test('the reset command and read-back templates follow the pad anchor', () => {
   // spawn_learner_pad / spawn_dummy_pad place.
   assert.deepEqual(bots.resetTemplate.position, { x: 512.5, y: 64.0, z: 1024.5 });
   assert.deepEqual(bots.dummyResetTemplate.position, { x: 515.5, y: 64.0, z: 1024.5 });
+});
+
+// ===========================================================================
+// THE EXHIBITION RESET (T3). `arena:reset_pad`'s third line is
+// `$function arena:spawn_dummy_pad {...dummy:"$(dummy)"...}`, and every one of
+// THAT file's eleven lines addresses `$(dummy)` as a selector. With no dummy bot
+// connected all eleven fail to find a player, so a human-mode reset prints
+// eleven "no player found" errors into the console the operator is watching —
+// per reset, all demo long. They are runtime selector no-ops rather than a macro
+// abort (the `$`-substitutions stay syntactically valid, so the function does
+// instantiate and its other lines run), which is why nothing was broken by them,
+// only obscured.
+//
+// The key cannot simply be dropped — a macro function errors when a referenced
+// key is absent, and THAT is the silent whole-function abort — so human mode
+// issues the two lines of reset_pad that apply to it, directly. Which means the
+// bridge now carries a COPY of datapack text: pinned below against the committed
+// file so an edit there fails here, not during an exhibition.
+// ===========================================================================
+
+/** The non-comment lines of `reset_pad.mcfunction`, with `$(k)` substituted. */
+function resetPadBody(args) {
+  return datapackLines('reset_pad.mcfunction').map((line) =>
+    line
+      .replace(/^\$/, '')
+      .replace(/\$\((\w+)\)/g, (_, key) => {
+        assert.ok(key in args, `reset_pad references an unknown macro key $(${key})`);
+        return String(args[key]);
+      }),
+  );
+}
+
+test('a human-mode reset runs the pad sweep and the LEARNER half, with no dummy selector at all', () => {
+  const args = { x: 512, z: 1024, learner: 'learner_3', dummy: 'dummy_3', nonce: 7 };
+  const body = resetPadBody(args);
+  const commands = formatHumanResetCommands(args);
+
+  // Line-for-line identity with what `arena:reset_pad` would have run, minus
+  // its dummy call. A drift in either direction (the datapack changing its
+  // sweep radius, this formatter changing its wording) fails here.
+  assert.equal(commands.length, 2);
+  assert.equal(commands[0], `/${body[0]}`, 'the entity sweep is the datapack line verbatim');
+  assert.equal(
+    commands[0],
+    '/execute positioned 512 64 1024 run kill @e[type=!minecraft:player,distance=..64]',
+  );
+  assert.equal(commands[1], `/${body[1]}`, 'and the learner half is reset_pad\'s own call');
+  assert.equal(
+    commands[1],
+    '/function arena:spawn_learner_pad {x:512,z:1024,learner:"learner_3",nonce:7}',
+  );
+  // The dummy half is what is deliberately NOT issued.
+  assert.ok(body[2].startsWith('function arena:spawn_dummy_pad'), 'reset_pad calls it');
+  assert.equal(
+    commands.some((cmd) => cmd.includes('dummy')),
+    false,
+    'no exhibition command may name a bot that is not connected',
+  );
+  // The macro arguments are validated exactly as the reset_pad ones are: a bad
+  // anchor here would still be pasted textually into spawn_learner_pad.
+  assert.throws(
+    () => formatHumanResetCommands({ ...args, x: -1 }),
+    /pad anchor x must be a non-negative plain integer/,
+  );
+  assert.throws(
+    () => formatHumanResetCommands({ ...args, learner: 'bad name' }),
+    /learner username must be a Minecraft username/,
+  );
+  assert.throws(() => formatHumanResetCommands({ ...args, nonce: 1.5 }), /reset nonce/);
+});
+
+test('handleReset chats the dummy-free pair in human mode and the SINGLE macro in bot mode', async () => {
+  // BOT MODE IS BYTE-INERT. The training path must issue exactly the one
+  // command it always has — same string, same count — or M2 regresses.
+  const botArena = new ArenaBots({}, { transport: { send: () => {} } });
+  botArena.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  botArena.dummy = mockDummy();
+  await botArena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+  assert.deepEqual(botArena.learner.chatLog, [botArena._resetPadCommand(1)]);
+  assert.deepEqual(botArena._resetCommands(1), [botArena._resetPadCommand(1)]);
+
+  // HUMAN MODE: the same reset, with nothing addressed to an absent dummy.
+  const sent = [];
+  const humanArena = exhibitionArena(sent, {});
+  humanArena._readbackOptions = SINGLE_POLL_GATE;
+  humanArena.learner.chatLog = [];
+  humanArena.learner.chat = (cmd) => humanArena.learner.chatLog.push(cmd);
+  await humanArena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+  assert.deepEqual(
+    humanArena.learner.chatLog,
+    formatHumanResetCommands({ x: 0, z: 0, learner: 'learner_bot', nonce: 1 }),
+  );
+});
+
+test('the exhibition challenger is NOT logged as cross-pad contamination', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: challenger });
+  arena._readbackOptions = SINGLE_POLL_GATE;
+  const errors = [];
+  const realError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    // Claim the slot, then reset the way an operator does between challengers.
+    await arena.handleStep({ type: 'step', action: Macro.IDLE });
+    assert.equal(arena._claimedChallenger, 'classmate_1');
+    assert.deepEqual(arena._scanForeignPlayers(), [], 'the opponent is not a foreign player');
+
+    // DRIVEN THROUGH THE REAL handleReset, not just the scan, because the
+    // ORDER of two lines at the end of it decides the outcome. handleReset both
+    // scans AND releases the slot; releasing first would blank the exclusion
+    // the scan depends on and log the outgoing challenger as contamination on
+    // their way out — every reset, which is the whole bug. A direct
+    // _scanForeignPlayers() call cannot see that ordering at all.
+    await arena.handleReset({ type: 'reset', episode: 1, seed: 0 });
+    assert.equal(arena._claimedChallenger, null, 'the reset still released the slot');
+
+    // A SECOND person in the pad still IS foreign — that is the
+    // one-challenger-at-a-time evidence, and narrowing the exclusion any
+    // further would throw it away.
+    await arena.handleStep({ type: 'step', action: Macro.IDLE });
+    arena.learner.entities[22] = playerEntity('classmate_2', 8.5, 4.5);
+    assert.deepEqual(arena._scanForeignPlayers(), ['classmate_2']);
+  } finally {
+    console.error = realError;
+  }
+  // eval/benchmark.py greps this exact line as contamination evidence, so an
+  // exhibition that logged its own opponent would read as a compromised run.
+  assert.equal(
+    errors.filter((line) => line.includes('foreign_players') && line.includes('classmate_1'))
+      .length,
+    0,
+    'the claimed challenger must never appear on the foreign_players line',
+  );
+  assert.ok(errors.some((line) => line.includes('foreign_players classmate_2')));
 });
 
 test('N=1 defaults reproduce the single-arena ports, usernames, anchor and templates (AC11)', () => {
@@ -931,9 +1069,9 @@ function coordsOf(pos) {
  * wait injected. `dummy` stays null — in 'human' mode there is no second
  * connection to make, which is the condition under test.
  */
-function exhibitionArena(sent, entities) {
+function exhibitionArena(sent, entities, config = {}) {
   const arena = new ArenaBots(
-    { opponentMode: OPPONENT_MODE_HUMAN },
+    { opponentMode: OPPONENT_MODE_HUMAN, ...config },
     { transport: { send: (msg) => sent.push(msg) } },
   );
   const learner = stepBot('learner_bot', { age: 100 });
@@ -953,9 +1091,15 @@ test('TC13: in exhibition mode ATTACK, the last-seen memory and the observation 
   const bystander = playerEntity('classmate_2', -9.5, 0.5);
   const arena = exhibitionArena(sent, { 11: challenger });
 
+  // The slot is EMPTY until a decision window claims it (T3's latch, tested in
+  // its own block below); resolution before that is null by design, so that no
+  // packet handler can ever be the thing that decides who the opponent is.
+  assert.equal(arena.dummy, null, "'human' mode never spawns a second bot");
+  assert.equal(arena._opponentHandle(), null, 'nothing is the opponent until it is claimed');
+  arena._claimChallenger();
+
   // The handle IS the player entity, and it reports no health SOURCE — not a
   // health of zero. A human's health is unreadable; T2's scoreboard owns wins.
-  assert.equal(arena.dummy, null, "'human' mode never spawns a second bot");
   const handle = arena._opponentHandle();
   assert.equal(handle.entity, challenger);
   assert.equal(handle.isBot, false);
@@ -1000,9 +1144,276 @@ test('TC13: in exhibition mode ATTACK, the last-seen memory and the observation 
     [5.5, 64, 0.5],
     'the observation describes the same person the window opened on',
   );
-  // Stateless ACROSS windows, though: the next step resolves afresh, so the
-  // bystander only becomes the opponent now. (The first-claimant latch is T3's.)
-  assert.equal(arena._opponentHandle().entity, bystander);
+  // REVISED BY T3, deliberately. Until the first-claimant latch landed this
+  // line asserted the OPPOSITE — that the next window resolves to the
+  // bystander — pinning the pre-latch statelessness with a comment saying T3
+  // would change it. It has: the slot belongs to classmate_1 until a reset, so
+  // a challenger who walks out does NOT hand the match to whoever is standing
+  // nearby. That is the whole of the latch, and since T2 it is also what keeps
+  // the bystander's next death from being credited as the agent's win.
+  assert.equal(arena._claimedChallenger, 'classmate_1', 'the slot is still claimed');
+  assert.equal(
+    arena._opponentHandle(),
+    null,
+    'the claimant is gone, so there is no opponent — the bystander does not inherit one',
+  );
+});
+
+// ===========================================================================
+// THE FIRST-CLAIMANT LATCH (T3, plan Error Handling: "Two people in the pad").
+//
+// `_resolveChallengerEntity()` used to be stateless: with challengerUsername
+// null it returned whichever non-own player `Object.keys(learner.entities)`
+// yielded first, which is deterministically the LOWEST ENTITY ID and not "first
+// to enter the pad" — re-decided on every call, over a view that reaches far
+// past the arena walls.
+//
+// T2's review escalated what that costs. `rl_deaths` is server-wide, so once
+// scoreboard death detection is live a bystander who resolves as the opponent
+// and then dies TO ANYTHING — fall, lava, another player, a different pad's
+// learner — is credited as this agent's win. The failure moved from "we aim at
+// the wrong person" (on screen, recoverable) to "we announce a win we did not
+// earn" (silent, and squarely against AC3).
+//
+// Two independent properties, tested independently below so one fixture cannot
+// stand in for both:
+//   (a) THE LATCH — the first claimant holds the slot until a reset;
+//   (b) THE PAD GATE — only somebody inside the pad may claim it at all.
+// ===========================================================================
+
+test('isInsidePad accepts the pad interior arena:setup_pad actually builds, and nothing else', () => {
+  // Bounds mirror setup_pad.mcfunction's own "EXACT BOUNDS" header: standable
+  // blocks x in [A.x-7, A.x+15], z in [A.z-11, A.z+11], inside an 8-block air
+  // column at y=64..71. The anchor is deliberately NOT (0,0) here — an
+  // implementation that ignored the anchor would pass at the origin.
+  const anchor = { x: 512, z: 1024 };
+  const at = (dx, y, dz) => isInsidePad({ x: anchor.x + dx, y, z: anchor.z + dz }, anchor);
+
+  assert.equal(at(0, 64, 0), true, 'the learner spawn cell is in the pad');
+  assert.equal(at(3, 64, 0), true, "the dummy's cell is in the pad");
+  assert.equal(at(-7, 64, -11), true, 'the far corner of the walkable floor');
+  assert.equal(at(15.7, 65.25, 11.7), true, 'a jumping player hugging the far wall');
+
+  // Outside the bedrock ring on each axis.
+  assert.equal(at(-7.5, 64, 0), false, 'past the west wall');
+  assert.equal(at(16.5, 64, 0), false, 'past the east wall');
+  assert.equal(at(0, 64, -11.5), false, 'past the north wall');
+  assert.equal(at(0, 64, 12.5), false, 'past the south wall');
+  // THE Y BAND IS NOT DECORATION. The pads float at y=62..71 while the superflat
+  // world's own ground is at y=-61..-64, so an x/z-only test would claim
+  // somebody standing directly UNDER the arena, hundreds of blocks below it.
+  assert.equal(at(0, -60, 0), false, 'the flat world floor beneath the pad is not the pad');
+  assert.equal(at(0, 200, 0), false, 'nor is the sky above it');
+
+  // An unreadable position must refuse the claim, never throw inside a decision
+  // window and never claim by accident.
+  for (const bad of [null, undefined, {}, { x: 0, y: 64 }, { x: NaN, y: 64, z: 0 }]) {
+    assert.equal(isInsidePad(bad, anchor), false);
+  }
+  assert.equal(isInsidePad({ x: 0, y: 64, z: 0 }, null), false);
+  // The constants are exported so a launcher/doc cannot restate them and drift.
+  assert.equal(PAD_INTERIOR_BOUNDS.minDx, -7);
+  assert.equal(PAD_INTERIOR_BOUNDS.maxDz, 12);
+});
+
+test('the FIRST claimant holds the slot: a later joiner IN THE PAD is ignored until reset', async () => {
+  const sent = [];
+  const first = playerEntity('classmate_1', 5.5, 0.5);
+  // Entity id 22 > 11, so `first` wins on entity order too — the ids are then
+  // SWAPPED below, which is what proves the slot is held by the claim and not
+  // re-decided by `Object.keys` order on every call.
+  const second = playerEntity('classmate_2', 8.5, 4.5);
+  const arena = exhibitionArena(sent, { 11: first });
+
+  assert.equal(arena._opponentHandle(), null, 'nothing is claimed before the first window');
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.equal(arena._claimedChallenger, 'classmate_1');
+
+  // A second person walks INTO THE PAD mid-match — the one-challenger-at-a-time
+  // case. They are eligible in every respect except that the slot is taken.
+  arena.learner.entities[2] = second;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+
+  assert.equal(arena._claimedChallenger, 'classmate_1', 'the claim does not move');
+  assert.equal(arena._opponentHandle().entity, first, 'nor does the opponent');
+  assert.deepEqual(sent[sent.length - 1].opponent.pos, [5.5, 64, 0.5]);
+
+  // ...and it is the RESET that arms the next challenger, per the protocol.
+  arena._readbackOptions = SINGLE_POLL_GATE;
+  await arena.handleReset({ type: 'reset', episode: 1, seed: 0 });
+  assert.equal(arena._claimedChallenger, null, 'the reset released the slot');
+
+  delete arena.learner.entities[11];
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.equal(arena._claimedChallenger, 'classmate_2', 'the next match claims afresh');
+});
+
+test('a player OUTSIDE the pad never claims the slot, however alone they are', async () => {
+  const sent = [];
+  // In the learner's entity view — mineflayer tracks players well past the pad
+  // walls — but standing outside the arena. Nobody else is present at all, so
+  // a stateless resolver hands them the whole match.
+  const distant = playerEntity('classmate_9', -9.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: distant });
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+
+  assert.equal(arena._claimedChallenger, null, 'out of the pad, out of the match');
+  assert.equal(arena._opponentHandle(), null);
+  assert.deepEqual(sent[sent.length - 1].opponent.pos, [0, 0, 0], 'a zeroed opponent block');
+
+  // They walk in. `livePosition` is the live vector mineflayer mutates, so this
+  // is how a real approach looks.
+  distant.position.x = 5.5;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+
+  assert.equal(arena._claimedChallenger, 'classmate_9', 'entering the pad claims it');
+  assert.equal(arena._opponentHandle().entity, distant);
+});
+
+test('AC3: an unclaimed bystander who dies outside the pad is NOT the agent\'s win', async () => {
+  const sent = [];
+  // THE FAILURE THIS TASK EXISTS TO CLOSE. Nobody has claimed the slot, and the
+  // only player in the learner's entity view is somebody outside the arena. Two
+  // separate mistakes each hand them the match: resolving the "first" player
+  // whenever the slot is empty, or claiming without the pad test. Either way
+  // their next death — to a mob, a fall, another player, anything — arrives on
+  // the server-wide `rl_deaths` objective and is announced as the agent's kill.
+  const bystander = playerEntity('classmate_9', -9.5, 0.5);
+  const arena = deathArena(sent, { 11: bystander });
+  await armDeathDetection(arena);
+
+  await stepOnce(arena, sent);
+  assert.equal(arena._claimedChallenger, null, 'nobody in the pad, nobody claimed');
+
+  emitDeathScore(arena, 'classmate_9', 1);
+
+  assert.equal(
+    (await stepOnce(arena, sent)).events.opponent_died,
+    false,
+    'a death outside the match must never be reported as a win',
+  );
+
+  // The same person, once they are actually IN the pad and claimed, is the
+  // opponent and their death does count — the gate refuses wins, it does not
+  // break them.
+  bystander.position.x = 5.5;
+  await stepOnce(arena, sent);
+  assert.equal(arena._claimedChallenger, 'classmate_9');
+  emitDeathScore(arena, 'classmate_9', 2);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('the claim survives a disconnect: the same person resumes, nobody else inherits', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const opportunist = playerEntity('classmate_2', 8.5, 4.5);
+  const arena = exhibitionArena(sent, { 11: challenger });
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.equal(arena._claimedChallenger, 'classmate_1');
+
+  // They rage-quit mid-match and somebody else steps into the pad. The plan is
+  // explicit that a leaver is NOT a death (entity-gone cannot tell the two
+  // apart), so the match is simply held — it is not handed to the newcomer.
+  delete arena.learner.entities[11];
+  arena.learner.entities[2] = opportunist;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.equal(arena._opponentHandle(), null, 'held, not reassigned');
+  assert.equal(arena._claimedChallenger, 'classmate_1');
+
+  // They reconnect: mineflayer hands the learner a NEW entity for them (a new
+  // id, a new object). Resolution is by NAME, so the match simply resumes.
+  arena.learner.entities[77] = playerEntity('classmate_1', 6.5, 1.5);
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assert.equal(arena._opponentHandle().entity, arena.learner.entities[77]);
+  assert.deepEqual(sent[sent.length - 1].opponent.pos, [6.5, 64, 1.5]);
+});
+
+test('a pinned challengerUsername IS the claim: it needs no pad entry and no window', () => {
+  const sent = [];
+  // Pinned, and NOBODY is in the entity view. The pin is the operator naming
+  // the opponent up front, which outranks any latch — and it must keep working
+  // with an empty pad, because T2 attributes a death by name alone.
+  const arena = exhibitionArena(sent, {}, { challengerUsername: 'classmate_1' });
+
+  assert.equal(arena._challengerSlot(), 'classmate_1', 'the pin fills the slot immediately');
+  arena._claimChallenger();
+  assert.equal(arena._claimedChallenger, null, 'a pin claims nothing of its own');
+
+  // A pin is not a licence to resolve the wrong entity, though: only the pinned
+  // name resolves, wherever anyone else is standing.
+  arena.learner.entities[11] = playerEntity('classmate_2', 5.5, 0.5);
+  assert.equal(arena._opponentHandle(), null);
+  arena.learner.entities[22] = playerEntity('classmate_1', 6.5, 0.5);
+  assert.equal(arena._opponentHandle().username, 'classmate_1');
+});
+
+test('an operator typo pinning one of our OWN bots resolves to nothing, never to the agent', () => {
+  const sent = [];
+  // `--challenger-username learner_bot`. run.js cannot catch this (it is a
+  // perfectly well-formed username), and the cost of resolving it would be the
+  // agent taking ITSELF as the opponent: ATTACK aimed at its own entity and,
+  // via `rl_deaths`, its own death credited to it as a win.
+  const arena = exhibitionArena(sent, {}, { challengerUsername: 'learner_bot' });
+  arena.learner.entities[11] = playerEntity('learner_bot', 5.5, 0.5);
+
+  assert.equal(arena._opponentHandle(), null);
+  assert.equal(arena._isChallengerName('learner_bot'), false);
+});
+
+test('with no challenger the agent HOLDS IDLE — it does not jog around an empty pad', async () => {
+  const sent = [];
+  const arena = exhibitionArena(sent, {});
+  const pressed = [];
+  arena.learner.setControlState = (state, value) => pressed.push([state, value]);
+
+  // A null handle already makes ATTACK a no-op (nothing to swing at), but the
+  // movement macros need no opponent at all — so between challengers a live
+  // policy would walk the agent around an empty arena on a projector.
+  await arena.handleStep({ type: 'step', action: Macro.APPROACH });
+
+  assert.deepEqual(
+    pressed.filter(([, value]) => value === true),
+    [],
+    'no control state may be PRESSED with nobody to fight',
+  );
+  const state = sent[sent.length - 1];
+  assert.doesNotThrow(() => validateOutbound(state));
+  assert.deepEqual(state.opponent.pos, [0, 0, 0], 'and the opponent block stays zeroed');
+
+  // The override is exactly as wide as the reason for it: once somebody claims
+  // the slot, the requested macro runs untouched.
+  arena.learner.entities[11] = playerEntity('classmate_1', 5.5, 0.5);
+  await arena.handleStep({ type: 'step', action: Macro.APPROACH });
+  assert.ok(
+    pressed.some(([state_, value]) => state_ === 'forward' && value === true),
+    'APPROACH must run normally against a real challenger',
+  );
+});
+
+test('BOT mode never claims, never holds IDLE, and never pays for the latch', async () => {
+  const sent = [];
+  // The M2/training path. Every line T3 added is gated on the opponent MODE, so
+  // a missing dummy here must behave exactly as it did before this task: the
+  // requested macro runs, and no challenger machinery engages at all.
+  const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  arena.learner = stepBot('learner_bot', { age: 10 });
+  arena.learner.entities = { 11: playerEntity('classmate_1', 5.5, 0.5) };
+  const pressed = [];
+  arena.learner.setControlState = (state, value) => pressed.push([state, value]);
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+
+  await arena.handleStep({ type: 'step', action: Macro.APPROACH });
+
+  assert.equal(arena._claimedChallenger, null, 'a human in view is not an opponent here');
+  assert.equal(arena._challengerSlot(), null);
+  assert.ok(
+    pressed.some(([state_, value]) => state_ === 'forward' && value === true),
+    'the training path executes the macro it was sent, dummy or no dummy',
+  );
 });
 
 test('TC22: a challenger who leaves mid-match zeroes the opponent block, keeps the memory, and never throws', async () => {

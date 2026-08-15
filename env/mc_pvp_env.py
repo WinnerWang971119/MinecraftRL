@@ -50,7 +50,9 @@ step:
     The raw state is gated by the PerceptionFilter, packed by
     ``build_observation``, validated, and scored by ``compute_reward`` against
     the previous observation. ``done`` fires on a death event or at
-    ``MAX_EPISODE_STEPS`` (timeout).
+    ``MAX_EPISODE_STEPS`` (timeout) — unless the env was built with
+    ``max_episode_steps=None``, the exhibition form (see
+    :class:`ExhibitionConfig`), where only a death ends the match.
 
 Privileged-data discipline (spec §5): opponent raw ``pos`` / ``yaw`` / ``vel``
 reach the obs ONLY through the gating filter; opponent ``health`` never reaches
@@ -64,7 +66,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import socket
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -106,6 +110,7 @@ __all__ = [
     "BridgeError",
     "BridgeTransport",
     "TcpBridgeClient",
+    "ExhibitionConfig",
     "MCPvPEnv",
     "DECISION_DT_SECONDS",
     "REWARD_COMPONENT_KEYS",
@@ -367,6 +372,102 @@ def _world_to_local_yaw(vx: float, vy: float, vz: float, yaw: float) -> Tuple[fl
 
 
 # ---------------------------------------------------------------------------
+# EXHIBITION MODE (T3) — the config for a match against a live human.
+#
+# Owned here because :class:`MCPvPEnv` is what ``no_timeout`` actually acts on;
+# the launcher, the reset command and the reflex shield (T5/T6/T7) consume it.
+# It is deliberately NOT a bridge concern: the bridge already carries the two
+# process-local keys it needs (``opponentMode`` / ``challengerUsername``, wired
+# through ``bridge/run.js``), and it has no notion of an episode horizon at all.
+# ---------------------------------------------------------------------------
+
+#: Minecraft usernames as this project uses them (offline mode, ops.json).
+#: Mirrors ``MACRO_USERNAME_RE`` in ``bridge/bot.js``.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+
+
+@dataclass(frozen=True)
+class ExhibitionConfig:
+    """Settings for one human-exhibition match.
+
+    Frozen: the launcher builds it once and hands the same object to the bridge
+    wiring, the env and the reflex shield, so no consumer can retune the match
+    out from under another.
+
+    Args:
+        challenger_username: The pinned challenger's Minecraft username, or
+            ``None`` for "the first non-agent player who enters the pad claims
+            the slot" (the bridge's first-claimant latch). **Prefer a pinned
+            name on demo day**: it is the operator naming the opponent up front,
+            which no heuristic can beat.
+        no_timeout: Disable the episode horizon while a human is the opponent.
+            A person deciding what to do is not a stalling agent, and a match
+            that ends mid-fight because 400 decision steps elapsed reads to a
+            classroom as the agent giving up. See :attr:`env_max_episode_steps`
+            for the form this takes — there is no sentinel and no large integer.
+        auto_reset: Whether a finished match restarts by itself. **Must be
+            False** (AC4): the match ends, the result is reported, and the
+            operator arms the next challenger with the separate reset command.
+            Constructing with ``True`` raises rather than silently promising a
+            restart nothing implements.
+        reflex_blind_steps: Consecutive blind decision steps before the
+            exhibition-only reflex shield overrides the action with
+            ``TURN_TO_LAST_SEEN``. Config only here — T7 owns the behavior. The
+            default of 8 is ~1.6 s at the frozen 200 ms decision interval.
+
+    Raises:
+        ValueError: on a malformed username, a non-``False`` ``auto_reset``, or
+            a negative ``reflex_blind_steps``.
+    """
+
+    challenger_username: Optional[str] = None
+    no_timeout: bool = True
+    auto_reset: bool = False
+    reflex_blind_steps: int = 8
+
+    def __post_init__(self) -> None:
+        name = self.challenger_username
+        if name is not None and (
+            not isinstance(name, str) or _USERNAME_RE.match(name) is None
+        ):
+            # A pin that cannot match a real player is an exhibition in which
+            # nobody is ever the opponent — indistinguishable, from the operator's
+            # side, from nobody having joined. Refuse it at construction.
+            raise ValueError(
+                "challenger_username must be a Minecraft username matching "
+                f"{_USERNAME_RE.pattern} or None, got {name!r}"
+            )
+        if self.auto_reset is not False:
+            raise ValueError(
+                "auto_reset=True is not implemented and would violate AC4 (after a "
+                "death the match must not auto-restart); the operator runs the "
+                "separate reset command between challengers"
+            )
+        if not isinstance(self.reflex_blind_steps, int) or isinstance(
+            self.reflex_blind_steps, bool
+        ):
+            raise ValueError(
+                f"reflex_blind_steps must be an int, got {self.reflex_blind_steps!r}"
+            )
+        if self.reflex_blind_steps < 0:
+            raise ValueError(
+                f"reflex_blind_steps must be >= 0, got {self.reflex_blind_steps}"
+            )
+
+    @property
+    def env_max_episode_steps(self) -> Optional[int]:
+        """The ``max_episode_steps`` an env for this match must be built with.
+
+        ``None`` when :attr:`no_timeout` is set — **the one and only form**
+        "disabled" takes. Not a sentinel, and emphatically not a large integer:
+        a large integer is a timeout that has merely been moved somewhere less
+        convenient to notice, and it would fire in the middle of a long match in
+        front of an audience.
+        """
+        return None if self.no_timeout else MAX_EPISODE_STEPS
+
+
+# ---------------------------------------------------------------------------
 # The environment.
 # ---------------------------------------------------------------------------
 
@@ -389,7 +490,13 @@ class MCPvPEnv:
         perception_filter: Optional pre-built filter (tests inject one with a
             custom ``los_clear`` / FOV). Defaults to a fresh :class:`PerceptionFilter`.
         max_episode_steps: Decision steps before a timeout truncation. Defaults to
-            the frozen :data:`MAX_EPISODE_STEPS`.
+            the frozen :data:`MAX_EPISODE_STEPS`. Pass ``None`` to disable
+            truncation entirely — the exhibition path (T3/AC4), where the
+            opponent is a person and an episode horizon would end a live match
+            mid-fight. ``None`` is the ONLY spelling of "disabled": a sentinel
+            or a very large integer would be a timeout that still fires, just
+            somewhere harder to notice. Build one with
+            :attr:`ExhibitionConfig.env_max_episode_steps`.
         dt: Per-step seconds handed to the filter's memory aging. Defaults to the
             derived :data:`DECISION_DT_SECONDS`.
         auto_connect: Connect the transport during construction. Defaults to True;
@@ -423,13 +530,15 @@ class MCPvPEnv:
         transport: BridgeTransport,
         reward_config: Optional[RewardConfig] = None,
         perception_filter: Optional[PerceptionFilter] = None,
-        max_episode_steps: int = MAX_EPISODE_STEPS,
+        max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
         dt: float = DECISION_DT_SECONDS,
         auto_connect: bool = True,
     ) -> None:
-        if max_episode_steps <= 0:
+        # ``None`` is "no truncation" and is handled BEFORE the range check —
+        # the check reads ``<= 0``, and ``None <= 0`` is a TypeError on Python 3.
+        if max_episode_steps is not None and max_episode_steps <= 0:
             raise ValueError(
-                f"max_episode_steps must be > 0, got {max_episode_steps}"
+                f"max_episode_steps must be > 0 or None, got {max_episode_steps}"
             )
         if dt < 0.0:
             raise ValueError(f"dt must be >= 0, got {dt}")
@@ -439,7 +548,10 @@ class MCPvPEnv:
         self._filter = (
             perception_filter if perception_filter is not None else PerceptionFilter()
         )
-        self._max_steps = int(max_episode_steps)
+        #: Episode horizon in decision steps, or None for no truncation at all.
+        self._max_steps: Optional[int] = (
+            None if max_episode_steps is None else int(max_episode_steps)
+        )
         self._dt = float(dt)
 
         # Per-episode mutable state (initialized by reset()).
@@ -468,6 +580,16 @@ class MCPvPEnv:
     def step_count(self) -> int:
         """Number of decision steps taken in the current episode."""
         return self._step_count
+
+    @property
+    def max_episode_steps(self) -> Optional[int]:
+        """Episode horizon in decision steps, or ``None`` for no truncation.
+
+        ``None`` is the exhibition form (T3/AC4): only a death ends the match.
+        Exposed so a caller can assert what it built rather than infer the
+        horizon from how long an episode happened to run.
+        """
+        return self._max_steps
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -585,9 +707,16 @@ class MCPvPEnv:
 
         ``done`` fires when the bridge reports a death (``events.i_died`` →
         terminal loss, ``events.opponent_died`` → terminal win) OR when the step
-        count reaches ``max_episode_steps`` (timeout / draw). The three terminal
-        outcomes are mutually exclusive; a same-step double-death is resolved as a
-        loss (the learner dying is never a win).
+        count reaches ``max_episode_steps`` (timeout / draw) — the latter only
+        when a horizon is set at all; ``max_episode_steps=None`` (exhibition,
+        AC4) never truncates. The three terminal outcomes are mutually
+        exclusive; a same-step double-death is resolved as a loss (the learner
+        dying is never a win).
+
+        Nothing here restarts an episode. ``done`` leaves the env finished and
+        the next :meth:`step` raises until :meth:`reset` is called explicitly —
+        which is exactly AC4's "after a death the match does not auto-restart",
+        and the reason :class:`ExhibitionConfig` refuses ``auto_reset=True``.
 
         Args:
             action: Discrete action index (or :class:`~agent.actions.Macro`) in
@@ -633,7 +762,11 @@ class MCPvPEnv:
 
         died = bool(events.i_died)
         opp_died = bool(events.opponent_died)
-        timed_out = self._step_count >= self._max_steps
+        # A None horizon NEVER truncates (T3/AC4): against a human the only
+        # things that end a match are a death and the operator's reset. Written
+        # as an explicit None test rather than a comparison against a stand-in
+        # ceiling so there is no number here that could ever be reached.
+        timed_out = self._max_steps is not None and self._step_count >= self._max_steps
 
         done = died or opp_died or timed_out
         # Resolve mutually-exclusive outcome flags. A simultaneous double-death is

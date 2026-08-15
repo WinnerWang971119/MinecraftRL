@@ -82,6 +82,7 @@ const { BridgeServer } = require('./transport');
 const {
   EventAggregator,
   MacroExecutor,
+  Macro,
   ACTION_MIN,
   ACTION_MAX,
   IRON_SWORD_ATTACK_SPEED_TICKS,
@@ -182,6 +183,74 @@ const RL_DEATHS_DISPLAY_SLOT = 'list';
 
 /** How long connect() waits for the server to echo the objective back. */
 const RL_DEATHS_READBACK_TIMEOUT_MS = 5000;
+
+// ---------------------------------------------------------------------------
+// EXHIBITION MODE (T3) — THE FIRST-CLAIMANT LATCH.
+//
+// `_resolveChallengerEntity()` used to scan the learner's whole entity view and
+// hand back whichever non-own player `Object.keys` yielded first — which is the
+// lowest ENTITY ID, not "first to enter the pad", and is re-decided on every
+// call. Two things make that unacceptable now:
+//
+//   1. The learner's entity view reaches far past this pad's bedrock ring, so
+//      "a player is in view" is a much larger region than "a player is in the
+//      arena". Somebody wandering the flat world hundreds of blocks away, or
+//      standing on the terrain BELOW the pad at the same x/z, qualified.
+//   2. Since T2 that is no longer merely "the agent aims at the wrong person"
+//      (visible on screen, recoverable). `rl_deaths` is server-wide, so a
+//      bystander who happens to resolve as the opponent and then dies TO
+//      ANYTHING — fall, lava, another player — is credited as the agent's win.
+//      Silent, and directly contrary to AC3.
+//
+// So the slot is CLAIMED: the first eligible player standing inside this pad
+// takes it, later joiners are ignored, and the slot is only released by a
+// reset (the operator's between-challengers command, T6). Resolution afterwards
+// is BY NAME, so the claimant keeps the slot across a disconnect and nobody
+// inherits it by having a lower entity ID.
+//
+// A pinned `challengerUsername` IS the claim: it is the operator naming the
+// challenger up front, which is strictly stronger than any latch, and it
+// deliberately skips the pad test so a pin works before anyone has walked in.
+// ---------------------------------------------------------------------------
+
+/**
+ * The pad's occupiable interior, as OFFSETS from the pad anchor, mirroring the
+ * geometry `arena:setup_pad` actually builds (see its "EXACT BOUNDS" header):
+ * floor at y=63, an 8-block air column at y=64..71, and a closed bedrock ring,
+ * leaving blocks x in [A.x-7, A.x+15], z in [A.z-11, A.z+11] standable.
+ *
+ * The bounds below are BLOCK bounds used against a player's CENTRE, so they are
+ * generous by up to half a block on each face — deliberately. This test decides
+ * whether somebody is close enough to be the challenger, and the cost of the
+ * two errors is wildly asymmetric: half a block of slack lets an operator who
+ * is hugging a wall be claimed, while half a block of strictness would refuse
+ * to claim the person standing in front of the agent, with a demo audience
+ * watching. Everything outside is bedrock, so the slack is unoccupiable anyway.
+ *
+ * The y band is what keeps the flat world's OWN ground out: the pads float at
+ * y=62..71 while the superflat terrain sits at y=-61..-64, so an x/z-only test
+ * would claim somebody standing far below the arena.
+ */
+const PAD_INTERIOR_BOUNDS = Object.freeze({
+  minDx: -7,
+  maxDx: 16,
+  minDz: -11,
+  maxDz: 12,
+  // Feet level inside the pad is y=64..71 (the air column). One block of slack
+  // below (the floor) and one above the ring for a jump at the top.
+  minY: 63,
+  maxY: 72,
+});
+
+/** Feet level of a pad's floor — the y `arena:setup_pad` positions from. */
+const PAD_FEET_Y = 64;
+
+/**
+ * Radius of the datapack's loose-entity sweep. Mirrors the `distance=..64` in
+ * BOTH `arena:setup_pad` and `arena:reset_pad`, which are deliberately equal so
+ * no band of space is reached by one sweep and missed by the other.
+ */
+const PAD_SWEEP_RADIUS = 64;
 
 /** Default offline-mode connection + identity config for the two bots. */
 const DEFAULT_BOT_CONFIG = Object.freeze({
@@ -383,6 +452,97 @@ function formatResetPadCommand(args) {
   // is absent — so the nonce is validated exactly like the coordinates.
   const nonce = assertMacroInt(spec.nonce, 'reset nonce');
   return `/function arena:reset_pad {x:${x},z:${z},learner:"${learner}",dummy:"${dummy}",nonce:${nonce}}`;
+}
+
+/**
+ * Whether a world position lies inside THIS pad's occupiable interior.
+ *
+ * PURE, and the gate on the first-claimant latch: "in the learner's entity
+ * view" is a far larger region than "in the arena", and since T2 a bystander
+ * who resolves as the opponent and then dies to anything is credited as the
+ * agent's win. Only somebody actually standing in the pad may claim the slot.
+ *
+ * Defensive about its input on purpose: a mineflayer entity that has been seen
+ * but not yet positioned carries no usable `position`, and an unreadable
+ * position must read as "not in the pad" (refuse the claim) rather than throw
+ * inside a decision window or, worse, claim by accident.
+ *
+ * @param {{x:number,y:number,z:number}|null|undefined} position A world position.
+ * @param {{x:number,z:number}} anchor This pad's anchor (the learner spawn CELL).
+ * @returns {boolean} True only for a position provably inside the pad.
+ */
+function isInsidePad(position, anchor) {
+  if (position === null || typeof position !== 'object' || !anchor) {
+    return false;
+  }
+  const { x, y, z } = position;
+  if (
+    typeof x !== 'number' ||
+    !Number.isFinite(x) ||
+    typeof y !== 'number' ||
+    !Number.isFinite(y) ||
+    typeof z !== 'number' ||
+    !Number.isFinite(z)
+  ) {
+    return false;
+  }
+  const dx = x - anchor.x;
+  const dz = z - anchor.z;
+  return (
+    dx >= PAD_INTERIOR_BOUNDS.minDx &&
+    dx <= PAD_INTERIOR_BOUNDS.maxDx &&
+    dz >= PAD_INTERIOR_BOUNDS.minDz &&
+    dz <= PAD_INTERIOR_BOUNDS.maxDz &&
+    y >= PAD_INTERIOR_BOUNDS.minY &&
+    y <= PAD_INTERIOR_BOUNDS.maxY
+  );
+}
+
+/**
+ * The per-episode reset commands for a pad whose opponent is a HUMAN (T3).
+ *
+ * WHY THIS EXISTS RATHER THAN `arena:reset_pad`. That macro's third line is
+ * `$function arena:spawn_dummy_pad {...dummy:"$(dummy)"...}`, and every one of
+ * that file's eleven lines addresses `$(dummy)` as a selector. In exhibition
+ * mode no dummy bot is connected, so all eleven fail to find a player and the
+ * server prints eleven errors PER RESET into the console the operator is
+ * watching during a demo. They are runtime selector no-ops, not a macro abort —
+ * the `$`-substitutions stay syntactically valid, so the function instantiates
+ * and its other lines still run — but they are noise that hides real problems,
+ * and the reset is asking the server to do work for a bot that does not exist.
+ *
+ * The `dummy` key cannot simply be dropped: a macro function errors if a
+ * referenced key is absent, which WOULD be the silent whole-function abort. Nor
+ * can another name be substituted — the learner's would make `spawn_dummy_pad`
+ * clear, teleport and knockback-pin the AGENT. So human mode issues the two
+ * lines of `arena:reset_pad` that apply to it, directly:
+ *
+ *   1. the loose-entity sweep, verbatim (same position, same radius);
+ *   2. `arena:spawn_learner_pad`, with the same arguments reset_pad forwards.
+ *
+ * The causality chain is intact: `spawn_learner_pad`'s last line is the
+ * nonce-stamped learner beacon, and `_resetWasConfirmed('dummy')` already
+ * auto-confirms when there is no dummy connection. The read-back gate is
+ * already keyed on the opponent MODE, so it skips the dummy gate here too.
+ *
+ * These two strings DUPLICATE lines of `reset_pad.mcfunction`, which is a real
+ * drift hazard — pinned by a test that reads the committed datapack and
+ * compares, so an edit there fails here instead of in a live exhibition.
+ *
+ * @param {{x:number, z:number, learner:string, nonce:number}} args
+ * @returns {string[]} Chat-ready commands, in issue order.
+ */
+function formatHumanResetCommands(args) {
+  const spec = args || {};
+  const x = assertMacroInt(spec.x, 'pad anchor x');
+  const z = assertMacroInt(spec.z, 'pad anchor z');
+  const learner = assertMacroUsername(spec.learner, 'learner username');
+  const nonce = assertMacroInt(spec.nonce, 'reset nonce');
+  return [
+    `/execute positioned ${x} ${PAD_FEET_Y} ${z} run kill ` +
+      `@e[type=!minecraft:player,distance=..${PAD_SWEEP_RADIUS}]`,
+    `/function arena:spawn_learner_pad {x:${x},z:${z},learner:"${learner}",nonce:${nonce}}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1176,37 @@ class ArenaBots {
     // joiner, and is overwritten by whoever the next window resolves.
     this._challengerDeathName = null;
 
+    // THE FIRST-CLAIMANT LATCH (T3). The username that has CLAIMED this pad's
+    // challenger slot, or null while the slot is free. See the EXHIBITION MODE
+    // block near the top of this file for why a stateless resolve is unsafe.
+    //
+    // Written in exactly ONE place — _claimChallenger(), called once per
+    // decision window from handleStep — and released in exactly one place, the
+    // tail of handleReset. Keeping the claim out of _resolveChallengerEntity()
+    // is load-bearing, not tidiness: that resolver is reached from the
+    // SCOREBOARD PACKET HANDLER (via _isChallengerName's live-resolve
+    // fallback), so a resolver that claimed would let a death packet itself
+    // decide who the challenger was — the exact fabricated-win path the latch
+    // exists to close.
+    //
+    // A pinned this.challengerUsername outranks it; see _challengerSlot().
+    this._claimedChallenger = null;
+
+    // Edge-trigger state for the exhibition's log-only status line. The wire
+    // has no slot for a status string (`state` is additionalProperties:false on
+    // both validators and the env blocks on exactly one `state` per `step`), so
+    // "waiting for a challenger" goes to the bridge log — and must be logged on
+    // TRANSITIONS only. handleStep runs five times a second; a per-window line
+    // would bury the reset diagnostics the operator actually needs.
+    //
+    // null == nothing logged yet, so the first window always states the truth.
+    this._challengerPresentLogged = null;
+
+    // Names already reported as "seen, but not in the pad", so the same distant
+    // player is named once rather than five times a second. Cleared with the
+    // claim on every reset, so it can never outgrow the player list.
+    this._outOfPadReported = new Set();
+
     // Bounded wait for the objective read-back. Injectable so a unit test can
     // drive the unconfirmed path without burning 5 s of wall clock.
     this._deathObjectiveTimeoutMs =
@@ -1498,8 +1689,32 @@ class ArenaBots {
   }
 
   /**
+   * Every command this reset issues, in order.
+   *
+   * ONE command in 'bot' mode — byte-identical to what handleReset chatted
+   * before this seam existed, so the training path cannot regress. In 'human'
+   * mode the dummy half of `arena:reset_pad` would address a bot that is not
+   * connected and print an error per line; see formatHumanResetCommands.
+   *
+   * @param {number} [nonce] Defaults to the currently armed nonce.
+   * @returns {string[]} Chat-ready commands, in issue order.
+   */
+  _resetCommands(nonce = this._resetConfirm.nonce) {
+    if (this._opponentIsBot()) {
+      return [this._resetPadCommand(nonce)];
+    }
+    return formatHumanResetCommands({
+      x: this.padOrigin.x,
+      z: this.padOrigin.z,
+      learner: this.config.learnerUsername,
+      nonce,
+    });
+  }
+
+  /**
    * Log any player in the learner's entity view that is not one of THIS pad's
-   * two bots (T12's cross-pad isolation evidence, AC13).
+   * two bots — nor, in exhibition mode, its claimed challenger (T12's cross-pad
+   * isolation evidence, AC13).
    *
    * `dummy.on('health')` records a health DROP with no attacker attribution, so
    * a learner that reached a neighbouring pad would silently credit its damage
@@ -1507,10 +1722,31 @@ class ArenaBots {
    * construction; this scan is the observable that PROVES it, emitted on the
    * bridge's stderr (never on the frozen wire) once per reset.
    *
+   * THE CHALLENGER IS NOT CONTAMINATION (T3). A human opponent is a player in
+   * the learner's view by definition, so without this exclusion every single
+   * exhibition reset would name them here — and eval/benchmark.py reads this
+   * line as cross-pad contamination evidence, so a perfectly clean demo would
+   * read as a compromised run. The exclusion is deliberately narrow: only the
+   * CLAIMED (or pinned) challenger, so a second person in the pad still shows
+   * up, which is exactly the one-challenger-at-a-time evidence an operator
+   * wants. A challenger standing in the pad before anything has claimed them
+   * (only possible on the first reset of an exhibition, since the claim is
+   * released here at the end of every later one) is likewise still named —
+   * truthfully: at that instant they are an unclaimed player, not the opponent.
+   *
    * @returns {string[]} Foreign usernames seen, in first-seen order.
    */
   _scanForeignPlayers() {
     const own = new Set([this.config.learnerUsername, this.config.dummyUsername]);
+    // MODE-GATED, like every other exhibition path in this file. A challenger
+    // name that somehow reached a 'bot'-mode pad (run.js refuses the
+    // combination, but this object can be constructed directly) must not
+    // quietly excuse a real player from the training path's contamination
+    // evidence — that is the one reader of this line who cannot afford a hole.
+    const challenger = this._opponentIsBot() ? null : this._challengerSlot();
+    if (challenger !== null) {
+      own.add(challenger);
+    }
     const foreign = [];
     const entities =
       this.learner && this.learner.entities && typeof this.learner.entities === 'object'
@@ -1581,7 +1817,12 @@ class ArenaBots {
     // exactly one reset.
     this._resetConfirm = { nonce: epoch, learner: false, dummy: false };
     const confirmStartedAt = Date.now();
-    this._sendCommand(this.learner, this._resetPadCommand(epoch));
+    // ONE command in 'bot' mode (unchanged); the dummy-free pair in 'human'
+    // mode, where `arena:reset_pad`'s dummy half would address a bot that is
+    // not connected. See _resetCommands / formatHumanResetCommands.
+    for (const command of this._resetCommands(epoch)) {
+      this._sendCommand(this.learner, command);
+    }
 
     // Reset per-episode state: the swing gate (so no previous episode's swing
     // is still cooling), the tick counter, the last-seen memory, and the held
@@ -1773,6 +2014,31 @@ class ArenaBots {
     // Cross-pad isolation evidence (AC13/T12): once per episode, name anything
     // in view that is not one of this pad's two bots. Logged, never on the wire.
     this._scanForeignPlayers();
+
+    // RELEASE THE CHALLENGER SLOT (T3) — "later joiners are ignored UNTIL
+    // RESET". This is the between-challengers reset the operator runs (T6);
+    // arming the next challenger is the whole point of it.
+    //
+    // AFTER _scanForeignPlayers, deliberately: clearing first would blank the
+    // exclusion the scan just gained and log the outgoing challenger as
+    // cross-pad contamination on their way out — the bug this task fixes. No
+    // step can interleave between the two (the transport serves one request at
+    // a time), so "until reset" is observably identical either way.
+    //
+    // WHICH RESETS REACH THIS LINE, stated precisely — the loose version of
+    // this comment ("a failed reset never releases the slot") was wrong in one
+    // of its three cases and is not worth shipping in a file that already
+    // carries retractions:
+    //   - a STALE-EPOCH handler returns inside the try above and never gets
+    //     here, so a superseded reset cannot release a slot the live reset owns;
+    //   - a THROWN gate propagates past this tail, so a reset that failed
+    //     outright leaves the match as it found it;
+    //   - an ok:FALSE reset (both gates polled, neither matched, nothing threw)
+    //     DOES get here and DOES release. Deliberately: the env answers ok:false
+    //     by retrying the whole reset, and that retry re-claims on its first
+    //     step; a second ok:false ends the session instead of continuing. So a
+    //     released slot there is never observed by a live match.
+    this._releaseChallengerSlot();
 
     // The frozen reset reply is TWO messages, not one: `state` doubles as the
     // post-reset first observation (schema.md), and the env's reset() blocks on
@@ -1995,19 +2261,36 @@ class ArenaBots {
     // handle is passed through as "no opponent this window" — the reads honor
     // it rather than re-resolving (only an OMITTED argument re-resolves).
     //
-    // This is intra-step CONSISTENCY only, not a claim on the slot: the handle
-    // dies with the window, so a challenger who disconnects is null on the very
-    // next step. The first-claimant latch is T3's.
+    // This is intra-step CONSISTENCY only. WHO may be resolved at all is the
+    // first-claimant latch's decision (T3), taken here — once per window, and
+    // in this one place, so no packet handler can ever claim the slot.
+    this._claimChallenger();
     const opponentHandle = this._opponentHandle();
     const opponentEntity = this._opponentEntity(opponentHandle);
     // Remember who that is, so a death packet arriving later this window (or
     // between windows) can be attributed even if their entity has gone. No-op
     // in 'bot' mode — the dummy's own `death` event needs no attribution (T2).
     this._noteChallengerIdentity(opponentHandle);
+    // "Waiting for a challenger" has no wire slot; it goes to the log, on the
+    // transition only (this runs five times a second).
+    this._logChallengerPresence(opponentHandle);
+
+    // HOLD IDLE WITH NO CHALLENGER (T3, exhibition only). A null handle already
+    // makes ATTACK a no-op — the executor has nothing to swing at — but the
+    // movement macros do not need an opponent to run, so an agent left stepping
+    // its policy against an empty pad would jog and strafe around it between
+    // challengers, on a projector. The action is overridden, NOT rejected: the
+    // env still gets exactly one `state` per `step` and nothing desyncs.
+    //
+    // Keyed on the opponent MODE, so 'bot' mode is untouched: there a missing
+    // dummy must keep behaving exactly as it does today (the M2 stationary-
+    // dummy path never inspects the handle before executing).
+    const effectiveAction =
+      !this._opponentIsBot() && opponentHandle === null ? Macro.IDLE : action;
 
     // 2. Begin the macro for this window (gated swing happens here, at tick 0).
     if (this.executor !== null) {
-      this.executor.begin(action, {
+      this.executor.begin(effectiveAction, {
         currentTick: windowStartTick,
         opponentEntity,
         lastSeenPosition: this._lastSeenOpponentPos,
@@ -2143,29 +2426,64 @@ class ArenaBots {
   }
 
   /**
-   * The challenger's player entity in the learner's own view, or null.
+   * WHO currently holds this pad's challenger slot, or null while it is free.
    *
-   * Resolved from `learner.entities` (the same source as _scanForeignPlayers)
-   * rather than the server-wide `bot.players` roster: the entity view is scoped
-   * to what is actually near this pad, so a neighbouring pad's bots 512 blocks
-   * away can never be mistaken for a challenger. This pad's own two bots are
-   * excluded by username.
+   * A pinned `challengerUsername` outranks the latch and needs no claim: it is
+   * the operator naming the challenger up front — stronger than "whoever walked
+   * in first" — and it must work with an empty entity view, e.g. attributing a
+   * death that lands before the named person is anywhere near the pad.
    *
-   * STATELESS by design: it re-resolves on every call, so a challenger who
-   * disconnects immediately reports null. The "first player claims the slot and
-   * later joiners are ignored until reset" protocol is exhibition policy and
-   * belongs to T3, which owns the latch on top of this primitive (as does any
-   * pad-entry gating).
-   *
-   * @returns {object|null} A Mineflayer player entity, or null.
+   * @returns {string|null} A username, or null.
    */
-  _resolveChallengerEntity() {
-    const entities =
-      this.learner && this.learner.entities && typeof this.learner.entities === 'object'
-        ? this.learner.entities
-        : null;
+  _challengerSlot() {
+    if (this.challengerUsername !== null) {
+      return this.challengerUsername;
+    }
+    return this._claimedChallenger;
+  }
+
+  /**
+   * The learner's player-entity view, or null when there is none.
+   *
+   * `learner.entities` (the same source as _scanForeignPlayers) rather than the
+   * server-wide `bot.players` roster: the entity view is scoped to what is
+   * actually near this pad, so a neighbouring pad's bots 512 blocks away are
+   * not even candidates.
+   *
+   * @returns {object|null}
+   */
+  _learnerEntities() {
+    return this.learner && this.learner.entities && typeof this.learner.entities === 'object'
+      ? this.learner.entities
+      : null;
+  }
+
+  /**
+   * THE FIRST-CLAIMANT LATCH (T3). If the challenger slot is free, give it to
+   * the first eligible player standing INSIDE this pad.
+   *
+   * Called from exactly one place — once per decision window, at the top of
+   * handleStep — and deliberately NOT from _resolveChallengerEntity(), which is
+   * reachable from the scoreboard packet handler. See _claimedChallenger.
+   *
+   * "Eligible" is: a player entity, not one of this pad's own two bots, and
+   * inside the pad's bedrock ring. That last test is the one that matters most
+   * (see the EXHIBITION MODE block at the top of this file): the entity view
+   * extends far past the arena, and since T2 an accidental claim on a distant
+   * bystander turns their next death — to anything at all — into a win the
+   * agent never earned.
+   *
+   * A pinned username is already the claim, so this no-ops there.
+   */
+  _claimChallenger() {
+    if (this._opponentIsBot() || this._challengerSlot() !== null) {
+      // 'bot' mode has no challenger; a taken slot ignores later joiners until
+      // the next reset releases it (the one-challenger-at-a-time protocol).
+      return;
+    }
+    const entities = this._learnerEntities();
     if (entities === null) {
-      return null;
+      return;
     }
     const own = new Set([this.config.learnerUsername, this.config.dummyUsername]);
     for (const key of Object.keys(entities)) {
@@ -2177,10 +2495,113 @@ class ArenaBots {
       if (name === null || own.has(name)) {
         continue;
       }
-      if (this.challengerUsername !== null && name !== this.challengerUsername) {
+      if (!isInsidePad(entity.position, this.padOrigin)) {
+        // Named ONCE per reset, not once per window: without this line an
+        // exhibition where the challenger joined at world spawn instead of the
+        // pad looks identical to one where nobody joined at all — the agent
+        // idles and nothing says why.
+        if (!this._outOfPadReported.has(name)) {
+          this._outOfPadReported.add(name);
+          console.error(
+            `[bridge] pad ${this.padIndex} challenger_outside_pad ${name} — seen in the ` +
+              `learner's view but not inside the pad at anchor ${this.padOrigin.x},` +
+              `${this.padOrigin.z}; they must be in the arena to be claimed`,
+          );
+        }
         continue;
       }
-      return entity;
+      this._claimedChallenger = name;
+      console.error(
+        `[bridge] pad ${this.padIndex} challenger_claimed ${name} — later joiners are ` +
+          'ignored until the next reset',
+      );
+      return;
+    }
+  }
+
+  /**
+   * Release the challenger slot so the next reset can arm a new challenger.
+   * Called from the tail of handleReset and nowhere else.
+   */
+  _releaseChallengerSlot() {
+    this._claimedChallenger = null;
+    this._outOfPadReported.clear();
+    this._challengerPresentLogged = null;
+  }
+
+  /**
+   * Log the exhibition's status when — and only when — it CHANGES.
+   *
+   * The `state` message is `additionalProperties:false` on both validators and
+   * the env blocks on exactly one `state` per `step`, so there is no wire slot
+   * for "waiting for challenger": it is a bridge-log line by contract. Edge
+   * triggered because handleStep runs five times a second.
+   *
+   * @param {object|null} handle The handle resolved for this window.
+   */
+  _logChallengerPresence(handle) {
+    if (this._opponentIsBot()) {
+      return;
+    }
+    const present = handle !== null;
+    if (present === this._challengerPresentLogged) {
+      return;
+    }
+    this._challengerPresentLogged = present;
+    if (present) {
+      console.error(
+        `[bridge] pad ${this.padIndex} challenger_present ${handle.username} — match live`,
+      );
+      return;
+    }
+    const slot = this._challengerSlot();
+    console.error(
+      `[bridge] pad ${this.padIndex} challenger_absent ` +
+        `${slot === null ? '(slot unclaimed)' : slot} — holding IDLE`,
+    );
+  }
+
+  /**
+   * The challenger's player entity in the learner's own view, or null.
+   *
+   * A PURE READ of the claimed slot (T3), by NAME. It claims nothing, so it is
+   * safe to call from anywhere — including the scoreboard packet handler, via
+   * _isChallengerName's live-resolve fallback, which is precisely where a
+   * resolver that also claimed would let an incoming death decide who the
+   * challenger was.
+   *
+   * Two nulls with different meanings, both handled the same by every caller:
+   * the slot is free (nobody has walked into the pad yet), or the claimant is
+   * not currently in view (they left, or died). The claim SURVIVES the second
+   * case — the slot is theirs until a reset — so nobody inherits the match by
+   * standing nearby, and the same person walking back in resumes it.
+   *
+   * @returns {object|null} A Mineflayer player entity, or null.
+   */
+  _resolveChallengerEntity() {
+    const claimed = this._challengerSlot();
+    if (claimed === null) {
+      return null;
+    }
+    const entities = this._learnerEntities();
+    if (entities === null) {
+      return null;
+    }
+    // DEFENCE IN DEPTH: a claim can never be one of our own bots (_claimChallenger
+    // excludes them), but `challengerUsername` is operator-supplied and a typo
+    // naming the learner would otherwise point every behavioral read — and
+    // ATTACK's target — at the agent itself.
+    if (claimed === this.config.learnerUsername || claimed === this.config.dummyUsername) {
+      return null;
+    }
+    for (const key of Object.keys(entities)) {
+      const entity = entities[key];
+      if (!entity || entity.type !== 'player') {
+        continue;
+      }
+      if (entity.username === claimed) {
+        return entity;
+      }
     }
     return null;
   }
@@ -2731,12 +3152,15 @@ module.exports = {
   OPPONENT_HEALTH_UNAVAILABLE,
   RL_DEATHS_OBJECTIVE,
   RL_DEATHS_DISPLAY_SLOT,
+  PAD_INTERIOR_BOUNDS,
   // Pure, unit-testable logic.
   assertMacroInt,
   assertMacroUsername,
+  isInsidePad,
   formatDeathObjectiveCommands,
   formatSetupPadCommand,
   formatResetPadCommand,
+  formatHumanResetCommands,
   formatResetConfirmation,
   readbackMatchesTemplate,
   computeAttackCooldown,
