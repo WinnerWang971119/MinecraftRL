@@ -170,6 +170,8 @@ class OpponentView:
     last_known_target_pos: tuple[float, float, float] | None
 ```
 
+**`attack_cooldown` MUST be clamped to exactly 1.0 by its producer (T11a).** `ScriptedBot` treats the swing as ready at `attack_cooldown >= 1.0 - 1e-6` — a deliberately tight epsilon, so a lenient threshold cannot reintroduce flailing. Consequence: if the shadow tracker ever yields a value a hair below 1.0 (e.g. `1.0 - 1e-5`, measured to produce `IDLE`), **the bot never attacks at all** — a total behavior failure that presents as a mysteriously passive opponent, not as an error. Values above 1.0 are safe. Clamp in `raw_opponent_view()`.
+
 **`attack_cooldown` source (pinned — it has none today):** the wire's `state.self.attack_cooldown` (`schema.md:135`) is the *learner's*; `state.opponent` carries only pos/yaw/pitch/velocity/health, and `messages.py:_check_keys` rejects extras. The opponent's swing gate lives in T11b's second `MacroExecutor` on the Node side. **Decision: Python shadow-tracks it** — `raw_opponent_view()` derives `attack_cooldown` from ticks elapsed since the last `opp_action == ATTACK` that the bridge reported as *executed*, using the same cooldown constant. This avoids a four-form wire change. T11b must therefore report whether the opponent's swing actually fired. TC2/TC3 depend on this.
 
 ### New — `ScriptedBot` (owner: T9; consumers: T10, T12)
