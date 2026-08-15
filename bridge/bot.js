@@ -147,6 +147,42 @@ const OPPONENT_HEALTH_OWN_CONNECTION = 'own-connection';
 /** Health is NOT readable: the opponent has no connection of its own. */
 const OPPONENT_HEALTH_UNAVAILABLE = 'unavailable';
 
+// ---------------------------------------------------------------------------
+// HUMAN DEATH DETECTION (T2). A human challenger has no Mineflayer connection,
+// so the `death` event that makes opponent_died work in 'bot' mode does not
+// exist for them — and neither does a health channel (mineflayer never
+// populates entity.health for non-self players). The only server-side signal
+// left is the SCOREBOARD: a `deathCount` objective the server increments in
+// ServerPlayer.die(), pushed to every client as a packet.
+//
+// The whole mechanism is 'human'-mode only. In 'bot' mode nothing here is
+// wired and no command is issued, so the training path is byte-identical.
+// ---------------------------------------------------------------------------
+
+/** The `deathCount` objective a human challenger's deaths ride on. */
+const RL_DEATHS_OBJECTIVE = 'rl_deaths';
+
+/**
+ * The display slot the objective is pinned to, and WHY it is not optional.
+ *
+ * VERIFIED AT PRIMARY SOURCE, not from memory (`javap -p -c` on
+ * server/versions/1.21.1/paper-1.21.1.jar):
+ * `ServerScoreboard.onScoreChanged` broadcasts ClientboundSetScorePacket ONLY
+ * inside `if (this.trackedObjectives.contains(objective))`, and the sole caller
+ * of `startTrackingObjective` in the whole jar is `setDisplayObjective`. So an
+ * objective that is merely ADDED emits no packet to anyone, ever: without this
+ * second command `/scoreboard objectives add` succeeds, the server counts the
+ * deaths, and the bridge is told nothing — a silent failure of exactly the
+ * shape this project keeps getting bitten by.
+ *
+ * `list` (the tab player-list) rather than `sidebar`/`below_name`: it is the
+ * least intrusive slot on the challenger's own screen.
+ */
+const RL_DEATHS_DISPLAY_SLOT = 'list';
+
+/** How long connect() waits for the server to echo the objective back. */
+const RL_DEATHS_READBACK_TIMEOUT_MS = 5000;
+
 /** Default offline-mode connection + identity config for the two bots. */
 const DEFAULT_BOT_CONFIG = Object.freeze({
   host: '127.0.0.1',
@@ -295,6 +331,34 @@ function formatSetupPadCommand(anchor) {
   const x = assertMacroInt(anchor ? anchor.x : undefined, 'pad anchor x');
   const z = assertMacroInt(anchor ? anchor.z : undefined, 'pad anchor z');
   return `/function arena:setup_pad {x:${x},z:${z}}`;
+}
+
+/**
+ * The two commands that make a human challenger's deaths observable (T2), in
+ * the order they must be issued.
+ *
+ * BOTH ARE REQUIRED. `add` creates the objective and makes the server count
+ * deaths; `setdisplay` is what puts it in `ServerScoreboard.trackedObjectives`,
+ * which is the gate on every ClientboundSetScorePacket (see
+ * RL_DEATHS_DISPLAY_SLOT for the decompiled proof). Issuing only the first is
+ * the silent-failure case: no error anywhere, and no death ever reported.
+ *
+ * RE-ISSUING IS SAFE AND EXPECTED. On a second bridge run the objective already
+ * exists and the server answers `add` with "An objective already exists by that
+ * name" — a chat error to the opped bot, a no-op server-side. The bridge never
+ * parses that reply (this file scrapes no chat at all), so the failure cannot
+ * wedge anything; `setdisplay` on the following line still re-pins the display.
+ *
+ * No macro, no `$`-substitution, no user-supplied text: the objective name and
+ * slot are module constants, so there is nothing here to validate.
+ *
+ * @returns {string[]} Chat-ready commands, in issue order.
+ */
+function formatDeathObjectiveCommands() {
+  return [
+    `/scoreboard objectives add ${RL_DEATHS_OBJECTIVE} deathCount`,
+    `/scoreboard objectives setdisplay ${RL_DEATHS_DISPLAY_SLOT} ${RL_DEATHS_OBJECTIVE}`,
+  ];
 }
 
 /**
@@ -744,6 +808,7 @@ class ArenaBots {
    *     loads without mineflayer installed, e.g. in CI before `npm install`).
    *   - transport: a BridgeServer (default constructed from config host/port).
    *   - resetTemplate: the reset template (health/position/inventory) for the gate.
+   *   - deathObjectiveTimeoutMs: budget for the `rl_deaths` read-back (T2).
    */
   constructor(config = {}, deps = {}) {
     this.config = { ...DEFAULT_BOT_CONFIG, ...config };
@@ -887,6 +952,77 @@ class ArenaBots {
     this._boundOnLearnerMessage = null;
     this._boundOnDummyMessage = null;
 
+    // HUMAN DEATH DETECTION (T2). All 'human'-mode only; inert in 'bot' mode.
+    //
+    // The scoreboard packet feed is raw (`learner._client`), so the bound
+    // handlers and the client they were attached to are retained for the same
+    // W1a off-before-on idempotency the bot handlers above use.
+    this._deathScoreClient = null;
+    this._boundOnScoreboardScore = null;
+    this._boundOnResetScore = null;
+    this._boundOnScoreboardObjective = null;
+    this._boundOnScoreboardDisplay = null;
+
+    /**
+     * @type {Map<string, number>} Scoreboard holder name -> last observed
+     * `rl_deaths` value. An INCREASE against this map is a death.
+     *
+     * MUST OUTLIVE EVERY RESET AND EVERY RECONNECT — see handleReset. It is
+     * what makes a re-sent score IDEMPOTENT, and the server does re-send whole
+     * batches at moments the bridge does not control. Both were read off the
+     * pinned jar rather than assumed (`javap -p -c` on
+     * server/versions/1.21.1/paper-1.21.1.jar — the PATCHED server jar, which is
+     * the only one carrying net/minecraft classes; server/paper-1.21.1-133.jar
+     * is the Paperclip bundler and holds nothing decompilable):
+     *
+     *   - EVERY JOIN, and this is the load-bearing one. PlayerList
+     *     .placeNewPlayer calls updateEntireScoreboard, which for each objective
+     *     currently pinned to a display slot pushes that objective's whole
+     *     getStartTrackingPackets list — SetObjective, SetDisplayObjective, and
+     *     ONE SetScore per existing entry — to the arriving player alone. So a
+     *     reconnecting learner is handed the full death history of everyone on
+     *     the server, on a socket whose listeners are already armed.
+     *   - `setdisplay`, but ONLY when the objective was not already tracked:
+     *     ServerScoreboard.setDisplayObjective broadcasts a bare
+     *     SetDisplayObjective when it was, and calls startTrackingObjective —
+     *     the same full list, to everyone — when it was not. On the common
+     *     fresh path the objective was created moments earlier by `objectives
+     *     add` and has no scores yet, so that list replays nothing. It has
+     *     teeth when scores already existed, e.g. a server restart that
+     *     reloaded them from scoreboard.dat with no display slot pinned.
+     *
+     * Drop the map and each of those replays reads as a fresh climb from zero,
+     * handing the agent a win per historical death — the fabricated-kill
+     * failure this whole path is built to avoid.
+     */
+    this._deathScores = new Map();
+
+    // Whether the server has echoed the objective back (see
+    // _verifyDeathObjective). Until then score packets are BASELINE-ONLY: the
+    // burst `setdisplay` can trigger replays every pre-existing score (see
+    // _deathScores above for exactly when it does), and a challenger who died
+    // in an earlier match would otherwise be reported dead the instant the
+    // bridge boots.
+    this._deathObjectiveReady = false;
+    this._deathObjectiveSeen = false;
+
+    // DEATH-ATTRIBUTION MEMORY, and deliberately nothing more. `rl_deaths` is
+    // server-wide, so a score packet only says "somebody died"; this is how the
+    // bridge knows whether that somebody was the opponent. It is written from
+    // the handle handleStep already resolves, so a death arriving while the
+    // challenger's entity is momentarily gone is still attributed correctly.
+    //
+    // NOT the first-claimant latch (T3's): it claims nothing, blocks no
+    // joiner, and is overwritten by whoever the next window resolves.
+    this._challengerDeathName = null;
+
+    // Bounded wait for the objective read-back. Injectable so a unit test can
+    // drive the unconfirmed path without burning 5 s of wall clock.
+    this._deathObjectiveTimeoutMs =
+      typeof deps.deathObjectiveTimeoutMs === 'number'
+        ? deps.deathObjectiveTimeoutMs
+        : RL_DEATHS_READBACK_TIMEOUT_MS;
+
     // RESET CAUSALITY LATCH. Re-armed with a fresh nonce at the top of every
     // handleReset and set by the datapack's per-bot beacon (see
     // formatResetConfirmation). The reset may only be acked ok:true once BOTH
@@ -996,6 +1132,17 @@ class ArenaBots {
     // every pad must be reset before ANY pad steps an episode.
     // _scanForeignPlayers() makes a violation visible; it does not prevent one.
     this._sendCommand(this.learner, formatSetupPadCommand(this.padOrigin));
+
+    // HUMAN DEATH DETECTION (T2), 'human' mode only. Issued AFTER
+    // wireDamageEvents() above so the listeners are already attached when the
+    // server answers, and AWAITED rather than left floating: an unawaited
+    // promise is process-fatal in this codebase, and its own bounded wait is
+    // what separates the replay of past deaths from a live one. It resolves
+    // without throwing on every path, so a scoreboard problem cannot fail
+    // connect() — it is reported loudly instead.
+    if (!this._opponentIsBot()) {
+      await this._verifyDeathObjective();
+    }
   }
 
   /**
@@ -1116,6 +1263,12 @@ class ArenaBots {
       opponentBot.on('health', this._boundOnOpponentHealth);
       opponentBot.on('death', this._boundOnDummyDeath);
     }
+
+    // The HUMAN half of the same channel (T2). Wired here, alongside the bot
+    // half, so both are (re-)established together on a reconnect, and BEFORE
+    // connect() issues the scoreboard commands — the reply to `setdisplay` is a
+    // packet burst that must not race an unwired listener.
+    this._wireDeathScoreboard();
   }
 
   /**
@@ -1446,6 +1599,17 @@ class ArenaBots {
     }
     this._currentTick = 0;
     this._lastSeenOpponentPos = null;
+    // A new match may be a new challenger, so the death-ATTRIBUTION memory is
+    // dropped alongside the last-seen memory; the first step of the episode
+    // rewrites it, and _isChallengerName resolves live until then.
+    //
+    // DO NOT ADD `this._deathScores.clear()` HERE. The baseline map is a
+    // different thing and must survive every reset: score packets are
+    // edge-triggered, so after a reset the challenger's NEXT `rl_deaths` packet
+    // is their death. Re-baselining here would read that packet as a first
+    // sighting and silently swallow every win in the exhibition. Pinned by a
+    // test ("a death after a reset is still reported").
+    this._challengerDeathName = null;
     this._prevSelfHealth = MAX_HEALTH;
     // Interim seed only: the authoritative baseline comes from the dummy
     // read-back gate below.
@@ -1836,6 +2000,10 @@ class ArenaBots {
     // next step. The first-claimant latch is T3's.
     const opponentHandle = this._opponentHandle();
     const opponentEntity = this._opponentEntity(opponentHandle);
+    // Remember who that is, so a death packet arriving later this window (or
+    // between windows) can be attributed even if their entity has gone. No-op
+    // in 'bot' mode — the dummy's own `death` event needs no attribution (T2).
+    this._noteChallengerIdentity(opponentHandle);
 
     // 2. Begin the macro for this window (gated swing happens here, at tick 0).
     if (this.executor !== null) {
@@ -2069,6 +2237,347 @@ class ArenaBots {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // HUMAN DEATH DETECTION (T2) — where `opponent_died` comes from when the
+  // opponent has no connection of its own.
+  //
+  // WHY NOT HEALTH. Mineflayer never populates `entity.health` for anyone but
+  // the connected bot. PR #32 repaired damage_dealt only by reading the dummy's
+  // OWN connection; a human has none, so there is no health channel for them at
+  // all. Nothing here may read `state.opponent.health` either: _snapshotOpponent
+  // emits 0 for a human for want of a source, on a field labelled "PRIVILEGED
+  // raw true health", so keying off it would report a kill on the first
+  // observation of every exhibition match. _opponentHealth() returns null —
+  // never 0 — for the same reason.
+  //
+  // WHY THE RAW PACKET FEED AND NOT MINEFLAYER'S SCOREBOARD PLUGIN. Reading
+  // `bot.scoreboards[...]` or listening for `scoreUpdated` looks like the
+  // obvious route and is DEAD on this server version. Both were checked at
+  // primary source before this was written:
+  //
+  //   - node_modules/mineflayer/lib/plugins/scoreboard.js:41-46 gates the whole
+  //     score path on `packet.action === 0`;
+  //   - the 1.21.1 `scoreboard_score` packet HAS NO `action` FIELD — it is
+  //     `{itemName, scoreName, value, display_name, number_format, styling}`
+  //     (minecraft-data 1.21.1 protocol; the field was split out into a
+  //     separate `reset_score` packet back in 1.20.3).
+  //
+  // So `packet.action` is `undefined`, the branch never runs, `scoreUpdated`
+  // never fires, and `ScoreBoard.itemsMap` is never populated. Listening on
+  // `bot._client` is therefore not a shortcut around the plugin — it is the
+  // only working form of "read it from packets, not from chat". Do not
+  // "simplify" this back to the plugin event; it would fail silently and take
+  // human win detection with it. (`scoreboard_objective` DOES still carry
+  // `action`, which is why the read-back below can use it.)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The learner's raw packet client, or null when there is none (every unit
+   * fake, and any bot that has not connected yet).
+   *
+   * @returns {object|null}
+   */
+  _learnerPacketClient() {
+    const client = this.learner ? this.learner._client : null;
+    return client && typeof client.on === 'function' ? client : null;
+  }
+
+  /**
+   * (Re-)wire the `rl_deaths` packet listeners. Idempotent: handlers are
+   * removed from the client they were ADDED to before new ones are attached,
+   * so a reconnect cannot double-register and count one death twice.
+   *
+   * Inert in 'bot' mode — no listeners at all. There the dummy's own `death`
+   * event remains the single, unchanged source of opponent_died.
+   */
+  _wireDeathScoreboard() {
+    const previous = this._deathScoreClient;
+    if (previous && typeof previous.off === 'function') {
+      if (this._boundOnScoreboardScore !== null) {
+        previous.off('scoreboard_score', this._boundOnScoreboardScore);
+      }
+      if (this._boundOnResetScore !== null) {
+        previous.off('reset_score', this._boundOnResetScore);
+      }
+      if (this._boundOnScoreboardObjective !== null) {
+        previous.off('scoreboard_objective', this._boundOnScoreboardObjective);
+      }
+      if (this._boundOnScoreboardDisplay !== null) {
+        previous.off('scoreboard_display_objective', this._boundOnScoreboardDisplay);
+      }
+    }
+    this._deathScoreClient = null;
+    this._boundOnScoreboardScore = null;
+    this._boundOnResetScore = null;
+    this._boundOnScoreboardObjective = null;
+    this._boundOnScoreboardDisplay = null;
+
+    if (this._opponentIsBot()) {
+      return;
+    }
+    const client = this._learnerPacketClient();
+    if (client === null) {
+      return;
+    }
+    this._boundOnScoreboardScore = (packet) => this._onScoreboardScore(packet);
+    this._boundOnResetScore = (packet) => this._onResetScore(packet);
+    this._boundOnScoreboardObjective = (packet) => this._onScoreboardObjective(packet);
+    this._boundOnScoreboardDisplay = (packet) => this._onScoreboardDisplay(packet);
+    client.on('scoreboard_score', this._boundOnScoreboardScore);
+    client.on('reset_score', this._boundOnResetScore);
+    client.on('scoreboard_objective', this._boundOnScoreboardObjective);
+    client.on('scoreboard_display_objective', this._boundOnScoreboardDisplay);
+    this._deathScoreClient = client;
+  }
+
+  /**
+   * Issue the two objective commands and VERIFY the server acted on them.
+   *
+   * A reply-less command proves nothing in this project — a `$`-macro can abort
+   * the whole function and a `/fill` can no-op into unloaded chunks, both with
+   * an empty log — so the objective is read BACK off the packet feed rather
+   * than assumed. Confirmation is either packet the server can answer with:
+   * `scoreboard_objective` (action 0) when the objective becomes tracked for
+   * the first time, or `scoreboard_display_objective` when it was already
+   * tracked from an earlier run and only the display is re-pinned.
+   *
+   * Never throws and never rejects: a scoreboard hiccup must not fail the whole
+   * connect(). An unconfirmed objective is reported loudly and detection is
+   * armed anyway — running unverified beats being silently switched off.
+   *
+   * @returns {Promise<boolean>} Whether the server echoed the objective back.
+   */
+  async _verifyDeathObjective() {
+    if (this._opponentIsBot()) {
+      return false;
+    }
+    // RE-ARM THE READ-BACK LATCH FIRST (S1). _deathObjectiveSeen is set by the
+    // packet handlers and, without this line, never cleared: a second call
+    // would see the PREVIOUS call's echo, return `confirmed: true` on its first
+    // synchronous poll, and have verified nothing about the two commands it is
+    // about to issue. connect() runs once today (bridge/run.js:353) so no
+    // caller can reach that yet — T3's launcher and T5's reconnect story add
+    // ones that can. A latch that can only be set is a read-back that has
+    // quietly stopped reading back, which is this project's signature failure.
+    this._deathObjectiveSeen = false;
+    for (const command of formatDeathObjectiveCommands()) {
+      this._sendCommand(this.learner, command);
+    }
+    let confirmed = false;
+    try {
+      confirmed = await waitForConfirmation(
+        () => this._deathObjectiveSeen,
+        this._deathObjectiveTimeoutMs,
+        DEFAULT_READBACK.pollIntervalMs,
+      );
+    } catch (err) {
+      confirmed = false;
+    }
+    if (confirmed) {
+      // DRAIN THE BURST BEFORE ARMING (W2). The packet that confirms and the
+      // score replay that follows it are ONE list: getStartTrackingPackets
+      // builds [SetObjective, SetDisplayObjective, SetScore x N] and the server
+      // writes the whole thing back to back. The poll above, though, runs on a
+      // 50 ms timer against whatever the socket has already delivered. If the
+      // list arrives in one synchronous emit batch the poll can only ever see
+      // all of it; if it spans two TCP reads the poll can land in the gap and
+      // arm detection while HISTORICAL scores are still coming in — each of
+      // which then reads as an increase and is credited as a kill from a match
+      // that ended before this process started. One further poll interval of
+      // silence is what proves the burst is drained. It costs one interval on
+      // the happy path and nothing on the timeout path, where the full budget
+      // has already elapsed. `sleep` cannot reject, so this needs no guard.
+      await sleep(DEFAULT_READBACK.pollIntervalMs);
+    }
+    // ARMED EITHER WAY, and deliberately so. Leaving detection disarmed on a
+    // failed read-back would convert a loud, recoverable problem into the
+    // silent one this whole path exists to avoid: an exhibition where the human
+    // dies and the agent is never credited. What the flag actually buys is the
+    // baseline — everything before this point is a replay of history, not news.
+    this._deathObjectiveReady = true;
+    if (!confirmed) {
+      console.error(
+        `[bridge] pad ${this.padIndex} ${RL_DEATHS_OBJECTIVE} objective NOT confirmed by the ` +
+          `server within ${this._deathObjectiveTimeoutMs}ms — human win detection is armed but ` +
+          'UNVERIFIED; check that the learner is opped and that ' +
+          `"${formatDeathObjectiveCommands().join('" and "')}" were accepted`,
+      );
+    }
+    return confirmed;
+  }
+
+  /**
+   * A score changed on some holder's `rl_deaths` entry.
+   *
+   * @param {{itemName?:string, scoreName?:string, value?:number}} packet
+   */
+  _onScoreboardScore(packet) {
+    if (!packet || packet.scoreName !== RL_DEATHS_OBJECTIVE) {
+      return;
+    }
+    const name = typeof packet.itemName === 'string' ? packet.itemName : null;
+    const value =
+      typeof packet.value === 'number' && Number.isFinite(packet.value) ? packet.value : null;
+    if (name === null || value === null) {
+      // A malformed packet records nothing and must never take the bridge down.
+      return;
+    }
+    this._recordDeathScore(name, value);
+  }
+
+  /**
+   * A holder's score entry was REMOVED (1.20.3+ split this out of the score
+   * packet; mineflayer's plugin handles it for neither). An absent entry reads
+   * as 0, so this re-baselines rather than reporting anything.
+   *
+   * @param {{entity_name?:string, objective_name?:string}} packet
+   */
+  _onResetScore(packet) {
+    if (!packet) {
+      return;
+    }
+    const name = typeof packet.entity_name === 'string' ? packet.entity_name : null;
+    if (name === null) {
+      return;
+    }
+    // An omitted objective name means "every objective for this holder".
+    const objective =
+      typeof packet.objective_name === 'string' ? packet.objective_name : RL_DEATHS_OBJECTIVE;
+    if (objective !== RL_DEATHS_OBJECTIVE) {
+      return;
+    }
+    this._deathScores.set(name, 0);
+  }
+
+  /**
+   * The objective was created (action 0) or removed (action 1) for this client.
+   *
+   * @param {{name?:string, action?:number}} packet
+   */
+  _onScoreboardObjective(packet) {
+    if (!packet || packet.name !== RL_DEATHS_OBJECTIVE) {
+      return;
+    }
+    if (packet.action === 0) {
+      this._deathObjectiveSeen = true;
+    } else if (packet.action === 1) {
+      // The objective stopped being tracked: no further score packets can
+      // arrive, so say so rather than silently reporting nothing forever.
+      this._deathObjectiveSeen = false;
+      console.error(
+        `[bridge] pad ${this.padIndex} ${RL_DEATHS_OBJECTIVE} objective was removed server-side ` +
+          '— human win detection has no source until it is re-added',
+      );
+    }
+  }
+
+  /**
+   * The objective was (re-)pinned to a display slot. On a server that already
+   * had it tracked from an earlier run this is the ONLY echo `setdisplay`
+   * produces, so it counts as a read-back too.
+   *
+   * @param {{name?:string}} packet
+   */
+  _onScoreboardDisplay(packet) {
+    if (packet && packet.name === RL_DEATHS_OBJECTIVE) {
+      this._deathObjectiveSeen = true;
+    }
+  }
+
+  /**
+   * Fold one observed `rl_deaths` value into the baseline map, reporting an
+   * INCREASE on the challenger's entry as opponent_died.
+   *
+   * A holder with no entry yet reads as 0, NOT as "unknown": `deathCount`
+   * entries do not exist until the first death, so a challenger's first-ever
+   * packet is `value: 1` at the moment they die — precisely the event AC3
+   * exists for. Treating a first sighting as a baseline would swallow it.
+   *
+   * The replay that would otherwise be misread by that same rule (the burst
+   * `setdisplay` triggers, which resends every pre-existing score) is handled
+   * by _deathObjectiveReady, which is false for its whole duration.
+   *
+   * NOT gated by _suppressOpponentEvents — same deliberate choice as the dummy
+   * `death` handler it stands in for (see wireDamageEvents). A death fired
+   * during a reset window is discarded by the winning handleReset's
+   * events.reset(); gating here would instead break detection mid-episode
+   * whenever a concurrent reset happens to be in flight.
+   *
+   * @param {string} name The scoreboard holder (a username for players).
+   * @param {number} value The holder's new `rl_deaths` value.
+   */
+  _recordDeathScore(name, value) {
+    const prior = this._deathScores.has(name) ? this._deathScores.get(name) : 0;
+    // The baseline advances unconditionally, including while priming and for
+    // holders nobody is fighting, so the NEXT increment is measured correctly.
+    this._deathScores.set(name, value);
+    if (!this._deathObjectiveReady) {
+      return;
+    }
+    if (value <= prior) {
+      // No increase: a re-send of the same value, or an external re-baseline
+      // (`/scoreboard players set|reset`). Neither is a death.
+      return;
+    }
+    if (!this._isChallengerName(name)) {
+      return;
+    }
+    this.events.recordOpponentDied();
+  }
+
+  /**
+   * Whether a scoreboard holder name is the opponent this pad is fighting.
+   *
+   * `rl_deaths` is server-wide: the learner's own deaths, a neighbouring pad's
+   * bots and any bystander all land on the same objective, so an unattributed
+   * increment would credit the agent with somebody else's death.
+   *
+   * @param {string} name
+   * @returns {boolean}
+   */
+  _isChallengerName(name) {
+    // The next two guards are DEFENCE IN DEPTH and are deliberately not unit
+    // tested — no test can reach them, which is the point. Nothing is wired in
+    // 'bot' mode, and neither branch below can yield this pad's own usernames
+    // (_resolveChallengerEntity excludes both, and the memory is only ever
+    // written from a non-bot handle). They stay because every other layer is
+    // one refactor from changing and the cost of being wrong here is not a
+    // missed win but a FABRICATED one — the agent credited for its own death.
+    if (this._opponentIsBot()) {
+      return false;
+    }
+    if (name === this.config.learnerUsername || name === this.config.dummyUsername) {
+      return false;
+    }
+    if (this.challengerUsername !== null) {
+      return name === this.challengerUsername;
+    }
+    if (this._challengerDeathName !== null) {
+      return name === this._challengerDeathName;
+    }
+    // No memory yet (a death between the reset ack and the episode's first
+    // step): fall back to resolving the challenger live.
+    const handle = this._opponentHandle();
+    return handle !== null && handle.isBot === false && handle.username === name;
+  }
+
+  /**
+   * Remember WHO the opponent is, for attributing a later death packet.
+   *
+   * Called once per decision window with the handle handleStep already
+   * resolved, so the memory and the window's swing always describe the same
+   * person. No-op in 'bot' mode and when there is no challenger — a slot that
+   * empties keeps the last name rather than blanking, because a player who
+   * dies can drop out of the entity view in the same instant.
+   *
+   * @param {object|null} handle The handle resolved for this window.
+   */
+  _noteChallengerIdentity(handle) {
+    if (handle !== null && handle.isBot === false && typeof handle.username === 'string') {
+      this._challengerDeathName = handle.username;
+    }
+  }
+
   /** Snapshot the learner's raw self state for the `state` message (LIVE). */
   _snapshotSelf() {
     const bot = this.learner;
@@ -2220,9 +2729,12 @@ module.exports = {
   OPPONENT_MODE_HUMAN,
   OPPONENT_HEALTH_OWN_CONNECTION,
   OPPONENT_HEALTH_UNAVAILABLE,
+  RL_DEATHS_OBJECTIVE,
+  RL_DEATHS_DISPLAY_SLOT,
   // Pure, unit-testable logic.
   assertMacroInt,
   assertMacroUsername,
+  formatDeathObjectiveCommands,
   formatSetupPadCommand,
   formatResetPadCommand,
   formatResetConfirmation,
