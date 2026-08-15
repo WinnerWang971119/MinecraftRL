@@ -256,7 +256,7 @@ reflex_blind_steps  : int = 8      # exhibition-only, ~1.6s
 | TC1 | Low health + `c_flee=1.0` | Unit | Returns `Macro.RETREAT` |
 | TC2 | In range, cooldown charged | Unit | Returns `Macro.ATTACK` |
 | TC3 | In range, cooldown NOT charged | Unit | Does not return `ATTACK` |
-| TC4 | Visible, far, `p_strafe=1.0` | Unit | Returns `STRAFE_L` or `STRAFE_R` |
+| TC4 | Visible, far, `p_strafe=1.0, p_jump=0.0` | Unit | Returns `STRAFE_L` or `STRAFE_R`. **Must pass `p_jump=0.0` explicitly** — `p_strafe=1.0` alone inherits EASY's `p_jump=0.05`, sums to 1.05, and correctly raises `ValueError` |
 | TC5 | Visible, far, `p_strafe=0, p_jump=0` | Unit | Returns `Macro.APPROACH` |
 | TC6 | Not visible, last-known set | Unit | Returns `TURN_TO_LAST_SEEN` or `APPROACH` toward memory |
 | TC7 | Same seed, same fixtures, two instances | Unit | Identical `Macro` sequences (AC7) |
