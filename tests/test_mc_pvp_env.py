@@ -33,6 +33,7 @@ from bridge.messages import ResetAckMsg, StateMsg
 from env.mc_pvp_env import (
     REWARD_COMPONENT_KEYS,
     BridgeError,
+    ExhibitionConfig,
     MCPvPEnv,
 )
 from env.observation_spec import OBS_DIM, Obs, validate
@@ -405,6 +406,146 @@ def test_timeout_ends_episode_at_max_steps():
     assert info["step"] == 3
     # Timeout terminal reward is the configured timeout penalty (anti-kiting).
     assert info["r_terminal"] == pytest.approx(RewardConfig().R_terminal_timeout)
+
+
+# ---------------------------------------------------------------------------
+# EXHIBITION MODE (T3, AC4) — no episode timeout against a human, and no
+# auto-restart after a death.
+#
+# "Disabled" is expressed as ``max_episode_steps=None`` meaning no truncation.
+# NOT a sentinel and NOT a large integer: a large integer is a timeout that has
+# merely been moved somewhere less convenient to notice, and it would fire in
+# the middle of a live match with an audience watching. Three consumers (this
+# task, the launcher, and TC16) depend on exactly this form.
+# ---------------------------------------------------------------------------
+
+
+def test_tc16_no_timeout_never_truncates_past_the_frozen_horizon():
+    """``max_episode_steps=None`` runs past MAX_EPISODE_STEPS without ending (AC4)."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env = _env(bridge, max_episode_steps=None)
+    env.reset(seed=0)
+
+    assert env.max_episode_steps is None
+
+    # Step PAST the frozen horizon, not merely past a small test cap: the
+    # regression this guards is somebody re-introducing a hidden ceiling (or
+    # "None means the default"), and only crossing the real number catches it.
+    for i in range(MAX_EPISODE_STEPS + 1):
+        bridge.push(_state(tick=2 + i))
+        _, _, done, info = env.step(Macro.IDLE)
+        assert done is False, f"truncated at step {i + 1} with no horizon set"
+        assert info["timeout"] is False
+
+    assert env.step_count == MAX_EPISODE_STEPS + 1
+
+    # A death still ends it. Disabling the horizon must not disable termination —
+    # otherwise the exhibition never reports a winner at all.
+    bridge.push(_state(tick=9999, opponent_died=True))
+    _, _, done, info = env.step(Macro.ATTACK)
+    assert done is True
+    assert info["won"] is True
+    assert info["timeout"] is False
+
+
+def test_no_timeout_does_not_change_the_default_horizon():
+    """Omitting ``max_episode_steps`` still truncates at the frozen constant."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env = _env(bridge)
+
+    assert env.max_episode_steps == MAX_EPISODE_STEPS
+
+
+@pytest.mark.parametrize("bad", [0, -1, -400])
+def test_max_episode_steps_still_rejects_non_positive_integers(bad):
+    """``None`` is the disabled form; 0 and negatives remain errors."""
+    bridge = ScriptedBridge([])
+    with pytest.raises(ValueError, match="max_episode_steps must be > 0 or None"):
+        _env(bridge, max_episode_steps=bad)
+
+
+def test_a_death_does_not_auto_restart_the_match():
+    """After a death the env stays finished until reset() is called (AC4)."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env = _env(bridge, max_episode_steps=None)
+    env.reset(seed=0)
+
+    bridge.push(_state(tick=2, opponent_died=True))
+    _, _, done, info = env.step(Macro.ATTACK)
+    assert done is True and info["won"] is True
+
+    # NOTHING here restarts. The match is over, the result is reported, and the
+    # operator arms the next challenger with the separate reset command; an env
+    # that resumed on its own would put the agent back in the pad against a
+    # dead opponent while the operator is still talking to the audience.
+    with pytest.raises(ValueError, match="finished/unstarted episode"):
+        env.step(Macro.IDLE)
+    assert bridge.sent[-1] == {"type": "step", "action": int(Macro.ATTACK)}
+
+    # ...and the operator's reset is what starts the next one.
+    bridge.push(_reset_ack(ok=True), _state(tick=3))
+    env.reset(seed=1)
+    assert env.step_count == 0
+    bridge.push(_state(tick=4))
+    _, _, done, _ = env.step(Macro.IDLE)
+    assert done is False
+
+
+# ---------------------------------------------------------------------------
+# ExhibitionConfig (T3) — the settings T5/T6/T7 consume.
+# ---------------------------------------------------------------------------
+
+
+def test_exhibition_config_defaults_match_the_contract():
+    """The four documented fields, with the documented defaults."""
+    cfg = ExhibitionConfig()
+
+    assert cfg.challenger_username is None  # first claimant in the pad
+    assert cfg.no_timeout is True
+    assert cfg.auto_reset is False
+    assert cfg.reflex_blind_steps == 8  # ~1.6 s at the frozen 200 ms interval
+    # The ONE form "no timeout" takes, handed straight to MCPvPEnv.
+    assert cfg.env_max_episode_steps is None
+    assert ExhibitionConfig(no_timeout=False).env_max_episode_steps == MAX_EPISODE_STEPS
+
+
+def test_exhibition_config_builds_an_env_that_never_truncates():
+    """The config's horizon reaches the env intact — the seam T5 uses."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env = _env(bridge, max_episode_steps=ExhibitionConfig().env_max_episode_steps)
+
+    assert env.max_episode_steps is None
+
+
+def test_exhibition_config_refuses_an_auto_restart():
+    """``auto_reset=True`` is refused loudly rather than silently ignored (AC4)."""
+    # Nothing implements an auto-restart, so accepting the flag would be a
+    # config that promises a behavior no code provides — and the failure would
+    # only show up as a match that does not restart, in front of a classroom.
+    with pytest.raises(ValueError, match="auto_reset=True is not implemented"):
+        ExhibitionConfig(auto_reset=True)
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "bad name", "seventeen_chars_x", "quote\"name", 42, "classmate 1"]
+)
+def test_exhibition_config_rejects_an_unmatchable_challenger_name(bad):
+    """A pin that can never equal a real username is refused at construction."""
+    # It would otherwise produce an exhibition in which nobody is ever the
+    # opponent — indistinguishable, from the operator's side, from an empty pad.
+    with pytest.raises(ValueError, match="challenger_username must be"):
+        ExhibitionConfig(challenger_username=bad)
+
+
+@pytest.mark.parametrize("good", ["classmate_1", "a", "sixteen_chars_ok"])
+def test_exhibition_config_accepts_real_usernames(good):
+    assert ExhibitionConfig(challenger_username=good).challenger_username == good
+
+
+@pytest.mark.parametrize("bad", [-1, 2.5, True, "8"])
+def test_exhibition_config_rejects_a_bad_reflex_window(bad):
+    with pytest.raises(ValueError, match="reflex_blind_steps must be"):
+        ExhibitionConfig(reflex_blind_steps=bad)
 
 
 def test_step_after_done_raises():

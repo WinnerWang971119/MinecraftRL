@@ -27,7 +27,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseBridgeConfig, parsePadOrigin, parsePadIndex, usernamesForPad } = require('./run');
+const {
+  parseBridgeConfig,
+  parsePadOrigin,
+  parsePadIndex,
+  parseOpponentMode,
+  parseChallengerUsername,
+  usernamesForPad,
+} = require('./run');
 
 // ===========================================================================
 // Defaults — nothing provided means an empty config (everything falls through
@@ -312,9 +319,104 @@ test('parseBridgeConfig rejects a username that could break the reset macro', ()
   );
 });
 
+// ===========================================================================
+// EXHIBITION MODE (T3). bot.js has carried `opponentMode` / `challengerUsername`
+// since T1, but run.js wired NEITHER — so the whole human-opponent seam was
+// unreachable from a command line and the exhibition path could not be launched
+// at all. These are the two flags that turn it on.
+// ===========================================================================
+
+test('parseBridgeConfig omits both exhibition keys when neither is given (the training path)', () => {
+  // The default must stay ABSENT, not 'bot': an omitted key falls through to
+  // DEFAULT_BOT_CONFIG, which is what keeps the no-flags path byte-identical.
+  assert.deepEqual(parseBridgeConfig([], {}), {});
+  assert.deepEqual(parseBridgeConfig([], { OPPONENT_MODE: '', CHALLENGER_USERNAME: '' }), {});
+});
+
+test('parseBridgeConfig wires --opponent-mode and --challenger-username through to ArenaBots', () => {
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', 'classmate_1'], {}),
+    { opponentMode: 'human', challengerUsername: 'classmate_1' },
+  );
+  // The env form the launcher (T5) will use, and the CLI-wins precedence.
+  assert.deepEqual(
+    parseBridgeConfig([], { OPPONENT_MODE: 'human', CHALLENGER_USERNAME: 'classmate_2' }),
+    { opponentMode: 'human', challengerUsername: 'classmate_2' },
+  );
+  assert.deepEqual(
+    parseBridgeConfig(['--challenger-username', 'from_cli'], {
+      OPPONENT_MODE: 'human',
+      CHALLENGER_USERNAME: 'from_env',
+    }),
+    { opponentMode: 'human', challengerUsername: 'from_cli' },
+  );
+});
+
+test('--challenger-username auto means "first claimant in the pad", not a player called auto', () => {
+  // A launcher that always passes the flag needs a way to say "no pin"; bot.js
+  // reads null as the first-claimant latch. Without this, `auto` would be taken
+  // as a literal username and NOBODY would ever be the challenger.
+  assert.deepEqual(parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', 'auto'], {}), {
+    opponentMode: 'human',
+    challengerUsername: null,
+  });
+});
+
+test('parseBridgeConfig refuses a typo\'d opponent mode rather than falling back to training', () => {
+  // The silent direction is what matters: `--opponent-mode humans` accepted as
+  // a default would spend the whole exhibition fighting a dummy bot nobody
+  // came to see, with no error anywhere.
+  for (const bad of ['humans', 'HUMAN', 'Human', 'dummy', '', 'true']) {
+    assert.throws(
+      () => parseBridgeConfig(['--opponent-mode', bad], {}),
+      /--opponent-mode must be "bot" or "human"/,
+      `--opponent-mode ${bad} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => parseBridgeConfig([], { OPPONENT_MODE: 'nope' }),
+    /OPPONENT_MODE must be "bot" or "human"/,
+  );
+});
+
+test('parseBridgeConfig refuses a challenger name that could never match a player', () => {
+  // A pin is compared against `entity.username`, so anything outside the
+  // username grammar can never match — producing an exhibition in which nobody
+  // is ever the opponent, which looks exactly like nobody having joined.
+  for (const bad of ['bad name', 'seventeen_chars_x', 'a"b']) {
+    assert.throws(
+      () => parseBridgeConfig(['--opponent-mode', 'human', '--challenger-username', bad], {}),
+      /--challenger-username must be a Minecraft username/,
+      `--challenger-username ${bad} must be rejected`,
+    );
+  }
+});
+
+test('a pinned challenger with no --opponent-mode human is refused, not silently ignored', () => {
+  // In 'bot' mode the opponent is the dummy and the pinned name is read by
+  // NOTHING — so this misconfiguration produces a demo in which the agent
+  // fights an invisible dummy while the operator believes they pinned the
+  // challenger. The likeliest demo-day mistake there is, and free to catch.
+  assert.throws(
+    () => parseBridgeConfig(['--challenger-username', 'classmate_1'], {}),
+    /requires --opponent-mode human/,
+  );
+  assert.throws(
+    () => parseBridgeConfig(['--opponent-mode', 'bot', '--challenger-username', 'classmate_1'], {}),
+    /requires --opponent-mode human/,
+  );
+  // `auto` is not a pin, so it is not caught by that rule.
+  assert.deepEqual(parseBridgeConfig(['--challenger-username', 'auto'], {}), {
+    challengerUsername: null,
+  });
+});
+
 test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher and tests', () => {
   assert.deepEqual(parsePadOrigin('512,1024', '--pad-origin'), { x: 512, z: 1024 });
   assert.equal(parsePadIndex('7', '--pad-index'), 7);
   assert.deepEqual(usernamesForPad(0), { learnerUsername: 'learner_bot', dummyUsername: 'dummy_bot' });
   assert.deepEqual(usernamesForPad(7), { learnerUsername: 'learner_7', dummyUsername: 'dummy_7' });
+  assert.equal(parseOpponentMode('human', '--opponent-mode'), 'human');
+  assert.equal(parseChallengerUsername('classmate_1', '--challenger-username'), 'classmate_1');
+  assert.equal(parseChallengerUsername('auto', '--challenger-username'), null);
 });

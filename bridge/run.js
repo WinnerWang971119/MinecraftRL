@@ -25,7 +25,12 @@
 
 'use strict';
 
-const { ArenaBots, assertMacroUsername } = require('./bot');
+const {
+  ArenaBots,
+  assertMacroUsername,
+  OPPONENT_MODE_BOT,
+  OPPONENT_MODE_HUMAN,
+} = require('./bot');
 
 // Fire-and-forget Mineflayer calls (lookAt, attack) reject outside any await
 // chain, and an unhandled rejection is process-fatal in Node — one killed the
@@ -73,6 +78,17 @@ const CONFIG_SPECS = Object.freeze([
   // Pad topology (T9). PROCESS-LOCAL: neither value ever reaches the wire.
   { key: 'padOrigin', flag: '--pad-origin', env: 'PAD_ORIGIN', kind: 'padOrigin' },
   { key: 'padIndex', flag: '--pad-index', env: 'PAD_INDEX', kind: 'padIndex' },
+  // EXHIBITION MODE (T3). Also process-local. Both keys existed in bot.js from
+  // T1 but nothing wired them, so the whole human-opponent seam was dormant:
+  // no flag, no env var, no way to reach it short of editing DEFAULT_BOT_CONFIG.
+  // Omitting both reproduces the training path exactly ('bot' / null).
+  { key: 'opponentMode', flag: '--opponent-mode', env: 'OPPONENT_MODE', kind: 'opponentMode' },
+  {
+    key: 'challengerUsername',
+    flag: '--challenger-username',
+    env: 'CHALLENGER_USERNAME',
+    kind: 'challengerUsername',
+  },
 ]);
 
 /**
@@ -157,6 +173,52 @@ function parsePadIndex(raw, source) {
     throw new Error(`${source} must be a non-negative plain integer, got ${showRaw(raw)}`);
   }
   return value;
+}
+
+/**
+ * Parse an `--opponent-mode` value: exactly `bot` or `human` (T3).
+ *
+ * Validated HERE as well as in the ArenaBots constructor because the failure it
+ * prevents is silent in the direction that matters: a typo'd `--opponent-mode
+ * humans` on demo day must not fall back to the training path and spend the
+ * exhibition swinging at a dummy bot nobody can see.
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error.
+ * @returns {'bot'|'human'} The parsed mode.
+ */
+function parseOpponentMode(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  if (text !== OPPONENT_MODE_BOT && text !== OPPONENT_MODE_HUMAN) {
+    throw new Error(
+      `${source} must be "${OPPONENT_MODE_BOT}" or "${OPPONENT_MODE_HUMAN}", got ${showRaw(raw)}`,
+    );
+  }
+  return text;
+}
+
+/**
+ * Parse a `--challenger-username`: a Minecraft username, or the empty-ish
+ * sentinel `auto` meaning "the first player to enter the pad claims the slot".
+ *
+ * Held to the same username grammar as the bot names even though this value
+ * never reaches a datapack macro. It is compared against `entity.username`, so
+ * anything that grammar rejects can never match a real player — and a pin that
+ * can never match is an exhibition where nobody is ever the opponent, which
+ * looks exactly like nobody having joined. Better to refuse it at startup.
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error.
+ * @returns {string|null} The pinned username, or null for "first claimant wins".
+ */
+function parseChallengerUsername(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  if (text === 'auto') {
+    // An explicit way to say "no pin" from a launcher that always passes the
+    // flag; bot.js reads null as "first non-own player in the pad claims it".
+    return null;
+  }
+  return assertMacroUsername(text, source);
 }
 
 /**
@@ -279,6 +341,10 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
       config.padOriginZ = anchor.z;
     } else if (spec.kind === 'padIndex') {
       config[spec.key] = parsePadIndex(raw, source);
+    } else if (spec.kind === 'opponentMode') {
+      config[spec.key] = parseOpponentMode(raw, source);
+    } else if (spec.kind === 'challengerUsername') {
+      config[spec.key] = parseChallengerUsername(raw, source);
     } else {
       // Hosts / usernames pass through as trimmed strings. Reject an
       // all-whitespace value rather than connecting a blank username.
@@ -320,6 +386,22 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
     }
   }
 
+  // A pinned challenger with no exhibition mode is INERT, not merely redundant:
+  // in 'bot' mode the opponent is the dummy and the name is read by nothing at
+  // all. Left to run, it produces a demo in which the agent fights a dummy the
+  // audience cannot see while the operator believes they pinned the challenger.
+  if (
+    config.challengerUsername !== undefined &&
+    config.challengerUsername !== null &&
+    (config.opponentMode === undefined || config.opponentMode === OPPONENT_MODE_BOT)
+  ) {
+    throw new Error(
+      `--challenger-username "${config.challengerUsername}" requires ` +
+        `--opponent-mode ${OPPONENT_MODE_HUMAN} (a pinned challenger is read by nothing ` +
+        `in "${OPPONENT_MODE_BOT}" mode, where the opponent is this pad's dummy bot)`,
+    );
+  }
+
   return config;
 }
 
@@ -339,9 +421,15 @@ async function main() {
   // today's BridgeServer on 127.0.0.1:5555 with learner_bot/dummy_bot on 25565
   // at pad anchor (0,0).
   const bots = new ArenaBots(config);
+  // In 'human' mode the second name is not a combatant: no dummy bot connects,
+  // so print who the opponent actually is instead of a bot that will not exist.
+  const opponent =
+    bots.opponentMode === OPPONENT_MODE_BOT
+      ? bots.config.dummyUsername
+      : `human ${bots.challengerUsername === null ? '(first claimant in the pad)' : bots.challengerUsername}`;
   console.error(
     `[bridge] pad ${bots.padIndex} @ anchor ${bots.padOrigin.x},${bots.padOrigin.z} ` +
-      `(${bots.config.learnerUsername} / ${bots.config.dummyUsername})`,
+      `(${bots.config.learnerUsername} vs ${opponent})`,
   );
 
   bots.transport.on('error', (err) => console.error('[bridge] transport error:', err));
@@ -352,7 +440,17 @@ async function main() {
 
   await bots.connect(); // spawn learner_bot + dummy_bot (requires Paper up + opped)
 
-  for (const [name, bot] of [['learner', bots.learner], ['dummy', bots.dummy]]) {
+  // `bots.dummy` is NULL for the whole run in 'human' mode — there is no second
+  // connection to make — so this loop must skip it. Unguarded it threw on
+  // `bot.on` and killed the bridge immediately after connect(), which is the
+  // first thing an exhibition launch would have hit.
+  for (const [name, bot] of [
+    ['learner', bots.learner],
+    ['dummy', bots.dummy],
+  ]) {
+    if (!bot) {
+      continue;
+    }
     bot.on('error', (err) => console.error(`[bridge] ${name} bot error:`, err));
     bot.on('kicked', (reason) => console.error(`[bridge] ${name} bot kicked:`, reason));
     bot.on('end', (reason) => console.error(`[bridge] ${name} bot disconnected:`, reason));
@@ -386,4 +484,11 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseBridgeConfig, parsePadOrigin, parsePadIndex, usernamesForPad };
+module.exports = {
+  parseBridgeConfig,
+  parsePadOrigin,
+  parsePadIndex,
+  parseOpponentMode,
+  parseChallengerUsername,
+  usernamesForPad,
+};
