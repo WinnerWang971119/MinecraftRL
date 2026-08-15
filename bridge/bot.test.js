@@ -65,6 +65,8 @@ const {
   OPPONENT_HEALTH_UNAVAILABLE,
   formatResetPadCommand,
   formatSetupPadCommand,
+  formatDeathObjectiveCommands,
+  RL_DEATHS_OBJECTIVE,
 } = require('./bot');
 // The REAL executor and the REAL weapon period drive the cooldown tests below:
 // MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
@@ -1036,6 +1038,569 @@ test('TC22: a challenger who leaves mid-match zeroes the opponent block, keeps t
   // The memory is RETAINED, not cleared: TURN_TO_LAST_SEEN must still be able
   // to face where the challenger was last seen (only handleReset clears it).
   assert.deepEqual(coordsOf(arena._lastSeenOpponentPos), { x: 5.5, y: 64, z: 0.5 });
+});
+
+// ===========================================================================
+// HUMAN DEATH DETECTION VIA THE `rl_deaths` SCOREBOARD (T2, TC15, AC3).
+//
+// A human challenger has no Mineflayer connection, so neither of the two
+// signals that make opponent_died work in 'bot' mode exists for them: no
+// `death` event, and no health channel at all (mineflayer never populates
+// entity.health for non-self players — the constraint PR #32 worked around by
+// reading the dummy's OWN connection). The server-side `deathCount` scoreboard
+// is the only remaining source, and these tests are what keep it honest.
+//
+// MOCK FIDELITY. The packet fakes below use the 1.21.1 field names as
+// minecraft-data defines them (`scoreboard_score` = {itemName, scoreName,
+// value}; `reset_score` = {entity_name, objective_name}), NOT invented ones,
+// and they are emitted on `learner._client` because mineflayer's own
+// `scoreUpdated` event is provably dead on this version (its plugin gates on a
+// `packet.action` field 1.20.3 deleted). A fake that emitted the plugin event
+// would be testing a channel the server can never drive.
+// ===========================================================================
+
+/**
+ * An exhibition arena whose learner carries a raw packet client, wired exactly
+ * as connect() wires it. `dummy` stays null throughout — "no opponent bot
+ * connection" is the condition AC3 is about.
+ */
+function deathArena(sent, entities, config = {}) {
+  const arena = new ArenaBots(
+    { opponentMode: OPPONENT_MODE_HUMAN, ...config },
+    // A short read-back budget: the unconfirmed path is a real case worth
+    // testing and must not cost 5 s of wall clock to reach.
+    { transport: { send: (msg) => sent.push(msg) }, deathObjectiveTimeoutMs: 20 },
+  );
+  const learner = stepBot('learner_bot', { age: 100 });
+  learner.entities = entities;
+  learner.attacked = [];
+  learner.attack = (entity) => learner.attacked.push(entity);
+  learner.chatLog = [];
+  learner.chat = (cmd) => learner.chatLog.push(cmd);
+  learner._client = new EventEmitter();
+  arena.learner = learner;
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+  arena.wireDamageEvents();
+  return arena;
+}
+
+/** The server pushing one holder's new `rl_deaths` value. */
+function emitDeathScore(arena, itemName, value, scoreName = RL_DEATHS_OBJECTIVE) {
+  arena.learner._client.emit('scoreboard_score', { itemName, scoreName, value });
+}
+
+/** The server announcing the objective (action 0 = created/now tracked). */
+function emitObjective(arena, action = 0, name = RL_DEATHS_OBJECTIVE) {
+  arena.learner._client.emit('scoreboard_objective', { name, action });
+}
+
+/**
+ * Arm detection the way connect() does: the objective is echoed back, so
+ * everything after this point is live news rather than a replay of history.
+ *
+ * The echo is answered FROM the `setdisplay` command and on a timer, not
+ * emitted before the call. _verifyDeathObjective re-arms its own latch on entry
+ * (S1) precisely so a second invocation cannot confirm itself from the previous
+ * run's echo — a fixture that pre-set the latch would be exercising exactly the
+ * stale-latch path that fix removes.
+ */
+async function armDeathDetection(arena) {
+  const inner = arena.learner.chat;
+  arena.learner.chat = (cmd) => {
+    inner.call(arena.learner, cmd);
+    if (typeof cmd === 'string' && cmd.startsWith('/scoreboard objectives setdisplay')) {
+      setTimeout(() => emitObjective(arena), 1);
+    }
+  };
+  let confirmed;
+  try {
+    confirmed = await arena._verifyDeathObjective();
+  } finally {
+    arena.learner.chat = inner;
+  }
+  assert.equal(confirmed, true, 'the fixture must leave detection CONFIRMED');
+  return confirmed;
+}
+
+/** Run one decision window and hand back the `state` it emitted. */
+async function stepOnce(arena, sent, action = Macro.IDLE) {
+  await arena.handleStep({ type: 'step', action });
+  const state = sent[sent.length - 1];
+  assert.doesNotThrow(() => validateOutbound(state));
+  return state;
+}
+
+test('the death objective is added AND pinned to a display slot (no slot, no packets)', () => {
+  // THE SECOND COMMAND IS NOT COSMETIC. Decompiling the pinned jar
+  // (`javap -p -c` on server/versions/1.21.1/paper-1.21.1.jar) shows
+  // ServerScoreboard.onScoreChanged broadcasting ClientboundSetScorePacket only
+  // inside `if (trackedObjectives.contains(objective))`, and the sole caller of
+  // startTrackingObjective in the whole jar is setDisplayObjective. An objective
+  // that is merely ADDED therefore emits no packet to anyone: the server counts
+  // the deaths and the bridge is told nothing, with no error to notice. Deleting
+  // the setdisplay line must fail here rather than during a live exhibition.
+  assert.deepEqual(formatDeathObjectiveCommands(), [
+    '/scoreboard objectives add rl_deaths deathCount',
+    '/scoreboard objectives setdisplay list rl_deaths',
+  ]);
+  // The objective NAME is a cross-process contract (the runbook and any operator
+  // command say `rl_deaths`), so it is pinned as a literal, not via the export.
+  assert.equal(RL_DEATHS_OBJECTIVE, 'rl_deaths');
+});
+
+test('TC15: a human challenger\'s FIRST death reaches the wire as opponent_died (AC3)', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+  await armDeathDetection(arena);
+
+  assert.equal(arena.dummy, null, 'AC3 is about winning with NO opponent bot connection');
+  // The window that establishes who the opponent is.
+  const before = await stepOnce(arena, sent);
+  assert.equal(before.events.opponent_died, false, 'nobody has died yet');
+
+  // A deathCount entry does not exist until the first death, so the very first
+  // packet a challenger ever produces is `value: 1` — AT the moment they die.
+  // Treating a first sighting as a baseline would swallow exactly this event.
+  emitDeathScore(arena, 'classmate_1', 1);
+
+  const state = await stepOnce(arena, sent);
+  assert.equal(state.events.opponent_died, true, 'the death must reach the wire');
+  // ...and exactly once: it belongs to the window it happened in.
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, false);
+});
+
+test('the death baseline SURVIVES a reset — a re-sent score is not a second win', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+
+  // Boot-time replay: `setdisplay` makes the server resend every pre-existing
+  // score, so a challenger who died in an EARLIER match arrives at 3. Detection
+  // is not armed yet, so this is a baseline and not three wins.
+  emitDeathScore(arena, 'classmate_1', 3);
+  assert.equal(arena.events.peek().opponent_died, false, 'a replay is history, not news');
+  await armDeathDetection(arena);
+
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  // A straggler re-send of the SAME value after the reset. This is the case
+  // that fails if anyone adds `this._deathScores.clear()` to handleReset: with
+  // the baseline dropped, an unchanged 3 reads as three-deaths-from-zero and
+  // the agent is handed a win it never earned, before the match even starts.
+  emitDeathScore(arena, 'classmate_1', 3);
+  assert.equal(
+    (await stepOnce(arena, sent)).events.opponent_died,
+    false,
+    'an unchanged score is never a death — the baseline must outlive the reset',
+  );
+
+  // The genuine next death still lands.
+  emitDeathScore(arena, 'classmate_1', 4);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('only the CHALLENGER\'s deaths count — the learner\'s and a bystander\'s do not', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+  await armDeathDetection(arena);
+
+  // FIRST, before any step has run: no attribution memory yet, so this is the
+  // live-resolve branch — the one a death landing between the reset ack and the
+  // episode's first window takes.
+  emitDeathScore(arena, 'learner_bot', 1);
+  emitDeathScore(arena, 'classmate_2', 1);
+  assert.equal(
+    arena.events.peek().opponent_died,
+    false,
+    'with no memory yet, only a live-resolved challenger may be credited',
+  );
+
+  await stepOnce(arena, sent);
+
+  // `rl_deaths` is server-wide: the learner's own deaths land on it too, and so
+  // does every bystander's and every other pad's bots'. Crediting any of them
+  // would hand the agent a win for someone else's mistake — and the learner's
+  // own entry would credit it for DYING.
+  emitDeathScore(arena, 'learner_bot', 2);
+  emitDeathScore(arena, 'dummy_bot', 1);
+  emitDeathScore(arena, 'classmate_2', 2);
+  emitDeathScore(arena, 'classmate_1', 1, 'some_other_objective');
+
+  assert.equal(
+    (await stepOnce(arena, sent)).events.opponent_died,
+    false,
+    'no death may be attributed to anyone but the opponent',
+  );
+
+  emitDeathScore(arena, 'classmate_1', 1);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('a scoreboard death is NOT gated by _suppressOpponentEvents', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+  await armDeathDetection(arena);
+  await stepOnce(arena, sent);
+
+  // The same deliberate asymmetry the dummy's `death` handler has (see the
+  // comment in wireDamageEvents): the flag gates HEALTH events, because a reset
+  // heals asynchronously and those deltas are not combat. A death is not a
+  // delta. Reset-window deaths are discarded by the winning handleReset's
+  // events.reset() instead — gating here would silently drop a real win
+  // whenever a retry reset happened to be in flight.
+  arena._suppressOpponentEvents = true;
+  emitDeathScore(arena, 'classmate_1', 1);
+
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('a death is still attributed when the challenger\'s entity vanishes with them', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const entities = { 11: challenger };
+  const arena = deathArena(sent, entities);
+  await armDeathDetection(arena);
+
+  // One window fixes who the opponent is.
+  await stepOnce(arena, sent);
+  // Dying can drop them out of the learner's entity view in the same instant,
+  // and _opponentHandle() is stateless — so a packet-time live resolve alone
+  // would lose the win in the exact moment it was earned.
+  delete entities[11];
+  assert.equal(arena._opponentHandle(), null, 'the entity really is gone');
+
+  emitDeathScore(arena, 'classmate_1', 1);
+
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('a pinned challengerUsername is the ONLY name that can win the match', async () => {
+  const sent = [];
+  const arena = deathArena(sent, {}, { challengerUsername: 'classmate_1' });
+  await armDeathDetection(arena);
+
+  // Nobody is in the entity view at all, so there is no live resolve and no
+  // attribution memory. A pinned name still decides both cases on its own.
+  emitDeathScore(arena, 'classmate_2', 1);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, false);
+
+  emitDeathScore(arena, 'classmate_1', 1);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('a removed score entry re-baselines to 0 rather than reporting anything', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+  await armDeathDetection(arena);
+  await stepOnce(arena, sent);
+
+  emitDeathScore(arena, 'classmate_1', 4);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+
+  // `/scoreboard players reset` — 1.20.3 split this out of the score packet and
+  // mineflayer's plugin handles neither half. An absent entry reads as 0, so the
+  // NEXT death is a 0 -> 1 step and must still be reported.
+  arena.learner._client.emit('reset_score', {
+    entity_name: 'classmate_1',
+    objective_name: RL_DEATHS_OBJECTIVE,
+  });
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, false, 'a removal is not a death');
+
+  emitDeathScore(arena, 'classmate_1', 1);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+test('the objective read-back is VERIFIED, and an unverified one is named loudly', async () => {
+  const sent = [];
+  const arena = deathArena(sent, {});
+  // Answer the way the server does — asynchronously, after the command has
+  // gone out. A fixture that confirmed synchronously would be more capable than
+  // the server and would hide a read-back that is never actually awaited.
+  arena.learner.chat = (cmd) => {
+    arena.learner.chatLog.push(cmd);
+    if (cmd.startsWith('/scoreboard objectives setdisplay')) {
+      setTimeout(() => emitObjective(arena), 1);
+    }
+  };
+
+  assert.equal(await arena._verifyDeathObjective(), true);
+  assert.deepEqual(arena.learner.chatLog, formatDeathObjectiveCommands());
+  assert.equal(arena._deathObjectiveReady, true);
+
+  // A server that never echoes the objective back: the commands may have been
+  // rejected outright (this project's failures are silent), so say so — but ARM
+  // detection anyway. A disarmed bridge would turn a loud problem into the
+  // silent one this whole path exists to avoid.
+  const quiet = new ArenaBots(
+    { opponentMode: OPPONENT_MODE_HUMAN },
+    { transport: { send: () => {} }, deathObjectiveTimeoutMs: 5 },
+  );
+  quiet.learner = stepBot('learner_bot');
+  const logged = [];
+  const realError = console.error;
+  console.error = (line) => logged.push(line);
+  try {
+    assert.equal(await quiet._verifyDeathObjective(), false);
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(quiet._deathObjectiveReady, true, 'unverified still means armed');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /rl_deaths objective NOT confirmed/);
+});
+
+test('the read-back latch is RE-ARMED per call: a second verify cannot confirm itself (S1)', async () => {
+  const sent = [];
+  const arena = deathArena(sent, {});
+  await armDeathDetection(arena);
+  assert.equal(arena._deathObjectiveSeen, true, 'the first call really did confirm');
+
+  // A second invocation — a reconnect, or T3's launcher connecting twice —
+  // against a server that answers nothing. Without the re-arm it would read the
+  // FIRST call's echo, return confirmed on its first poll, and have verified
+  // nothing about the commands it just issued: a read-back that has silently
+  // stopped reading back, reported as healthy.
+  const logged = [];
+  const realError = console.error;
+  console.error = (line) => logged.push(line);
+  try {
+    assert.equal(await arena._verifyDeathObjective(), false, 'a silent server is NOT a confirmation');
+  } finally {
+    console.error = realError;
+  }
+  assert.match(logged[0], /rl_deaths objective NOT confirmed/);
+  // ...and it is still armed, so a real death after a failed re-verify counts.
+  assert.equal(arena._deathObjectiveReady, true);
+});
+
+/**
+ * How late the replayed half of the burst arrives. Must sit strictly between a
+ * degenerate drain (a single event-loop yield) and the real one
+ * (DEFAULT_READBACK.pollIntervalMs, 50 ms), so the test fails if the drain is
+ * removed OR shortened to a token yield, and passes with 40 ms of slack when it
+ * is intact.
+ */
+const REPLAY_DELAY_MS = 10;
+
+test('a score replayed just AFTER the confirmation packet is baseline, not a win (W2)', async () => {
+  const sent = [];
+  // Pinned, so attribution cannot be what saves the assertion: this name is the
+  // one name allowed to win the match.
+  const arena = deathArena(sent, {}, { challengerUsername: 'classmate_1' });
+
+  // THE BURST, SPLIT. getStartTrackingPackets builds one list — the objective,
+  // its display slot, then one score per existing entry — and the server writes
+  // it back to back. Delivered in a single TCP read the poll can only ever see
+  // all of it; split across two reads the poll can land in the gap. That gap is
+  // what this models: the confirmation is observable at the poll, the scores
+  // are not there yet.
+  //
+  // FIDELITY NOTE — the round trip is deliberately compressed to zero here.
+  // Answering `setdisplay` synchronously is not how a server behaves (the test
+  // above owns that: it answers on a timer and would catch a read-back that is
+  // never awaited). Compressing it is what makes the ORDER under test a fact
+  // rather than a race between two wall-clock timers: the confirmation is seen
+  // on the poll's first check, and the replay lands strictly afterwards.
+  arena.learner.chat = (cmd) => {
+    arena.learner.chatLog.push(cmd);
+    if (!cmd.startsWith('/scoreboard objectives setdisplay')) {
+      return;
+    }
+    emitObjective(arena);
+    // classmate_1 died three times in a match that ended before this process
+    // existed. This is history arriving late, not news.
+    //
+    // 10 ms, not 0: the gap between two TCP reads is I/O time, not a macrotask
+    // hop, and a drain that only yielded the event loop once would still arm
+    // ahead of this. It must be comfortably inside the 50 ms drain and
+    // comfortably outside any degenerate one.
+    setTimeout(() => emitDeathScore(arena, 'classmate_1', 3), REPLAY_DELAY_MS);
+  };
+
+  assert.equal(await arena._verifyDeathObjective(), true);
+  // Let the replay land before asking whether it was believed. Without the
+  // drain the flag is already armed by the time it arrives, so an earlier
+  // assertion would report "no death" for the wrong reason.
+  await new Promise((resolve) => setTimeout(resolve, REPLAY_DELAY_MS * 2 + 5));
+
+  assert.equal(
+    arena.events.peek().opponent_died,
+    false,
+    'a replayed historical score is not a kill — arming must wait out the burst',
+  );
+  assert.equal(arena._deathScores.get('classmate_1'), 3, 'it still baselines the map');
+
+  // ...and the genuine next death, after the burst, still lands.
+  emitDeathScore(arena, 'classmate_1', 4);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
+});
+
+// ===========================================================================
+// connect() — THE ONE LINE THAT ARMS HUMAN WIN DETECTION (T2, AC3).
+//
+// Every test above drives _verifyDeathObjective() by hand, so every one of them
+// stays green with the LIFECYCLE call site gone. Replacing connect()'s
+// `if (!this._opponentIsBot())` with `if (false)` switches the whole feature
+// off — the objective is never added, never tracked, and (per the decompile
+// quoted above) no ClientboundSetScorePacket is ever sent to anyone — and the
+// suite still reported 157 passing. Nothing bound the arming edge.
+//
+// It matters because connect() is refactored next, and the symptom of losing
+// this line is not an error: it is an exhibition in which nobody ever dies.
+//
+// MOCK FIDELITY. createBot comes through the injection seam ArenaBots already
+// has (deps.createBot), so this exercises the real connect(), not a re-creation
+// of it. The fakes are EventEmitters because waitForSpawn attaches
+// .once('spawn'/'error'/'kicked'), and they fire `spawn` on a TIMER: createBot
+// returns synchronously and connect() attaches that listener afterwards, so a
+// fake that spawned synchronously would be missed and connect() would hang.
+// The scoreboard echo rides `_client`, the raw packet feed, for the same reason
+// the handlers do — mineflayer's own scoreUpdated is dead on 1.21.1.
+// ===========================================================================
+
+/** A mineflayer-shaped bot carrying only what connect() actually touches. */
+function connectBot(username) {
+  const bot = Object.assign(new EventEmitter(), {
+    username,
+    chatLog: [],
+    health: MAX_HEALTH,
+    // The raw packet client the scoreboard listeners attach to.
+    _client: new EventEmitter(),
+  });
+  bot.chat = (cmd) => {
+    bot.chatLog.push(cmd);
+    // The server's answer to `setdisplay` is a PACKET, not a chat reply, and it
+    // is a round trip — hence the timer. 0 ms still lands strictly before the
+    // read-back's first poll, so the confirmation is deterministic.
+    if (typeof cmd === 'string' && cmd.startsWith('/scoreboard objectives setdisplay')) {
+      setTimeout(
+        () => bot._client.emit('scoreboard_objective', { name: RL_DEATHS_OBJECTIVE, action: 0 }),
+        0,
+      );
+    }
+  };
+  // Spawn on the next macrotask — see the MOCK FIDELITY note above.
+  setTimeout(() => bot.emit('spawn'), 0);
+  return bot;
+}
+
+/**
+ * An ArenaBots whose connect() builds `connectBot`s, plus the usernames it
+ * asked for (one bot in 'human' mode, two in 'bot' mode).
+ */
+function connectFixture(config = {}) {
+  const created = [];
+  const arena = new ArenaBots(config, {
+    createBot: (opts) => {
+      const bot = connectBot(opts.username);
+      created.push(opts.username);
+      return bot;
+    },
+    transport: { send: () => {} },
+    deathObjectiveTimeoutMs: 50,
+  });
+  return { arena, created };
+}
+
+test('connect() in HUMAN mode issues the setup pad command AND both scoreboard commands', async () => {
+  const { arena, created } = connectFixture({ opponentMode: OPPONENT_MODE_HUMAN });
+
+  await arena.connect();
+
+  assert.deepEqual(created, ['learner_bot'], "'human' mode never makes a second connection");
+  assert.equal(arena.dummy, null);
+  // EXACT, not a superset: connect() chats these three commands and nothing
+  // else, in this order. BOTH scoreboard commands must be here — `add` alone
+  // makes the server count deaths and tell the bridge nothing.
+  assert.deepEqual(arena.learner.chatLog, [
+    formatSetupPadCommand(arena.padOrigin),
+    ...formatDeathObjectiveCommands(),
+  ]);
+  // The read-back was AWAITED, not left floating: an unawaited promise is
+  // process-fatal here, and connect() returning before it resolves would leave
+  // the burst racing the first episode.
+  assert.equal(arena._deathObjectiveSeen, true, 'the server echo arrived within connect()');
+  assert.equal(arena._deathObjectiveReady, true, 'detection is armed by the time connect() returns');
+  assert.equal(arena.learner._client.listenerCount('scoreboard_score'), 1);
+});
+
+test('connect() in BOT mode issues NEITHER scoreboard command and stays byte-inert', async () => {
+  const { arena, created } = connectFixture();
+
+  await arena.connect();
+
+  assert.deepEqual(created, ['learner_bot', 'dummy_bot'], 'the training path still spawns both');
+  assert.notEqual(arena.dummy, null);
+  // The M2/training path must be byte-identical to before T2 existed: one
+  // command, no objective, and not one scoreboard listener.
+  assert.deepEqual(arena.learner.chatLog, [formatSetupPadCommand(arena.padOrigin)]);
+  assert.deepEqual(arena.dummy.chatLog, []);
+  assert.equal(arena._deathObjectiveReady, false, 'nothing is armed on the training path');
+  assert.equal(arena.learner._client.listenerCount('scoreboard_score'), 0);
+  assert.equal(arena.learner._client.listenerCount('scoreboard_objective'), 0);
+});
+
+test('in BOT mode the scoreboard path is entirely absent and the dummy owns opponent_died', async () => {
+  const sent = [];
+  // The default opponent mode: the M2/training path, which must be byte-identical.
+  const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  arena.learner = liveBot('learner_bot');
+  arena.learner._client = new EventEmitter();
+  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.wireDamageEvents();
+
+  // Not one listener, so a stray packet cannot reach the aggregator even in
+  // principle, and no scoreboard command is ever chatted on the training path.
+  assert.equal(arena.learner._client.listenerCount('scoreboard_score'), 0);
+  assert.equal(arena.learner._client.listenerCount('scoreboard_objective'), 0);
+  arena.learner._client.emit('scoreboard_score', {
+    itemName: 'dummy_bot',
+    scoreName: RL_DEATHS_OBJECTIVE,
+    value: 9,
+  });
+  assert.equal(arena.events.peek().opponent_died, false);
+  assert.deepEqual(arena.learner.chatLog, [], 'no /scoreboard command on the training path');
+
+  // opponent_died still comes from where it always has: the dummy's OWN death
+  // event on its OWN connection.
+  arena.dummy.emit('death');
+  assert.equal(arena.events.peek().opponent_died, true);
+});
+
+test('re-wiring does not double-count, and a malformed packet never throws', async () => {
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = deathArena(sent, { 11: challenger });
+  // A reconnect re-wires; handlers must be removed from the client they were
+  // added to first (W1a), or one death would be recorded twice.
+  arena.wireDamageEvents();
+  arena.wireDamageEvents();
+  assert.equal(arena.learner._client.listenerCount('scoreboard_score'), 1);
+  await armDeathDetection(arena);
+  await stepOnce(arena, sent);
+
+  // Garbage off the wire records nothing and takes nothing down.
+  for (const bad of [null, undefined, {}, { scoreName: RL_DEATHS_OBJECTIVE }]) {
+    assert.doesNotThrow(() => arena.learner._client.emit('scoreboard_score', bad));
+    assert.doesNotThrow(() => arena.learner._client.emit('reset_score', bad));
+    assert.doesNotThrow(() => arena.learner._client.emit('scoreboard_objective', bad));
+  }
+  for (const bad of [NaN, Infinity, '3', null]) {
+    emitDeathScore(arena, 'classmate_1', bad);
+  }
+  assert.equal(
+    (await stepOnce(arena, sent)).events.opponent_died,
+    false,
+    'a non-finite score is not a death',
+  );
+
+  emitDeathScore(arena, 'classmate_1', 1);
+  assert.equal((await stepOnce(arena, sent)).events.opponent_died, true);
 });
 
 // ===========================================================================
