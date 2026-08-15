@@ -72,7 +72,26 @@
 - [ ] **AC13** `README.md`, `RUNBOOK.md`, and the demo-day guide describe the one-command flow accurately on macOS.
 - [ ] **AC14** The demo-day guide and `README.md` state plainly that the agent's turn is assisted, that its observation is nonetheless honestly FOV/LoS-gated, and that this is a placeholder scheduled for removal. Written to be said out loud to a classroom, not buried in a footnote.
 - [ ] **AC15** ε does not reach its floor before ~15% of the run's episodes at the chosen pad count, and the arenas explore at distinct rates rather than one shared schedule.
-- [ ] **AC16** The pad ceiling is a measured number: transitions/s and p99 vs pad count at N = 16/20/24/25, a 600 s confirm at the chosen N, Paper console TPS flat at 20.0 there, and learner-limited throughput reported alongside collector throughput.
+- [x] **AC16 — MEASURED 2026-08-16. Chosen pad count: 25.**
+
+  | N | aggregate/s | per-arena/s | p99 ms | min TPS | ≥19 gate |
+  |---|---|---|---|---|---|
+  | 16 | 78.04 | 4.8772 | 208.7 | 19.00 | pass |
+  | 20 | 97.57 | 4.8787 | 208.7 | 19.00 | pass |
+  | 24 | 117.06 | 4.8776 | 208.8 | 19.00 | pass |
+  | 25 | 121.91 | 4.8763 | 208.9 | 19.00 | pass |
+
+  **600s confirm at N=25: 121.95/s aggregate, 4.8782 per-arena, p99 208.8 ms, max 305.9 ms, 73,197 transitions, gate passes.** Throughput came out marginally *higher* over the longer window than the 240s rung, so there is no sustained-load or thermal decay.
+
+  Scaling is linear with no knee: 16→25 is 1.5625× the arenas for 1.562× the throughput, per-arena rate varies 0.05% across the whole range, and p99 moves 0.2 ms. **No ceiling was found** — the binding constraint at 25 is `max-players=60` (`REQUIRED_PLAYERS = 2N + 10` = exactly 60), not the machine. Going beyond 25 needs a `setup.sh` re-run, not more hardware.
+
+  **The ≥19 TPS gate now PASSES at every rung**, where issue #4's sweep reported `max_arenas_sustaining_tps: 0`. That artifact appears to have been fixed by `19fd8e5` ("measure real server TPS from world age, not the physics timer"), which is on this branch. The old advice to disregard the gate as a minimum-over-run artifact no longer applies — it can be read at face value.
+
+  **Budget consequence:** 121.95/s ≈ **10.5M transitions/day**, up 55% from the 6.8M the plan was sized against.
+
+  **Operational note:** `start-pads.sh` rewrites the git-tracked `server/ops.json` for all 2N bots on every fleet boot (issue #29). Restore it (`git checkout -- server/ops.json`) after any sweep, or `tests/test_pad_launcher.py::TestOpsJson::test_one_pad_is_byte_identical_to_the_committed_file` fails and looks like a code regression. The test suite itself does **not** touch the file — verified.
+
+- [ ] ~~**AC16** The pad ceiling is a measured number:~~ transitions/s and p99 vs pad count at N = 16/20/24/25, a 600 s confirm at the chosen N, Paper console TPS flat at 20.0 there, and learner-limited throughput reported alongside collector throughput.
 - [ ] **AC17** Training constants are derived from AC16 and the smoke run's *measured* mean episode length — not the 400-step ceiling — and `eps_start` is lowered when `warm_start` is set.
 - [ ] **AC18** The scripted opponent takes knockback (its `knockback_immune=False` reaches the server), verified by hitting it and observing displacement.
 
