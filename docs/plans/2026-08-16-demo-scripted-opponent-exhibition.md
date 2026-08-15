@@ -28,6 +28,7 @@
   - IRB / human-subject study (`study/booth_app.py` stays a stub)
   - Cross-machine distributed training (#22), PPO/SAC/Rainbow (#18–#20)
   - Spectator UI, leaderboards, match history
+  - **Changing `ACTION_REPEAT` (the 200 ms decision interval).** Worth a post-demo experiment, not a 4-day change. Human *reaction* latency is ~200 ms so the agent is near parity there; what it lacks is sub-window control granularity (it cannot abort a macro mid-motion), which costs it smooth strafing — partly offset by the assisted turn making its aim better than human. Dropping to 50 ms would require `seq_len` ~16→~64 to preserve the 3.2 s memory horizon (~4× learner compute), `MAX_EPISODE_STEPS` 400→1600, and a 4× message rate across 16 pads whose sustainability is **unmeasured** (p99 step time is ~208 ms today, i.e. paced by the game tick). It also behaviorally invalidates the checkpoint.
 
 ---
 
