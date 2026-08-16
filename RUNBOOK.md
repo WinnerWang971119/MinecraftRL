@@ -16,6 +16,10 @@ covered by `pytest`.
 > **inside pad 0**). Follow [`docs/spectate.md`](docs/spectate.md) instead, and read
 > its "Before you join" section before you press Join.
 
+> **Running the classroom demo?** That is [Step 7](#step-7--the-human-exhibition) here
+> and, in full, [`docs/demo-day.md`](docs/demo-day.md). It is one command and it does
+> not need any of the milestones below to have been collected.
+
 ---
 
 ## Read this first — what changed on this branch
@@ -73,7 +77,7 @@ Two open defects to keep in mind while reading live results:
 
 | Need | Check | Source |
 |------|-------|--------|
-| **Java 21 exactly** | `java -version` | Paper 1.21.1 boots on newer JDKs and then SIGSEGVs inside spark's native profiler. `start.sh` pins 21 and refuses anything else. |
+| **Java 21 installed** | `/usr/libexec/java_home -v 21` | Must print a path. Paper 1.21.1 boots on newer JDKs and then SIGSEGVs inside spark's native profiler ~20 s after it reports Done. **Do not check `java -version`**: this Mac's PATH `java` is 26 and that is fine, because `start.sh` resolves 21 through `java_home` and refuses to launch on anything else. That pin is the only thing standing between you and the SIGSEGV. |
 | Node ≥22 (v24.13.0 pinned) | `node -v` | `bridge/package.json` |
 | Python ≥3.11 in a venv | `.venv/bin/python --version` | System python on this Mac is 3.9.6, below the floor |
 | Python deps incl. torch | `.venv/bin/python -c "import torch"` | `requirements.txt` |
@@ -508,9 +512,94 @@ Also watch the per-component reward log — if win-rate stalls or the agent spin
 runs away, the components catch reward hacking before you blame the learner. If Q
 diverges: lower lr, confirm grad-norm clip, slow the target (τ↓).
 
-**Any checkpoint currently in `runs/` is from the dead-damage-channel era.** Do not
-use one as a baseline, a warm start, or a demo. The post-repair re-baseline (T14, 3
-pinned seeds) is the first trustworthy reference point.
+**Every checkpoint from before the damage-channel repair is unusable** as a baseline,
+a warm start, or a demo: it was trained in a regime where landing a hit paid nothing.
+The archived pre-repair set is catalogued in
+[`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md).
+
+`runs/m2_multi.pt` is the exception and the only checkpoint this branch has trained
+post-repair. It is what `deploy.exhibition` loads by default and what the demo runs
+on. It is a working checkpoint, not a certified one: no milestone has been signed off
+against it. Check the date on any other `.pt` before trusting it.
+
+---
+
+## Training (flags TBD)
+
+The retrain flags (warm start, opponent selection, the EASY/HARD curriculum, eval and
+checkpoint cadence) are documented separately and land here shortly.
+
+---
+
+## Step 7 — the human exhibition
+
+This is the demo-day path, not a milestone. It is the only mode where a **person**
+is the opponent instead of a bot, and it is the only mode where the episode horizon
+is off.
+
+**The full operating procedure lives in [`docs/demo-day.md`](docs/demo-day.md).** Read
+that one, not this section, when you are actually running a demo. What follows is the
+runbook-level summary and the handful of facts that surprise people.
+
+```bash
+.venv/bin/python -m deploy.exhibition --challenger-username <their_mc_name>
+```
+
+One command: it runs its refusal gates, writes `server/ops.json` for this one pad,
+starts Paper, waits for the Minecraft port, starts the bridge in human-opponent mode,
+waits for the bridge port, prints the LAN join address and the pad anchor, and
+connects the agent playing greedily from `runs/m2_multi.pt`. Foreground for the whole
+exhibition. Every gate runs **before** anything is spawned, so a refusal leaves
+nothing running.
+
+Arm the next challenger from a second terminal:
+
+```bash
+.venv/bin/python -m deploy.exhibition --reset
+```
+
+It starts nothing and never connects to the bridge. It files
+`server/logs/exhibition/reset.request`, which the running launcher consumes within
+about a second. Exit codes: `0` armed, `1` refused. The launcher itself exits `130` on
+Ctrl-C and `1` on any refusal or boot failure.
+
+**Do not try to reset by connecting a second client.** `BridgeServer` accepts exactly
+one TCP client and resolves a second connection by destroying the incumbent, so a
+process that connected would evict the live agent mid-exhibition. That single-client
+rule is also why the exhibition is one challenger at a time, start to finish.
+
+Things that bite, all of them documented at length in the demo-day guide:
+
+- **Pin `--challenger-username`.** Unpinned, the bridge credits the first non-agent
+  player in the pad, so a bystander who dies to anything gets reported as the agent's
+  win; and the launcher cannot heal the human between matches, because nothing on the
+  wire says who claimed the slot. It warns you at startup and again at reset time.
+- **A reset restores health, food, position and the challenger's sword.** Both
+  fighters get exactly one iron sword: the learner from the datapack, the human from
+  the launcher's reset commands (a `clear` scoped to `minecraft:iron_sword`, then a
+  `give`, so repeated resets never pile up duplicates). Neither side gets armor.
+  **Match 1 of a launch is the exception** — `--reset` is what arms the human, and it
+  has not run yet, so the first challenger needs gear handed out before the
+  exhibition starts. There is no live command channel once it is running (Paper's
+  stdin belongs to the launcher, and `ops.json` is rewritten to the two bots before
+  Paper boots).
+- **The health check is an absence.** On first exhibition boot, `rl_deaths objective
+  NOT confirmed` must **not** appear in `server/logs/exhibition/bridge.log`. Silence
+  there is the read-back confirming that human death detection works.
+- **`rl_deaths` shows up in the tab player list.** Expected. The objective has to be
+  display-bound or the server broadcasts no score packets at all.
+- **The first reset of an exhibition logs the challenger on a `foreign_players`
+  line.** Expected: the exclusion covers a *claimed* challenger and nothing has
+  claimed yet. `eval/benchmark.py` reads that line as cross-pad contamination
+  evidence, so an exhibition log looks contaminated to that tool and is not.
+- **`No player was found` after a reset** means a pinned challenger who is offline
+  right now. Harmless.
+
+Rehearse the whole gate chain with `--dry-run`, which starts nothing and exits `0`:
+
+```bash
+.venv/bin/python -m deploy.exhibition --challenger-username demo_player --dry-run
+```
 
 ---
 
@@ -529,5 +618,6 @@ pinned seeds) is the first trustworthy reference point.
 | M2 learning | `agent.train --checkpoint runs/m2.pt` | win ≥95%, aim-while-invisible == 0, len < cap | AC6 |
 
 After M2 passes, the M3/M4 ladder (scripted bot → self-play/PFSP/Elo) is the
-next horizon. `distributed/` is built (issue #4); `deploy/` and `study/`
-remain skeleton-only and out of kickoff scope.
+next horizon. `distributed/` is built (issue #4) and `deploy/exhibition.py` is the
+human-exhibition path (Step 7); `study/` remains skeleton-only and out of kickoff
+scope.
