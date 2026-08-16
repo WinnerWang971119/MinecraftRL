@@ -7,8 +7,10 @@ requires a PR visible to all tracks.
 
 These macros map directly to Mineflayer plugin/control calls on the Node.js
 side.  This module is **descriptive only** — execution lives in bridge/actions.js
-(task T7b), which reads MACRO_SEMANTICS as documentation and implements each
-macro against the Mineflayer API.
+(task T7b), whose author reads MACRO_SEMANTICS while implementing each macro
+against the Mineflayer API.  Nothing reads it at runtime: Node cannot import a
+Python dict, so the two are kept in step by hand and by review.  See the note on
+MACRO_SEMANTICS below.
 
 Owner: T4 (DQN core track)
 """
@@ -38,9 +40,10 @@ N_ACTIONS: int = len(Macro)  # == 8
 # ---------------------------------------------------------------------------
 # Semantic mapping table
 # ---------------------------------------------------------------------------
-# Documents what each macro means and how bridge/actions.js executes it.
-# The bridge reads this at startup for self-consistency assertions and logs it
-# for debugging; the agent uses it only as documentation.
+# Documents what each macro means and how bridge/actions.js executes it. The
+# mapping is mirrored BY HAND in bridge/actions.js (Node cannot import this
+# Python dict) — drift between the two is caught by code review, not by any
+# runtime assertion; the agent uses this table only as documentation.
 #
 # Execution model (T7b notes):
 #   - Movement macros (APPROACH, RETREAT, STRAFE_L, STRAFE_R) use
@@ -100,7 +103,7 @@ MACRO_SEMANTICS: dict[Macro, str] = {
         " from a memory gated on visibility (TODO(T12)) — so despite the"
         " macro's name this is an omniscient aim-snap, not a recall of a"
         " genuinely last-*seen* position.  The agent's own observation stays"
-        " honestly FOV/LoS-gated (env/perception_filter.py); only this turn is"
+        " honestly FOV/LoS-gated (env/perception_filter.py); this turn is"
         " assisted, and only until TODO(T12) resolves."
     ),
 }

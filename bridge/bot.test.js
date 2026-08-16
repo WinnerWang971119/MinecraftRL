@@ -1513,6 +1513,16 @@ test('_updateLastSeen stores a Vec3-style clone, not an alias of the live positi
 //      PerceptionFilter-backed gating — in which case DELETE this test, do not
 //      "fix" it to match the new behavior. Its entire premise expires with the
 //      placeholder it documents.
+//
+// COLLATERAL: if _updateLastSeen() ever does get gated, three other tests
+// dereference `_lastSeenOpponentPos` with no null guard of their own and will
+// also go red with a bare, unexplained TypeError — the "_updateLastSeen
+// stores a Vec3-style clone..." test just above this block, "TC13: in
+// exhibition mode ATTACK, the last-seen memory and the observation all
+// follow the human entity (AC2)", and "TC22: a challenger who leaves
+// mid-match zeroes the opponent block, keeps the memory, and never throws".
+// Only THIS test explains itself; those three will look like unrelated
+// flakes unless whoever is gating already knows to expect them.
 // ===========================================================================
 test('TC14 (AC11): _updateLastSeen still writes memory when the opponent is behind the learner — KNOWN CONTRACT VIOLATION frozen through 2026-08-20 (TODO(T12))', () => {
   const bots = new ArenaBots({}, { transport: { send: () => {} } });

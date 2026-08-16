@@ -1593,8 +1593,9 @@ class ArenaBots {
     this.wireDamageEvents();
 
     // Build THIS pad before any episode can start. The bridge is the sole
-    // command channel (RCON is off), so the geometry call rides the opped
-    // learner's chat like every other command. Idempotent by the datapack's
+    // command channel for arena macros (RCON is off and bot.js itself has no
+    // console access), so the geometry call rides the opped learner's chat
+    // like every other command. Idempotent by the datapack's
     // contract, so re-running it on pad 0 — already built by arena:setup at
     // datapack load — is a no-op re-fill, and a bridge restart repairs its own
     // pad for free.

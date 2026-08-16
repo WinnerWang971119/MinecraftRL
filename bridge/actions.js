@@ -8,7 +8,10 @@
 //      exact low-level Mineflayer calls the resolved T7b execution model
 //      prescribes — raw bot.setControlState(...) for movement, raw
 //      bot.attack(entity) for a SINGLE cooldown-gated swing, bot.lookAt(...) for
-//      the memory-driven turn. It DELIBERATELY never touches bot.pvp.attack or a
+//      the memory-driven turn (the ctx.lastSeenPosition it targets is, today,
+//      the opponent's LIVE position — bot.js's _updateLastSeen() writes it
+//      unconditionally, TODO(T12), frozen through 2026-08-20 — not one gated
+//      on visibility). It DELIBERATELY never touches bot.pvp.attack or a
 //      pathfinder goal (those own the cooldown / drive async pursuit and would
 //      swing across decision boundaries — forbidden by the contract).
 //
@@ -135,7 +138,12 @@ function isAttackMacro(macro) {
   return macro === Macro.ATTACK;
 }
 
-/** True iff the macro is the memory-driven look toward the last-seen opponent. */
+/**
+ * True iff the macro is the memory-driven look toward ctx.lastSeenPosition —
+ * which today holds the opponent's LIVE position (bot.js's _updateLastSeen()
+ * writes it unconditionally, TODO(T12), frozen through 2026-08-20), not one
+ * gated on last-seen visibility.
+ */
 function isTurnMacro(macro) {
   return macro === Macro.TURN_TO_LAST_SEEN;
 }
@@ -377,7 +385,10 @@ class MacroExecutor {
    *   (no entity to hit) — but still respects the gate so timing is unaffected.
    * @param {{x:number,y:number,z:number}|null} [ctx.lastSeenPosition=null] The
    *   stored last-seen opponent world position, the target of TURN_TO_LAST_SEEN.
-   *   If absent (never seen / memory expired) the turn is a no-op.
+   *   If absent — the opponent has not yet been resolved this episode, or a
+   *   reset just ran (bot.js's ArenaBots constructor / handleReset are the
+   *   only two places that null it; nothing expires it mid-episode) — the
+   *   turn is a no-op.
    * @returns {{swung:boolean, looked:boolean, controlStates:string[]}} A summary
    *   of what was issued (useful for the step log and for tests).
    * @throws {RangeError} If `macro` is unknown.
@@ -485,7 +496,10 @@ class MacroExecutor {
       typeof lastSeenPosition.y !== 'number' ||
       typeof lastSeenPosition.z !== 'number'
     ) {
-      // Never seen the opponent (or memory expired): nothing to face.
+      // Null: the opponent has not yet been resolved this episode, or a reset
+      // just ran (bot.js's ArenaBots constructor / handleReset are the only
+      // two places that null this; nothing expires it mid-episode). Nothing
+      // to face.
       return false;
     }
     if (this.bot && typeof this.bot.lookAt === 'function') {
