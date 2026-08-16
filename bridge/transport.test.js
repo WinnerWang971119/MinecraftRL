@@ -12,7 +12,16 @@
 //     - a malformed JSON line throws loudly.
 //   Outbound encoding (transport.js encodeMessage / validateOutbound):
 //     - state + reset_ack round-trip: encode -> frame -> deep-equal original;
-//     - a missing/extra/wrong-typed outbound field throws (loud).
+//     - a missing/extra/wrong-typed outbound field throws (loud);
+//     - the OPTIONAL state.opp_action_executed swing report encodes as
+//       true/false/null/absent, and a non-boolean is rejected.
+//   Inbound validation (transport.js validateInbound):
+//     - reset / step / close accepted; unknown + outbound types rejected;
+//     - step.opp_action is optional and nullable, and when present gets the
+//       SAME validation as action (integer, 0..7 — N_ACTIONS stays frozen).
+//   Cross-form (bridge/schema.json read from disk):
+//     - every field these validators accept is declared in the canonical
+//       schema, which is `additionalProperties: false`.
 //   Reset gate (bot.js readbackMatchesTemplate / computeAttackCooldown):
 //     - a matching readback (full health, spawn pos within epsilon, template
 //       inventory, no effects) is ACCEPTED;
@@ -33,11 +42,14 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   LineFramer,
   encodeMessage,
   validateOutbound,
+  validateInbound,
   WireError,
   ACTION_MIN,
   ACTION_MAX,
@@ -272,6 +284,180 @@ test('encodeMessage allows ok:false reset_ack (the read-back timeout reply)', ()
   const msg = { type: 'reset_ack', ok: false, readback: {} };
   const out = new LineFramer().push(encodeMessage(msg));
   assert.deepEqual(out, [msg]);
+});
+
+// ===========================================================================
+// state.opp_action_executed — the OPTIONAL swing report (Node -> Python).
+//
+// The bridge reports here whether the opponent's swing actually fired; the
+// Python side shadow-tracks the opponent's attack cooldown from it (the wire
+// has no opponent cooldown channel). Without the field declared in
+// validateState, encodeMessage would reject it as an unexpected property and
+// the report could never be sent at all.
+// ===========================================================================
+
+test('a state WITHOUT the swing report is unchanged (the M2 path)', () => {
+  const msg = makeStateMsg();
+  assert.equal(Object.prototype.hasOwnProperty.call(msg, 'opp_action_executed'), false);
+  const out = new LineFramer().push(encodeMessage(msg));
+  assert.deepEqual(out, [msg]);
+});
+
+for (const executed of [true, false]) {
+  test(`encodeMessage carries opp_action_executed:${executed}`, () => {
+    const msg = { ...makeStateMsg(), opp_action_executed: executed };
+    const out = new LineFramer().push(encodeMessage(msg));
+    assert.deepEqual(out, [msg]);
+    assert.equal(out[0].opp_action_executed, executed);
+  });
+}
+
+test('encodeMessage accepts an explicit null swing report ("not reported")', () => {
+  const msg = { ...makeStateMsg(), opp_action_executed: null };
+  assert.doesNotThrow(() => encodeMessage(msg));
+});
+
+test('validateOutbound REJECTS a non-boolean swing report', () => {
+  // A number/string would read as a truthy report downstream and silently
+  // mistime the shadow cooldown, so it must fail loudly here.
+  for (const bad of [1, 0, 'true', [], {}]) {
+    assert.throws(
+      () => validateOutbound({ ...makeStateMsg(), opp_action_executed: bad }),
+      WireError,
+      `opp_action_executed: ${JSON.stringify(bad)} must be rejected`,
+    );
+  }
+});
+
+test('validateOutbound still rejects OTHER unexpected state fields', () => {
+  // Declaring one optional property must not open `state` to arbitrary ones.
+  assert.throws(
+    () => validateOutbound({ ...makeStateMsg(), opp_action_executed: true, extra: 1 }),
+    WireError,
+  );
+});
+
+// ===========================================================================
+// validateInbound — the Node binding of the Python -> Node command half.
+//
+// Pure and exported; deliberately NOT wired into BridgeServer's receive path
+// (a validation-triggered destroy would change live M2 behavior).
+// ===========================================================================
+
+test('validateInbound accepts reset / step / close', () => {
+  assert.doesNotThrow(() => validateInbound({ type: 'reset', episode: 0, seed: 12345 }));
+  assert.doesNotThrow(() => validateInbound({ type: 'step', action: 3 }));
+  assert.doesNotThrow(() => validateInbound({ type: 'close' }));
+});
+
+test('validateInbound accepts a step WITHOUT opp_action (the M2 dummy path)', () => {
+  const msg = { type: 'step', action: 7 };
+  assert.equal(validateInbound(msg), msg, 'returns the message unchanged');
+});
+
+for (let oppAction = ACTION_MIN; oppAction <= ACTION_MAX; oppAction += 1) {
+  test(`validateInbound accepts opp_action ${oppAction}`, () => {
+    assert.doesNotThrow(() => validateInbound({ type: 'step', action: 0, opp_action: oppAction }));
+  });
+}
+
+test('validateInbound accepts an explicit null opp_action ("no opponent action")', () => {
+  assert.doesNotThrow(() => validateInbound({ type: 'step', action: 0, opp_action: null }));
+});
+
+test('validateInbound REJECTS an out-of-range opp_action (N_ACTIONS is frozen at 8)', () => {
+  for (const bad of [8, -1, 100, -100]) {
+    assert.throws(
+      () => validateInbound({ type: 'step', action: 0, opp_action: bad }),
+      WireError,
+      `opp_action ${bad} must be rejected`,
+    );
+  }
+});
+
+test('validateInbound REJECTS a non-integer opp_action', () => {
+  // `true` would coerce to 1 under a naive numeric check.
+  for (const bad of [3.5, '3', true, false, [], {}]) {
+    assert.throws(
+      () => validateInbound({ type: 'step', action: 0, opp_action: bad }),
+      WireError,
+      `opp_action ${JSON.stringify(bad)} must be rejected`,
+    );
+  }
+});
+
+test('validateInbound applies the same range rule to action and opp_action', () => {
+  assert.throws(() => validateInbound({ type: 'step', action: 8 }), WireError);
+  assert.throws(() => validateInbound({ type: 'step', action: 8, opp_action: 8 }), WireError);
+});
+
+test('validateInbound still rejects unexpected step fields and unknown types', () => {
+  assert.throws(
+    () => validateInbound({ type: 'step', action: 1, opp_action: 2, extra: 7 }),
+    WireError,
+  );
+  assert.throws(() => validateInbound({ type: 'teleport' }), WireError);
+  assert.throws(() => validateInbound({ type: 'state' }), WireError, 'outbound type');
+  assert.throws(() => validateInbound('not an object'), WireError);
+});
+
+test('validateInbound rejects a reset missing a required field', () => {
+  assert.throws(() => validateInbound({ type: 'reset', episode: 0 }), WireError);
+  assert.throws(() => validateInbound({ type: 'reset', episode: -1, seed: 0 }), WireError);
+});
+
+// ===========================================================================
+// Cross-form guard: schema.json is the CANONICAL contract.
+//
+// The contract exists in three mutually-consistent forms (schema.md prose,
+// schema.json canonical, messages.py Python) and this file is the Node binding.
+// A field that reaches the prose and the code but not schema.json is a contract
+// the wire does not actually carry — `additionalProperties: false` means it is
+// rejected exactly when something first uses it. These tests read the REAL
+// file, so deleting a property there fails here by name.
+// ===========================================================================
+
+function schemaBranch(type) {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'schema.json'), 'utf8'),
+  );
+  const branch = schema.oneOf.find((b) => b.properties.type.const === type);
+  assert.ok(branch, `schema.json has no "${type}" branch`);
+  return branch;
+}
+
+test('schema.json declares every field the Node validators accept', () => {
+  const cases = [
+    ['step', { type: 'step', action: 3, opp_action: 5 }, validateInbound],
+    ['state', { ...makeStateMsg(), opp_action_executed: true }, validateOutbound],
+  ];
+  for (const [type, message, validator] of cases) {
+    validator(message); // this file accepts the fully-populated form...
+    const branch = schemaBranch(type);
+    const declared = new Set(Object.keys(branch.properties));
+    for (const key of Object.keys(message)) {
+      assert.ok(
+        declared.has(key),
+        `${type}.${key} is accepted here but NOT declared in bridge/schema.json; ` +
+          'additionalProperties:false means the wire rejects it',
+      );
+    }
+    assert.equal(branch.additionalProperties, false);
+  }
+});
+
+test('schema.json declares opp_action as optional, nullable, and 0..7', () => {
+  const step = schemaBranch('step');
+  assert.deepEqual(step.properties.opp_action.type, ['integer', 'null']);
+  assert.equal(step.properties.opp_action.minimum, ACTION_MIN);
+  assert.equal(step.properties.opp_action.maximum, ACTION_MAX);
+  assert.deepEqual(step.required, ['type', 'action'], 'opp_action must NOT be required');
+});
+
+test('schema.json declares opp_action_executed as optional and nullable', () => {
+  const state = schemaBranch('state');
+  assert.deepEqual(state.properties.opp_action_executed.type, ['boolean', 'null']);
+  assert.equal(state.required.includes('opp_action_executed'), false);
 });
 
 // ===========================================================================

@@ -82,10 +82,25 @@ Node aggregates events over the interval and replies with one
 |----------|-----------------|----------------------------------------------------------------------------|
 | `type`   | `"step"` (const) | Discriminator.                                                            |
 | `action` | int `0..7`      | Discrete action index, **must be in [0, 7]**, matching the 8 frozen action macros in `agent/actions.py`. |
+| `opp_action` | int `0..7` \| `null` \| *absent* | **Optional.** The same discrete action index, for the **opponent**. Same validation as `action`: integer, `0 <= v < N_ACTIONS`. |
 
 ```json
 {"type":"step","action":3}
+{"type":"step","action":3,"opp_action":5}
 ```
+
+**`opp_action` — the opponent-acts path.** `N_ACTIONS` is frozen at 8; this field
+widens *who* acts, never the action space.
+
+- **Absent or `null` ⇒ the opponent takes no action.** This is the M1/M2
+  stationary-dummy path, and it stays byte-identical: `StepMsg` **omits** the key
+  when it is `None`, so a dummy-path step line is exactly what it was before the
+  field existed.
+- **Present ⇒ the bridge drives the opponent handle through a second
+  `MacroExecutor`** in the same decision window as the learner's. With no
+  opponent bot to drive, it is **silently ignored** — never an error.
+- Out of range, non-integer, or boolean ⇒ a protocol error, exactly as for
+  `action`.
 
 ### `close`
 
@@ -120,6 +135,7 @@ post-`reset` first observation once the episode is running).
 | `arena`        | object  | Arena geometry sensed this interval. See below.                     |
 | `tick`         | int ≥ 0 | Server game tick at end of the interval.                            |
 | `code_version` | string  | Env+filter code-version stamp (git SHA + config hash). Kickoff **logs** a mismatch; the distributed future **rejects** it. |
+| `opp_action_executed` | bool \| `null` \| *absent* | **Optional.** Did this window's `opp_action` actually take effect? See [the swing report](#the-swing-report). |
 
 **`self`** (FULL — always real, never gated):
 
@@ -159,6 +175,34 @@ post-`reset` first observation once the episode is running).
 |------------------|-----------------|------------------------------------------------------------------|
 | `wall_distances` | array of floats | Distances to surrounding arena walls (fixed bridge probe order). |
 
+<a id="the-swing-report"></a>
+**`opp_action_executed` — the swing report.** The opponent has **no
+`attack_cooldown` channel on the wire**: `self.attack_cooldown` is the
+*learner's*, and the `opponent` block carries only pos/yaw/pitch/velocity/health.
+Python therefore **shadow-tracks** the opponent's swing meter
+(`MCPvPEnv.raw_opponent_view()`), counting **decision windows** since the last
+`opp_action == ATTACK` that actually fired — and this field is the only way it
+can know whether one did.
+
+**The tracker must NOT use `state.tick`.** That field is the *server* tick
+(`bot.time.age`), which the server sends only ~once per second: it reads flat for
+several states and then jumps ~20 (see `eval/benchmark.py`'s coarse-tick note).
+The swing gate rides a different clock — `bot.js`'s `_currentTick`, which advances
+exactly `ACTION_REPEAT` per window — and `bot.js`'s `_serverTick()` docstring states
+the two are decoupled. Deriving the meter from `state.tick` makes it read ready
+1-5 windows after a swing instead of 4, and then **locks into a flail**: the shadow
+says ready, `canSwing` blocks, `swung=false` suppresses the stamp, the meter stays
+pinned at `1.0`, and the opponent mashes ATTACK every window without ever strafing.
+
+| Value | Meaning | Tracker behavior |
+|-------|---------|------------------|
+| `true` | The opponent's macro produced its side effect; for `ATTACK`, the swing really went out. | Stamp the 0-based **decision-window index** of the swing, and compute `elapsed = (windows_since_swing) * ACTION_REPEAT`. One `step()` is one window is `ACTION_REPEAT` gate ticks, so this reconstructs `_currentTick - _lastSwingTick` by construction. Never derive it from `state.tick` — see above. |
+| `false` | The swing did **not** fire: gate-blocked, or no entity to swing at. | Do **not** stamp — mirrors the executor's own "a swing at nothing does not start the cooldown" rule. |
+| absent / `null` | The bridge does not report (no `opp_action` was sent, or a pre-T11b bridge). | Assume it fired. The opposite assumption pins the shadow meter at `1.0` forever and reintroduces the flailing the tight readiness epsilon exists to prevent. |
+
+The bridge already has this value: `MacroExecutor.begin(...)` returns `{swung}`.
+It is threaded onto the wire, not recomputed.
+
 ```json
 {"type":"state",
  "self":{"pos":[0.5,64.0,0.5],"yaw":0.0,"pitch":0.0,"velocity":[0.0,0.0,0.0],
@@ -187,10 +231,14 @@ Acknowledges a [`reset`](#reset) **after the post-reset read-back gate**.
 
 ## Message list (frozen)
 
-| Direction      | `type`        | Required fields                                                |
-|----------------|---------------|----------------------------------------------------------------|
-| Python → Node  | `reset`       | `type`, `episode`, `seed`                                      |
-| Python → Node  | `step`        | `type`, `action` (int 0..7)                                   |
-| Python → Node  | `close`       | `type`                                                        |
-| Node → Python  | `state`       | `type`, `self`, `opponent`, `events`, `arena`, `tick`, `code_version` |
-| Node → Python  | `reset_ack`   | `type`, `ok`, `readback`                                      |
+| Direction      | `type`        | Required fields                                                | Optional fields |
+|----------------|---------------|----------------------------------------------------------------|-----------------|
+| Python → Node  | `reset`       | `type`, `episode`, `seed`                                      | — |
+| Python → Node  | `step`        | `type`, `action` (int 0..7)                                   | `opp_action` (int 0..7 \| null) |
+| Python → Node  | `close`       | `type`                                                        | — |
+| Node → Python  | `state`       | `type`, `self`, `opponent`, `events`, `arena`, `tick`, `code_version` | `opp_action_executed` (bool \| null) |
+| Node → Python  | `reset_ack`   | `type`, `ok`, `readback`                                      | — |
+
+Both validators are `additionalProperties: false`, so a field is accepted **only**
+if it is listed above — an optional field that reaches only the prose and the
+Python is rejected on the wire precisely when something first tries to use it.

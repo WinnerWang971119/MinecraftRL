@@ -44,8 +44,15 @@ reset:
     failure (protects the MDP / AC7 — never learn from a corrupt initial state).
 
 step:
-    Python -> ``step(action)``
+    Python -> ``step(action, opp_action?)``
     Node   -> ``state(...)``                # raw aggregated state for the interval
+
+    ``opp_action`` is optional: omitted (the default) the opponent takes no
+    action of its own and the wire line is byte-identical to the M1/M2
+    stationary-dummy path; supplied, the bridge drives the opponent through the
+    same decision window. The policy that chooses it reads
+    :meth:`MCPvPEnv.raw_opponent_view` — raw, ungated state that must NEVER
+    reach the agent's observation.
 
     The raw state is gated by the PerceptionFilter, packed by
     ``build_observation``, validated, and scored by ``compute_reward`` against
@@ -99,12 +106,13 @@ from env.observation_spec import (
     held_item_id,  # noqa: F401  (re-exported convenience for callers/logging)
     validate,
 )
-from env.perception_filter import PerceptionFilter
+from env.perception_filter import ATTACK_RANGE, PerceptionFilter
 from env.reward import (
     TermInfo,
     compute_reward,
     compute_reward_components,
 )
+from opponents.scripted_bot import OpponentView
 
 __all__ = [
     "BridgeError",
@@ -113,6 +121,7 @@ __all__ = [
     "ExhibitionConfig",
     "MCPvPEnv",
     "DECISION_DT_SECONDS",
+    "OPPONENT_ATTACK_SPEED_TICKS",
     "REWARD_COMPONENT_KEYS",
 ]
 
@@ -126,6 +135,27 @@ __all__ = [
 # (== DECISION_INTERVAL_MS / 1000 == 0.2 s).
 # ---------------------------------------------------------------------------
 DECISION_DT_SECONDS: float = ACTION_REPEAT / SERVER_TPS
+
+
+# ---------------------------------------------------------------------------
+# Opponent swing period (the shadow cooldown's only constant).
+#
+# Ticks for the opponent's weapon to fully recharge. The wire carries NO
+# opponent cooldown — ``state.self.attack_cooldown`` is the learner's, and
+# ``state.opponent`` has no such field — so ``raw_opponent_view()`` reconstructs
+# the meter in Python from the decision windows elapsed since the opponent's
+# last swing (one window == ACTION_REPEAT gate ticks). NEVER from the coarse
+# ``state.tick``, which rides the server world age and is flat-then-jumping —
+# see _track_opponent_swing() for why that clock cannot carry this meter.
+#
+# MIRRORS ``IRON_SWORD_ATTACK_SPEED_TICKS`` in ``bridge/actions.js`` (the same
+# ``SERVER_TPS / 1.6`` == 12.5 ticks at vanilla 1.9+ attack speed), and is
+# written as that expression rather than the literal so it cannot drift from
+# ``SERVER_TPS``. Both sides must agree: the bridge's ``MacroExecutor.canSwing``
+# gate allows the next swing at ``elapsed >= 12.5`` ticks of ITS clock, and the
+# shadow meter here reaches 1.0 at exactly the same elapsed tick count.
+# ---------------------------------------------------------------------------
+OPPONENT_ATTACK_SPEED_TICKS: float = SERVER_TPS / 1.6
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +606,17 @@ class MCPvPEnv:
         self._episode: int = -1
         self._step_count: int = 0
         self._prev_obs: Optional[np.ndarray] = None
+        # The most recent RAW state message, kept ONLY to serve
+        # raw_opponent_view(). It is never consulted by the observation path —
+        # _state_to_obs() gates the state it is handed, and this attribute is
+        # not one of its inputs.
+        self._last_state: Optional[StateMsg] = None
+        # Shadow attack-cooldown tracker for the opponent: the 0-based index of
+        # the decision window in which its last swing actually fired, or None
+        # for "no swing yet this episode" (== fully charged). A WINDOW COUNT,
+        # never a wire tick — see _track_opponent_swing() for why the coarse
+        # ``state.tick`` cannot carry this meter.
+        self._opp_last_swing_window: Optional[int] = None
         # True only while reset() is doing wire I/O. Switches _send/_recv from
         # their step-time semantics (self-recover on send; reconnect-then-re-raise
         # on recv) to "propagate the raw transport error" so reset()'s own bounded
@@ -709,6 +750,16 @@ class MCPvPEnv:
         self._filter.reset()
         self._step_count = 0
         self._done = False
+        # Re-arm the opponent's shadow swing meter alongside the filter memory:
+        # the bridge calls executor.resetCooldown() on every reset, so carrying
+        # last episode's swing window across would leave a fresh opponent unable
+        # to attack for its first few decisions of the new episode.
+        self._opp_last_swing_window = None
+        # Drop the previous episode's latched raw state alongside it: if the
+        # post-reset state read below dies (and the transport retries run out),
+        # raw_opponent_view() must raise its "before any state" error, not
+        # silently serve the PREVIOUS episode's world as if it were current.
+        self._last_state = None
 
         # The post-reset first observation is the next inbound `state` message.
         state = self._recv_state()
@@ -716,12 +767,20 @@ class MCPvPEnv:
         self._prev_obs = obs
         return obs
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(
+        self, action: int, opp_action: Optional[int] = None
+    ) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """Advance one decision step.
 
         Sends a ``step(action)``, awaits one ``state`` reply, gates + packs it
         into the next observation, validates it, and scores the transition with
         :func:`env.reward.compute_reward`.
+
+        ``opp_action`` is the optional opponent-acts path: pass the macro an
+        opponent policy chose and the bridge drives the opponent handle through
+        a second executor in the same window. Leave it ``None`` (the default)
+        and the wire line is byte-identical to what it was before the field
+        existed — the M1/M2 stationary-dummy path is untouched.
 
         ``done`` fires when the bridge reports a death (``events.i_died`` →
         terminal loss, ``events.opponent_died`` → terminal win) OR when the step
@@ -739,6 +798,10 @@ class MCPvPEnv:
         Args:
             action: Discrete action index (or :class:`~agent.actions.Macro`) in
                 ``[0, n_actions)``.
+            opp_action: Optional discrete action index for the OPPONENT, in the
+                same ``[0, n_actions)`` range and validated identically.
+                ``None`` (the default) means the opponent takes no action of its
+                own and the field is omitted from the wire line entirely.
 
         Returns:
             ``(obs, reward, done, info)`` where ``obs`` is a validated
@@ -762,13 +825,31 @@ class MCPvPEnv:
             raise ValueError(
                 f"action must be in [0, {N_ACTIONS}), got {action!r}"
             )
+        # Same validation as `action` — N_ACTIONS is frozen at 8, and this field
+        # widens WHO acts, never the action space. None stays None: it is the
+        # "opponent does nothing" case, not a zeroth macro.
+        opp_act: Optional[int] = None
+        if opp_action is not None:
+            opp_act = int(opp_action)
+            if not (0 <= opp_act < N_ACTIONS):
+                raise ValueError(
+                    f"opp_action must be in [0, {N_ACTIONS}) or None, got {opp_action!r}"
+                )
         if self._prev_obs is None:
             # Defensive: reset() always sets _prev_obs before clearing _done.
             raise ValueError("internal error: no previous observation; call reset()")
 
         # Send the action and await exactly one state reply.
-        self._send(StepMsg(action=act))
+        self._send(StepMsg(action=act, opp_action=opp_act))
         state = self._recv_state()
+
+        # Fold this window into the opponent's shadow swing meter. MUST stay
+        # ABOVE the `self._step_count += 1` below: the stamp is the 0-based
+        # index of the window that swung, read from the PRE-increment counter
+        # (see _track_opponent_swing's ordering invariant) — and it must land
+        # before step() returns so a raw_opponent_view() taken after this step
+        # sees the swing that just happened.
+        self._track_opponent_swing(opp_act, state)
 
         # Gate + pack the new observation (s').
         obs = self._state_to_obs(state)
@@ -830,6 +911,122 @@ class MCPvPEnv:
 
         return obs, float(reward), done, info
 
+    # -- the raw opponent view (scripted-opponent seam) --------------------
+
+    def raw_opponent_view(self) -> OpponentView:
+        """RAW, ungated combat state as the *opponent* sees it. **Never the obs.**
+
+        This is the ONLY sanctioned raw-state accessor and it exists for one
+        consumer: the omniscient :class:`~opponents.scripted_bot.ScriptedBot`,
+        which cannot be driven from :meth:`step`'s return value because that
+        observation is deliberately gated (FOV cone + line of sight + memory).
+        The view is built from the most recent ``state`` message with **no
+        gating applied at all**.
+
+        **It must never be routed into the agent's observation.** The obs is
+        built solely by :meth:`_state_to_obs` from the ``state`` message it is
+        handed, through the :class:`~env.perception_filter.PerceptionFilter`;
+        this method is not one of its inputs and calling it has no effect on any
+        observation. Feeding this return value into the agent would leak
+        privileged state into training and quietly invalidate every result.
+
+        **TRAINING ONLY — not valid in exhibition mode.** ``self_health`` can
+        only come from ``state.opponent.health``, which the bridge reports as
+        ``0`` when the opponent is a *human* (mineflayer never populates
+        ``entity.health`` for another player, so there is no source). Against a
+        person this view would read ``self_health == 0`` — a HARD-preset bot
+        would flee forever, and anything scoring on it would see a permanent
+        corpse. That is not a live hazard today, because exhibition mode has no
+        scripted opponent at all: the human *replaces* the opponent bot. It is
+        recorded here so nobody wires the two together later.
+
+        Field mapping (the polarity is the thing to get right — ``self_*`` is
+        the OPPONENT, ``target_*`` is the LEARNER):
+
+        ==========================  ==========================================
+        ``OpponentView`` field      Source
+        ==========================  ==========================================
+        ``self_pos/yaw/health``     ``state.opponent`` (the scripted bot itself)
+        ``target_pos/yaw/health``   ``state.self`` (the learner it is fighting)
+        ``distance``                horizontal (XZ) separation, per the type
+        ``in_attack_range``         ``distance <= ATTACK_RANGE``
+        ``attack_cooldown``         the Python shadow tracker (see below)
+        ``can_see_target``          always ``True`` — this bot is omniscient
+        ``last_known_target_pos``   the target's position now; with
+                                    ``can_see_target`` always ``True`` the
+                                    most-recently-seen position IS the current
+                                    one
+        ==========================  ==========================================
+
+        Yaw is converted to **degrees**: the wire carries radians, and
+        ``OpponentView`` documents its ``self_yaw`` / ``target_yaw`` as degrees.
+        This method is the only place that conversion happens.
+
+        ``attack_cooldown`` is clamped to **exactly** ``1.0`` (never ``1.0``
+        minus a float hair) because ``ScriptedBot`` tests readiness with a
+        deliberately tight ``>= 1.0 - 1e-6``: a value a hair under 1.0 makes it
+        never attack at all, which presents as a mysteriously passive opponent
+        rather than as an error.
+
+        Returns:
+            A fresh :class:`~opponents.scripted_bot.OpponentView`.
+
+        Raises:
+            ValueError: if no ``state`` has been received yet (``reset()`` has
+                not run). There is no raw state to report and inventing a
+                zeroed one would hand the bot a view in which both fighters are
+                at the origin and dead.
+        """
+        state = self._last_state
+        if state is None:
+            raise ValueError(
+                "raw_opponent_view() called before any state was received; "
+                "call reset() first"
+            )
+
+        opp_raw = state.opponent
+        self_raw = state.self_state
+
+        # The opponent is the "self" of this view; the learner is its target.
+        view_self_pos = (
+            float(opp_raw.pos[0]),
+            float(opp_raw.pos[1]),
+            float(opp_raw.pos[2]),
+        )
+        view_target_pos = (
+            float(self_raw.pos[0]),
+            float(self_raw.pos[1]),
+            float(self_raw.pos[2]),
+        )
+
+        # Horizontal (XZ-plane) separation, matching OpponentView's documented
+        # `distance` and the PerceptionFilter's own in-range test — a jumping
+        # fighter is not out of melee range.
+        distance = math.hypot(
+            view_target_pos[0] - view_self_pos[0],
+            view_target_pos[2] - view_self_pos[2],
+        )
+
+        return OpponentView(
+            self_pos=view_self_pos,
+            self_yaw=math.degrees(float(opp_raw.yaw)),
+            # PRIVILEGED and training-only — see the exhibition note above.
+            self_health=float(opp_raw.health),
+            target_pos=view_target_pos,
+            target_yaw=math.degrees(float(self_raw.yaw)),
+            target_health=float(self_raw.health),
+            distance=distance,
+            # The module-level ATTACK_RANGE, deliberately NOT this env's filter
+            # instance: tests (and a future tuned filter) override the LEARNER's
+            # perception, and an omniscient opponent must not inherit those.
+            in_attack_range=distance <= ATTACK_RANGE,
+            attack_cooldown=self._opponent_attack_cooldown(),
+            # Omniscient by design: no FOV, no LoS, no memory. The field is on
+            # the type for a future filtered mode that does not exist yet.
+            can_see_target=True,
+            last_known_target_pos=view_target_pos,
+        )
+
     def close(self) -> None:
         """Send ``close`` (best-effort) and tear down the transport.
 
@@ -890,6 +1087,10 @@ class MCPvPEnv:
             raise BridgeError(
                 f"expected a state message, got {type(msg).__name__}"
             )
+        # Latch the RAW state here — the one place both the reset and the step
+        # path funnel through — so raw_opponent_view() can never be served a
+        # stale snapshot because a caller forgot to record one.
+        self._last_state = msg
         return msg
 
     def _send(self, message: Union[ResetMsg, StepMsg, CloseMsg]) -> None:
@@ -953,6 +1154,106 @@ class MCPvPEnv:
                 f"bridge {where} failed and the single reconnect attempt also "
                 f"failed; aborting the run: {exc}"
             ) from exc
+
+    # -- opponent shadow attack cooldown ----------------------------------
+
+    def _track_opponent_swing(
+        self, opp_action: Optional[int], state: StateMsg
+    ) -> None:
+        """Fold one window's ``opp_action`` into the opponent's shadow swing meter.
+
+        Records a swing only when this window actually asked the opponent to
+        ``ATTACK`` **and** the bridge did not report that the swing failed to
+        fire (``state.opp_action_executed is False``). An absent/``None`` report
+        is treated as "it fired": the opposite default would leave the meter
+        pinned at 1.0 forever, and a permanently-charged meter is exactly the
+        flailing opponent the readiness epsilon exists to prevent.
+
+        The stamp is a **WINDOW COUNT**, deliberately never ``state.tick``.
+        The wire tick rides the learner's server world age (``bot.js
+        _serverTick``), which the server's ``update_time`` packet refreshes only
+        ~once per second — so it is FLAT for several decision windows, then
+        jumps ~20 (``eval/benchmark.py`` TickDeltaTpsProvider records the same
+        measured shape). The bridge's swing gate rides a different clock,
+        ``_currentTick``, which advances exactly ``ACTION_REPEAT`` per window.
+        A meter fed the coarse clock reads ready 1-5 windows off the gate, and
+        the ready-early case LOCKS IN: ``ScriptedBot`` returns ``ATTACK``,
+        ``canSwing`` blocks it, ``opp_action_executed=false`` suppresses the
+        stamp, the meter stays pinned at 1.0, and the opponent mashes ``ATTACK``
+        every window instead of strafing or jumping. Counting decision windows
+        reconstructs the gate's clock by construction: one :meth:`step` is one
+        window is ``ACTION_REPEAT`` gate ticks.
+
+        ORDERING INVARIANT: this runs BEFORE :meth:`step` increments
+        ``_step_count``, so the stamp is the 0-based index of the window that
+        swung, and ``_step_count - stamp`` afterwards counts the windows elapsed
+        since that window's start. Moving the increment above this call would
+        shift the meter one whole window slow (ready at ``T+20``, not ``T+16``);
+        the worked-example gate test pins that direction, and the coarse-clock
+        tests pin the fast one.
+        """
+        if opp_action != int(Macro.ATTACK):
+            return
+        if state.opp_action_executed is False:
+            # Explicitly reported as not fired (gate-blocked, or nothing to
+            # swing at). Mirrors the executor's own rule that a swing at nothing
+            # does not start the cooldown.
+            return
+        self._opp_last_swing_window = self._step_count
+
+    def _opponent_attack_cooldown(self) -> float:
+        """The opponent's shadow swing **METER** in ``[0, 1]`` — charge, not a gate.
+
+        The quantity is the one :class:`~opponents.scripted_bot.OpponentView`
+        documents for ``attack_cooldown`` (1.0 == fully charged), reconstructed
+        on the swing gate's own clock: ``elapsed = (decision windows since the
+        swing) * ACTION_REPEAT`` gate ticks, which equals the bridge's
+        ``currentTick - lastSwingTick`` by construction (one :meth:`step` is
+        one window). Its SATURATION therefore coincides with the gate at window
+        granularity: the meter reads 1.0 exactly when ``MacroExecutor.canSwing``
+        would allow the next window's swing (``elapsed >=
+        OPPONENT_ATTACK_SPEED_TICKS``), and reads the true partial charge in
+        between.
+
+        RESET SEEDING — deliberately none. "No swing yet this episode" returns
+        1.0, with no analogue of the bridge's ``_meterResetTick`` regear anchor
+        (``bot.js`` issue #28), because that anchor models a hazard the
+        opponent's channel does not have:
+
+        * The thing this meter must mirror — the opponent-side swing gate —
+          starts every episode OPEN: the bridge clears ``executor.lastSwingTick``
+          on reset. A shadow seeded below the gate would hold a fresh opponent
+          out of a fight it is allowed to swing in.
+        * The server's own meter is NOT re-zeroed by the opponent's reset.
+          ``Player.tick()`` resets it only on a main-hand item-TYPE change,
+          compared once per tick (decompiled from the pinned jar; quoted at
+          ``bot.js:2102-2113``), and ``arena:spawn_dummy_pad`` runs ``$clear``
+          with **no** ``give`` at all, inside one single-tick function — the
+          dummy's hand goes air -> air, so the comparison never sees a change,
+          the empty-handed JOIN case included. The LEARNER needed the anchor
+          precisely because its regear is a same-tick clear+give of a sword
+          and its join is air -> sword.
+        * The residual — the opponent's final kill swing of the previous
+          episode zeroing the server-side ticker across a reset — affects hit
+          STRENGTH only, never gate agreement, and the bridge's own gate is
+          equally blind to it by design.
+
+        Returns **exactly** ``1.0`` (via ``min``, never an arithmetic result)
+        whenever the meter is full, including the "no swing yet this episode"
+        case. ``ScriptedBot`` reads readiness as ``>= 1.0 - 1e-6``, so a value a
+        hair under 1.0 would silently stop it attacking altogether.
+        """
+        last_swing_window = self._opp_last_swing_window
+        if last_swing_window is None:
+            return 1.0
+        if OPPONENT_ATTACK_SPEED_TICKS <= 0.0:
+            # Degenerate weapon speed: never block, matching the bridge's own
+            # defensive branches in canSwing()/computeAttackCooldown().
+            return 1.0
+        elapsed = (self._step_count - last_swing_window) * ACTION_REPEAT
+        if elapsed <= 0:
+            return 0.0
+        return min(1.0, elapsed / OPPONENT_ATTACK_SPEED_TICKS)
 
     # -- state -> observation ---------------------------------------------
 

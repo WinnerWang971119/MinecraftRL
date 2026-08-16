@@ -19,6 +19,16 @@ Covered behaviors:
   * ``info`` exposes the per-reward-component breakdown.
   * A simulated bridge disconnect raises ``BridgeError`` (and triggers a
     reconnect attempt).
+  * The opponent-acts seam (T11a/AC9): ``step(action, opp_action)`` carries the
+    optional field, validates it exactly like ``action``, and OMITS it entirely
+    when it is ``None`` so the M1/M2 stationary-dummy path is unchanged.
+  * ``raw_opponent_view()`` returns RAW, ungated state for the omniscient
+    scripted opponent — with the polarity, units and horizontal distance the
+    ``OpponentView`` contract pins — and never reaches the observation.
+  * The shadow attack cooldown tracks the bridge's swing gate on the gate's OWN
+    clock — decision-window counts (one step == ACTION_REPEAT gate ticks), never
+    the coarse flat-then-jumping ``state.tick`` — and clamps to EXACTLY 1.0
+    (``ScriptedBot`` reads readiness as ``>= 1.0 - 1e-6``).
 """
 
 import math
@@ -27,10 +37,11 @@ import numpy as np
 import pytest
 
 from agent.actions import Macro, N_ACTIONS
-from agent.contract_config import MAX_EPISODE_STEPS
+from agent.contract_config import ACTION_REPEAT, MAX_EPISODE_STEPS
 from agent.reward_config import RewardConfig
 from bridge.messages import ResetAckMsg, StateMsg
 from env.mc_pvp_env import (
+    OPPONENT_ATTACK_SPEED_TICKS,
     REWARD_COMPONENT_KEYS,
     BridgeError,
     ExhibitionConfig,
@@ -132,10 +143,21 @@ def _state(
     opponent_died=False,
     tick=1,
     code_version="test",
+    opp_action_executed=None,
 ):
-    """Build a valid ``StateMsg`` from keyword overrides (sane combat defaults)."""
+    """Build a valid ``StateMsg`` from keyword overrides (sane combat defaults).
+
+    ``opp_action_executed`` is the OPTIONAL swing report: left ``None`` the key
+    is omitted entirely, exactly as a bridge that makes no report emits it.
+    """
+    extra = (
+        {}
+        if opp_action_executed is None
+        else {"opp_action_executed": opp_action_executed}
+    )
     return StateMsg.from_dict(
         {
+            **extra,
             "type": "state",
             "self": {
                 "pos": list(self_pos),
@@ -1003,3 +1025,435 @@ def test_context_manager_closes():
         env.reset(seed=0)
     assert bridge.closes >= 1
     assert any(m["type"] == "close" for m in bridge.sent)
+
+
+# ---------------------------------------------------------------------------
+# The opponent-acts seam: step(action, opp_action) (T11a / AC9).
+#
+# The M1/M2 stationary-dummy path must be untouched — same call, same wire
+# bytes — while a supplied opp_action rides along on the same step line.
+# ---------------------------------------------------------------------------
+
+
+def _stepped_env(bridge=None, **state_kwargs):
+    """Helper: an env reset and primed with ONE more state for the next step."""
+    if bridge is None:
+        bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env, _ = _reset_env(bridge)
+    bridge.push(_state(**state_kwargs))
+    return env, bridge
+
+
+def _last_step_msg(bridge):
+    return [m for m in bridge.sent if m["type"] == "step"][-1]
+
+
+def test_step_without_opp_action_sends_no_such_key():
+    """AC9: the M2 dummy path's step line is byte-identical to before the field."""
+    env, bridge = _stepped_env(tick=2)
+
+    env.step(Macro.APPROACH)
+
+    assert _last_step_msg(bridge) == {"type": "step", "action": int(Macro.APPROACH)}
+
+
+def test_step_with_explicit_none_opp_action_sends_no_such_key():
+    """`opp_action=None` is "the opponent does nothing", not macro 0."""
+    env, bridge = _stepped_env(tick=2)
+
+    env.step(Macro.APPROACH, opp_action=None)
+
+    assert "opp_action" not in _last_step_msg(bridge)
+
+
+def test_step_forwards_opp_action_on_the_wire():
+    env, bridge = _stepped_env(tick=2)
+
+    env.step(Macro.IDLE, opp_action=Macro.STRAFE_R)
+
+    assert _last_step_msg(bridge) == {
+        "type": "step",
+        "action": int(Macro.IDLE),
+        "opp_action": int(Macro.STRAFE_R),
+    }
+
+
+@pytest.mark.parametrize("opp_action", list(range(N_ACTIONS)))
+def test_step_accepts_every_valid_opp_action(opp_action):
+    env, bridge = _stepped_env(tick=2)
+
+    env.step(Macro.IDLE, opp_action=opp_action)
+
+    assert _last_step_msg(bridge)["opp_action"] == opp_action
+
+
+@pytest.mark.parametrize("bad", [N_ACTIONS, -1, 100, -100])
+def test_step_rejects_out_of_range_opp_action(bad):
+    """Same validation as `action`; N_ACTIONS is FROZEN at 8."""
+    env, bridge = _stepped_env(tick=2)
+
+    with pytest.raises(ValueError, match="opp_action"):
+        env.step(Macro.IDLE, opp_action=bad)
+
+    # Rejected BEFORE the wire: nothing was sent, so the request/response
+    # stream cannot desync.
+    assert not [m for m in bridge.sent if m["type"] == "step"]
+
+
+def test_step_with_opp_action_is_positional_or_keyword():
+    """T12 may pass it either way; the signature is (action, opp_action=None)."""
+    env, bridge = _stepped_env(tick=2)
+
+    env.step(Macro.IDLE, Macro.JUMP)
+
+    assert _last_step_msg(bridge)["opp_action"] == int(Macro.JUMP)
+
+
+# ---------------------------------------------------------------------------
+# raw_opponent_view() — RAW, ungated state for the scripted opponent.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_opponent_view_before_reset_raises():
+    """No state has been received: there is nothing raw to report."""
+    env = _env(ScriptedBridge([]))
+    with pytest.raises(ValueError, match="before any state"):
+        env.raw_opponent_view()
+
+
+def test_raw_opponent_view_polarity_self_is_the_opponent():
+    """`self_*` is the OPPONENT, `target_*` is the LEARNER — an easy silent swap."""
+    bridge = ScriptedBridge(
+        [
+            _reset_ack(ok=True),
+            _state(
+                self_pos=(1.0, 64.0, 2.0),
+                self_health=17.0,
+                opp_pos=(4.0, 64.0, 6.0),
+                opp_health=11.0,
+            ),
+        ]
+    )
+    env, _ = _reset_env(bridge)
+
+    view = env.raw_opponent_view()
+
+    assert view.self_pos == (4.0, 64.0, 6.0)
+    assert view.self_health == pytest.approx(11.0)
+    assert view.target_pos == (1.0, 64.0, 2.0)
+    assert view.target_health == pytest.approx(17.0)
+
+
+def test_raw_opponent_view_distance_is_horizontal_and_gates_attack_range():
+    """XZ separation only: a jumping fighter is not out of melee range."""
+    bridge = ScriptedBridge(
+        [
+            _reset_ack(ok=True),
+            # 3-4-5 triangle in XZ, plus a big Y gap that must NOT count.
+            _state(self_pos=(0.0, 64.0, 0.0), opp_pos=(3.0, 90.0, 4.0)),
+        ]
+    )
+    env, _ = _reset_env(bridge)
+
+    view = env.raw_opponent_view()
+
+    assert view.distance == pytest.approx(5.0)
+    assert view.in_attack_range is False
+
+    bridge.push(_state(self_pos=(0.0, 64.0, 0.0), opp_pos=(1.0, 90.0, 0.0), tick=2))
+    env.step(Macro.IDLE)
+    close_view = env.raw_opponent_view()
+    assert close_view.distance == pytest.approx(1.0)
+    assert close_view.in_attack_range is True
+
+
+def test_raw_opponent_view_yaw_is_in_degrees():
+    """The wire carries radians; OpponentView documents degrees."""
+    bridge = ScriptedBridge(
+        [_reset_ack(ok=True), _state(self_yaw=math.pi / 2.0, opp_yaw=math.pi)]
+    )
+    env, _ = _reset_env(bridge)
+
+    view = env.raw_opponent_view()
+
+    assert view.self_yaw == pytest.approx(180.0)
+    assert view.target_yaw == pytest.approx(90.0)
+
+
+def test_raw_opponent_view_is_omniscient():
+    """No FOV/LoS/memory gating: an opponent behind a blocked LoS still sees all."""
+    behind = _state(self_pos=(0.0, 64.0, 0.0), opp_pos=(0.0, 64.0, -5.0))
+    bridge = ScriptedBridge([_reset_ack(ok=True), behind])
+    env = _env(bridge, perception_filter=PerceptionFilter(los_clear=lambda *a, **k: False))
+    env.reset(seed=0)
+
+    view = env.raw_opponent_view()
+
+    assert view.can_see_target is True
+    assert view.target_pos == (0.0, 64.0, 0.0)
+    assert view.last_known_target_pos == view.target_pos
+
+
+def test_raw_opponent_view_never_reaches_the_observation():
+    """The obs stays gated; the raw view is a side channel with no effect on it.
+
+    The opponent is BEHIND the agent, so the gated obs must report absent while
+    the raw view still reports the truth — and taking the raw view must not
+    change the obs one bit.
+    """
+    bridge = ScriptedBridge(
+        [_reset_ack(ok=True), _state(self_pos=(0.0, 64.0, 0.0), opp_pos=(0.0, 64.0, -5.0))]
+    )
+    env, _ = _reset_env(bridge)
+    bridge.push(_state(self_pos=(0.0, 64.0, 0.0), opp_pos=(0.0, 64.0, -5.0), tick=2))
+
+    obs, _, _, _ = env.step(Macro.IDLE, opp_action=Macro.APPROACH)
+    view = env.raw_opponent_view()
+
+    # Gated: the opponent is absent from the observation...
+    assert obs.shape == (OBS_DIM,)
+    assert obs[Obs.VISIBLE] == pytest.approx(0.0)
+    np.testing.assert_allclose(
+        obs[Obs.OPP_POS_LOCAL : Obs.OPP_POS_LOCAL + 3], [0.0, 0.0, 0.0], atol=1e-6
+    )
+    # ...while the raw view has the real position, and taking it changed nothing.
+    assert view.self_pos == (0.0, 64.0, -5.0)
+    np.testing.assert_array_equal(obs, env._prev_obs)
+
+
+# ---------------------------------------------------------------------------
+# The shadow attack cooldown (the opponent has NO cooldown channel on the wire).
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_cooldown_starts_exactly_charged():
+    """Exactly 1.0 — ScriptedBot's readiness test is `>= 1.0 - 1e-6`."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env, _ = _reset_env(bridge)
+
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_drops_after_an_opponent_attack():
+    env, bridge = _stepped_env(tick=104)
+
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+
+    # One decision window has elapsed since the swing, and one window is
+    # ACTION_REPEAT gate ticks — so the meter has charged ACTION_REPEAT of its
+    # 12.5-tick period. Deliberately NOT derived from state.tick: that is the
+    # coarse server clock, not the one the swing gate rides.
+    assert env.raw_opponent_view().attack_cooldown == pytest.approx(
+        ACTION_REPEAT / OPPONENT_ATTACK_SPEED_TICKS
+    )
+
+
+def test_shadow_cooldown_matches_the_bridge_gate_tick_for_tick():
+    """The worked example: a swing at T is ready again at T+16, not T+20.
+
+    The bridge swings at ``executor.begin(windowStartTick)`` and re-arms at
+    ``elapsed >= 12.5``. Stamping the window END instead would leave the meter
+    reading 0.96 at T+16 and not ready until T+20 — an opponent permanently one
+    whole decision window slower than the one actually fighting.
+    """
+    env, bridge = _stepped_env(tick=104)  # window 100 -> 104
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+
+    ready_at = {}
+    for tick in (108, 112, 116):
+        bridge.push(_state(tick=tick))
+        env.step(Macro.IDLE)
+        ready_at[tick] = env.raw_opponent_view().attack_cooldown
+
+    assert ready_at[108] == pytest.approx(8 / OPPONENT_ATTACK_SPEED_TICKS)
+    # 12 ticks elapsed < 12.5: the bridge's canSwing() says no, and so do we.
+    assert ready_at[112] == pytest.approx(12 / OPPONENT_ATTACK_SPEED_TICKS)
+    assert ready_at[112] < 1.0
+    # 16 >= 12.5: the bridge re-arms here, and the meter reads EXACTLY 1.0 —
+    # not 1.0 - 1e-15, which would make ScriptedBot never attack at all.
+    assert ready_at[116] == 1.0
+
+
+def test_shadow_cooldown_is_not_stamped_when_the_swing_did_not_fire():
+    """`opp_action_executed: false` == gate-blocked or nothing to swing at."""
+    env, bridge = _stepped_env(tick=104, opp_action_executed=False)
+
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_assumes_a_swing_fired_when_unreported():
+    """Absent report: assume it fired, or the meter is pinned at 1.0 forever.
+
+    A permanently-charged meter is exactly the flailing opponent the tight
+    readiness epsilon exists to prevent.
+    """
+    env, bridge = _stepped_env(tick=104)  # no opp_action_executed key at all
+
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+
+    assert env.raw_opponent_view().attack_cooldown < 1.0
+
+
+def test_shadow_cooldown_stamped_on_an_explicit_true_report():
+    env, bridge = _stepped_env(tick=104, opp_action_executed=True)
+
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+
+    assert env.raw_opponent_view().attack_cooldown < 1.0
+
+
+@pytest.mark.parametrize(
+    "opp_action", [m for m in Macro if m is not Macro.ATTACK]
+)
+def test_shadow_cooldown_untouched_by_non_attack_opponent_actions(opp_action):
+    env, bridge = _stepped_env(tick=104, opp_action_executed=True)
+
+    env.step(Macro.IDLE, opp_action=opp_action)
+
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_untouched_when_no_opp_action_is_sent():
+    """The M2 dummy path can never accrue a phantom opponent cooldown."""
+    env, bridge = _stepped_env(tick=104)
+
+    env.step(Macro.ATTACK)  # the LEARNER attacks; the opponent does nothing
+
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_advances_while_the_coarse_tick_is_flat():
+    """The meter must ramp on the gate's clock even when ``state.tick`` stalls.
+
+    ``state.tick`` is the learner's server world age (``bot.js _serverTick``),
+    fed by ``update_time`` only ~once per second — so it is FLAT for several
+    decision windows, then jumps ~20. The swing gate rides ``_currentTick``,
+    which advances exactly ACTION_REPEAT per window. A shadow meter reading the
+    coarse clock stalls with it and reports the opponent uncharged at the very
+    window the bridge's gate re-arms.
+    """
+    env, bridge = _stepped_env(tick=104)
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)  # swing, window 0
+
+    # Windows 1 and 2: update_time has not landed, the wire tick is frozen at
+    # 104 — but 4 more gate ticks elapse per window regardless.
+    bridge.push(_state(tick=104))
+    env.step(Macro.IDLE)
+    assert env.raw_opponent_view().attack_cooldown == pytest.approx(
+        8 / OPPONENT_ATTACK_SPEED_TICKS
+    )
+
+    bridge.push(_state(tick=104))
+    env.step(Macro.IDLE)
+    assert env.raw_opponent_view().attack_cooldown == pytest.approx(
+        12 / OPPONENT_ATTACK_SPEED_TICKS
+    )
+
+    # Window 3: still flat. 16 gate ticks >= 12.5 — the bridge re-arms for
+    # window 4 and the meter must read EXACTLY 1.0 despite the frozen wire tick.
+    bridge.push(_state(tick=104))
+    env.step(Macro.IDLE)
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_does_not_ready_early_on_the_update_time_jump():
+    """The C1 flail lock: a +20 ``update_time`` jump must not fake a recharge.
+
+    When the coarse clock jumps mid-recharge, a shadow meter on that clock reads
+    ready 1-2 windows before the bridge's gate re-arms. ``ScriptedBot`` then
+    returns ``ATTACK``, ``canSwing`` blocks it, ``opp_action_executed`` comes
+    back ``false``, the stamp never lands, and the meter stays pinned at 1.0 —
+    an opponent mashing ATTACK every window instead of strafing or jumping.
+    """
+    env, bridge = _stepped_env(tick=104)
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)  # swing, window 0
+
+    bridge.push(_state(tick=104))  # window 1: flat
+    env.step(Macro.IDLE)
+
+    # Window 2: update_time lands, the wire tick jumps 104 -> 124. On that
+    # clock the meter would read 24/12.5 -> 1.0 — two windows before the gate
+    # re-arms. Only 12 gate ticks have elapsed: NOT ready.
+    bridge.push(_state(tick=124))
+    env.step(Macro.IDLE)
+    view = env.raw_opponent_view()
+    assert view.attack_cooldown < 1.0
+    assert view.attack_cooldown == pytest.approx(12 / OPPONENT_ATTACK_SPEED_TICKS)
+
+    # Window 3: 16 gate ticks — ready exactly when the gate is, and exactly 1.0.
+    bridge.push(_state(tick=124))
+    env.step(Macro.IDLE)
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_shadow_cooldown_rearms_on_reset():
+    """The bridge calls executor.resetCooldown() every reset; so do we."""
+    env, bridge = _stepped_env(tick=104)
+    env.step(Macro.IDLE, opp_action=Macro.ATTACK)
+    assert env.raw_opponent_view().attack_cooldown < 1.0
+
+    bridge.push(_reset_ack(ok=True), _state(tick=106))
+    env.reset(seed=1)
+
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+
+
+def test_opponent_attack_speed_ticks_mirrors_the_bridge_constant():
+    """Mirrors IRON_SWORD_ATTACK_SPEED_TICKS in bridge/actions.js (20 / 1.6)."""
+    assert OPPONENT_ATTACK_SPEED_TICKS == pytest.approx(12.5)
+
+
+# ---------------------------------------------------------------------------
+# The wire tick is COARSE (flat, then a ~+20 jump). Nothing in the env may
+# assume it advances per step — every fixture above that hands the env a
+# perfectly regular tick stream is idealized, and it was exactly that idealized
+# clock that hid the shadow-cooldown defect the two tests above pin.
+# ---------------------------------------------------------------------------
+
+
+def test_step_tolerates_a_flat_then_jump_tick_stream():
+    """The realistic clock: obs stay valid, no spurious done, ticks pass through.
+
+    ``state.tick`` comes from the learner's world age, updated by the server's
+    ``update_time`` packet only ~once per second (``bot.js _serverTick``;
+    ``eval/benchmark.py`` TickDeltaTpsProvider records the same measured shape).
+    A per-step diff of it reads ``0, 0, 0, +20`` — the env must treat it as an
+    opaque timestamp, never as a per-step clock.
+    """
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state(tick=104)])
+    env, _ = _reset_env(bridge)
+
+    seen_ticks = []
+    for tick in (104, 104, 104, 124):
+        bridge.push(_state(tick=tick))
+        obs, _reward, done, info = env.step(Macro.APPROACH)
+        validate(obs)
+        assert done is False
+        seen_ticks.append(info["tick"])
+
+    # Passed through raw — no smoothing, no monotonicity repair.
+    assert seen_ticks == [104, 104, 104, 124]
+
+
+def test_a_reset_that_fails_after_the_gate_does_not_serve_a_stale_raw_view():
+    """A dead reset must leave raw_opponent_view() raising, not time-travelling.
+
+    The gate confirms, per-episode state is cleared, and THEN the transport
+    dies before the post-reset state arrives. Serving the previous episode's
+    latched state from raw_opponent_view() after that would hand the scripted
+    opponent a fight that no longer exists.
+    """
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state(tick=104)])
+    env, _ = _reset_env(bridge)
+    assert env.raw_opponent_view().target_health == 20.0  # episode 0's view
+
+    # Attempt 1: gate ok -> per-episode state cleared -> recv of the post-reset
+    # state raises. Attempts 2 and 3 die on the empty queue. reset() gives up.
+    bridge.push(_reset_ack(ok=True), ScriptedBridge.Disconnect)
+    with pytest.raises(BridgeError):
+        env.reset(seed=1)
+
+    with pytest.raises(ValueError, match="before any state"):
+        env.raw_opponent_view()
