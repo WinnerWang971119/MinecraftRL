@@ -11,8 +11,41 @@ the real stack, no mock.
 
 > **New here? Read this file top to bottom, then run [Your first 30 minutes](#your-first-30-minutes).**
 > When you're ready to take the stack live, follow [`RUNBOOK.md`](RUNBOOK.md).
+> Running the classroom exhibition? [`docs/demo-day.md`](docs/demo-day.md).
 > Just want to watch the bots fight with your own Minecraft client? That has its own
 > short procedure and its own traps: [`docs/spectate.md`](docs/spectate.md).
+
+---
+
+## Disclosure: the agent's senses are fair, its turning is assisted
+
+If you play against this agent, or watch someone play against it, you should know
+this up front rather than find it in a source comment later.
+
+**Fair.** Everything the agent *perceives* is honestly limited. Its observation
+passes through a 70° field-of-view cone, a line-of-sight raycast, and a memory
+timeout ([`env/perception_filter.py`](env/perception_filter.py)). It genuinely
+cannot see behind itself, and circling out of its cone does make it lose you.
+
+**Assisted.** One of its eight actions is named `TURN_TO_LAST_SEEN`, as if it
+recalls where the opponent was last *seen*. It does not. `_updateLastSeen()` in
+[`bridge/bot.js`](bridge/bot.js) writes the opponent's **live** world position
+into that memory on every decision window, whether or not the agent can see them.
+So that one action is an aim-snap onto where the opponent actually is, about
+200 ms stale, regardless of line of sight.
+
+The practical upshot: the agent can be blinded, but once it decides to turn it
+cannot be dodged.
+
+This was a deliberate, disclosed decision made under deadline. The two honest
+fixes (gate the memory on real visibility, or resolve it properly and add real
+facing actions) each invalidate the trained checkpoint, and there was one
+training window left before the 2026-08-20 demo. It is written into the action's
+own docstring in [`agent/actions.py`](agent/actions.py), frozen through
+2026-08-20, guard-tested so nobody silently changes it before then, and recorded
+in the plan's decision log
+([`docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md`](docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md)).
+It comes out after the demo.
 
 ---
 
@@ -77,7 +110,7 @@ milestones, not green tests.**
 
 | Need | Check | Why |
 |------|-------|-----|
-| **Java 21 exactly** | `java -version` | Paper 1.21.1 boots on newer JDKs and then SIGSEGVs in spark's native profiler; `server/setup/start.sh` pins 21 and refuses anything else. macOS: `brew install --cask temurin@21` |
+| **Java 21 installed** | `/usr/libexec/java_home -v 21` | Must print a path. Paper 1.21.1 boots on newer JDKs and then SIGSEGVs in spark's native profiler ~20 s after it reports Done. Your PATH `java` being 26 is fine and expected on this Mac: `server/setup/start.sh` resolves 21 itself and refuses to launch on anything else. macOS: `brew install --cask temurin@21` |
 | Node v24 (≥22) | `node -v` | mineflayer floor is `engines.node >=22` |
 | Python 3.11+ **in a venv** | `.venv/bin/python --version` | System python on the dev Mac is 3.9.6, below the floor |
 
@@ -120,7 +153,7 @@ contract + hand-authored fixtures.
 | [`eval/`](eval/) | Eval/infra | Random tracer (M1), combat probe (the damage-channel gate), benchmark (the number), eval harness (M2), logging |
 | [`server/`](server/) | Environment/bridge | Paper setup scripts, enclosed-pad arena datapack, ops, `server.properties` rationale |
 | [`distributed/`](distributed/) | Multi-pad (issue #4) | N-pad collection into one learner: `Episode`+serialization, `LocalTransport`, `WeightStore`, `LearnerLoop`, `ActorPool`, `SubprocessArenaLauncher`, and `padAnchor(i)` — the **sole** source of pad coordinates; wired into `agent.train --arenas N` |
-| [`deploy/`](deploy/) | *(deferred)* | Booth skeleton only |
+| [`deploy/`](deploy/) | Demo | `exhibition.py`: the one-command human-exhibition launcher and its separate reset command ([`docs/demo-day.md`](docs/demo-day.md)). Booth skeleton otherwise |
 | [`study/`](study/) | *(deferred)* | Study skeleton only |
 | [`tests/`](tests/) | all | Unit + integration tests (one per component) |
 
@@ -184,7 +217,7 @@ Commands assume the venv (`.venv/bin/python`); plain `python` works if you activ
 | Goal | Command | Notes |
 |------|---------|-------|
 | Offline tests | `.venv/bin/python -m pytest` · `cd bridge && npm test` | Fakes + fixtures; no game needed |
-| Boot Paper | `bash server/setup/setup.sh` then `bash server/setup/start.sh` | `setup` is idempotent and re-copies the datapack into the world; `start.sh` pins Java 21. PowerShell equivalents in [`server/setup/`](server/setup/) |
+| Boot Paper | `bash server/setup/setup.sh` then `bash server/setup/start.sh` | `setup` is idempotent and re-copies the datapack into the world; `start.sh` resolves and pins Java 21. The `.ps1` files in [`server/setup/`](server/setup/) are Windows leftovers, unmaintained since the move to macOS and **not** kept in step with the shell scripts (their Java advice is wrong). macOS is the supported path |
 | Start the bridge | `cd bridge && npm start` | Start Paper **first** — bots connect before the port opens |
 | Damage-channel gate | `.venv/bin/python -m eval.combat_probe --cycles 10` | AC8, the go/no-go: per-hit `6,6,6,2`, cumulative 20, reconciled against the wire's opponent health |
 | M1 slice | `.venv/bin/python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555` | ≥100 eps, zero crashes |
@@ -192,6 +225,8 @@ Commands assume the venv (`.venv/bin/python`); plain `python` works if you activ
 | M2 training (single pad) | `.venv/bin/python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
 | Multi-pad training | `PADS=N bash server/setup/setup.sh`, `bash server/setup/start-pads.sh --pads N` (wait for `FLEET READY`), then `.venv/bin/python -m agent.train --arenas N --port 5555 --max-episodes 10000 --checkpoint runs/m2_multi.pt --run-name m2_multi` | **One** Paper JVM, N enclosed pads 512 blocks apart, bridge port `5555+i`. `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
 | Watch it live | [`docs/spectate.md`](docs/spectate.md) | Join with your own client. Read its "Before you join" first — you spawn in **survival**, inside pad 0 |
+| Human exhibition | `.venv/bin/python -m deploy.exhibition --challenger-username <name>` | One command: Paper + bridge + the agent playing greedily from a checkpoint. Plays **one** match, then waits. Full procedure, the one-challenger protocol and the failure lookup table are in [`docs/demo-day.md`](docs/demo-day.md) |
+| Arm the next challenger | `.venv/bin/python -m deploy.exhibition --reset` | Separate command, second terminal. Heals and repositions both sides and plays exactly one more match. Never automatic |
 
 **Run order for anything live: Paper → bridge → Python driver.** Full ordered
 procedure, pass conditions, and what to watch (reward components, Q divergence) are
@@ -205,6 +240,7 @@ in [`RUNBOOK.md`](RUNBOOK.md).
 |-----------|------|
 | **This README** | First. The mental model + where to start. |
 | [`RUNBOOK.md`](RUNBOOK.md) | Taking the stack live and collecting M1 + M2, plus the scale-ladder table. |
+| [`docs/demo-day.md`](docs/demo-day.md) | Running the classroom exhibition: the one command, the one-challenger protocol, the reset, and what to do when something looks wrong mid-demo. |
 | [`docs/spectate.md`](docs/spectate.md) | Joining the world with your own Minecraft client to check the bots by eye. |
 | [`docs/plans/2026-08-08-damage-channel-fix-and-pad-topology.md`](docs/plans/2026-08-08-damage-channel-fix-and-pad-topology.md) | Why the damage channel was dead, the enclosed-pad topology, and the reward re-ordering. Current branch. |
 | [`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md) | What the pre-repair training archive actually contains, and why no checkpoint in `runs/` is usable. |
@@ -214,5 +250,6 @@ in [`RUNBOOK.md`](RUNBOOK.md).
 | [`server/compat_check.md`](server/compat_check.md) | Authority for version pins, the Java pin, the world's block composition, and the connection throttle — all measured live on macOS. |
 
 After M2 passes, the M3/M4 ladder (scripted bot → self-play / PFSP / Elo) is the
-next horizon. `distributed/` is now built (issue #4); `deploy/` and `study/`
-remain skeleton-only and out of kickoff scope.
+next horizon. `distributed/` is built (issue #4), and `deploy/exhibition.py` is
+the human-exhibition path built for the 2026-08-20 demo. `study/` remains
+skeleton-only and out of kickoff scope.
