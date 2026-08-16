@@ -53,6 +53,13 @@ __all__ = ["TrainConfig"]
 #: overnight retrain, so the set is validated in ``__post_init__``.
 _OPPONENT_CHOICES = frozenset({"dummy", "scripted"})
 
+#: The tiers ``TrainConfig.eval_opponent_preset`` accepts — which scripted
+#: opponent the PERIODIC EVAL fights (never the training mixture, which drifts
+#: as the curriculum gate fires and would make two evals incomparable).
+#: ``"mixed"`` alternates EASY/HARD by episode index, ``"easy"`` / ``"hard"``
+#: pin one tier. Read only when ``opponent == "scripted"``.
+_EVAL_OPPONENT_PRESET_CHOICES = frozenset({"mixed", "easy", "hard"})
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -264,11 +271,38 @@ class TrainConfig:
     #: win (1/1 == 100%).
     opponent_gate_window: int = 50
 
-    #: Optional path to a checkpoint whose weights initialize the run (T13 owns
-    #: the loading itself and the ε restart that keeps a warm start from being
-    #: thrown away). Declared here so the field exists on the config every task
-    #: downstream reads. ``None`` == train from a fresh initialization.
+    #: Optional path to a checkpoint whose weights initialize the run. ``None``
+    #: == train from a fresh initialization. The load happens in
+    #: ``agent.train.Trainer.__init__``: the checkpoint's weights go into BOTH
+    #: the online net and the target net (a target left at a random init would
+    #: bootstrap the warm-started online net toward noise), and the replay
+    #: buffer is deliberately NOT restored — a warm start reuses the policy, not
+    #: the stale off-policy data that produced it.
     warm_start: str | None = None
+
+    #: ε the schedule RESTARTS at when ``warm_start`` is set (read by
+    #: ``agent.train.effective_eps_start``; ``eps_start`` governs a fresh run).
+    #: 0.25 is the plan's pinned 0.2-0.3 band. THIS IS THE FIELD THAT MAKES A
+    #: WARM START WORTH DOING: under the fresh-init ``eps_start=1.0`` the agent
+    #: spends the first ``eps_decay_episodes`` episodes acting mostly at random,
+    #: which throws away the very behavior the checkpoint was loaded for and
+    #: fills the fresh replay with noise. Ignored entirely when ``warm_start``
+    #: is ``None``.
+    warm_start_eps_start: float = 0.25
+
+    #: Which scripted tier the PERIODIC EVAL fights (one of
+    #: :data:`_EVAL_OPPONENT_PRESET_CHOICES`). Read only when ``opponent ==
+    #: "scripted"``; the dummy path has no opponent policy to step.
+    #:
+    #: The eval opponent is deliberately NOT the training curriculum's mixture:
+    #: that mixture SHIFTS when the win-rate gate fires, so two evals either side
+    #: of the gate would score different opponents and the checkpoint selection
+    #: would compare numbers that do not mean the same thing. ``"mixed"`` (the
+    #: default) alternates EASY/HARD by episode index — deterministic, identical
+    #: at every eval, and it can neither saturate at 100% early (the HARD half)
+    #: nor sit pinned at 0 all run (the EASY half), which are the two ways a
+    #: single-tier eval stops discriminating between checkpoints.
+    eval_opponent_preset: str = "mixed"
 
     def __post_init__(self) -> None:
         """Validate the hyperparameters so a misconfigured run fails loudly.
@@ -384,4 +418,26 @@ class TrainConfig:
             raise ValueError(
                 "warm_start must be a non-empty path or None, got "
                 f"{self.warm_start!r}"
+            )
+        # `not 0 <= x <= 1` (not two or-ed comparisons) so NaN is rejected rather
+        # than slipping through as an always-false predicate.
+        if not 0.0 <= self.warm_start_eps_start <= 1.0:
+            raise ValueError(
+                "warm_start_eps_start must be in [0, 1], got "
+                f"{self.warm_start_eps_start!r}"
+            )
+        if self.warm_start_eps_start < self.eps_end:
+            # The schedule decays FROM the start value TO eps_end; a start below
+            # the floor would make ε climb over the run, which is not a schedule
+            # anyone means to configure.
+            raise ValueError(
+                "warm_start_eps_start must be >= eps_end, got "
+                f"warm_start_eps_start={self.warm_start_eps_start}, "
+                f"eps_end={self.eps_end}"
+            )
+        if self.eval_opponent_preset not in _EVAL_OPPONENT_PRESET_CHOICES:
+            raise ValueError(
+                "eval_opponent_preset must be one of "
+                f"{sorted(_EVAL_OPPONENT_PRESET_CHOICES)}, got "
+                f"{self.eval_opponent_preset!r}"
             )
