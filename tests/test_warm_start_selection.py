@@ -330,6 +330,47 @@ def _run_multi_arena(cfg: TrainConfig, pads: List[PadEnv], **kwargs: Any):
     return _completes_within(lambda: train_multi_arena(cfg, **call))
 
 
+def _fake_eval_report(win_rate: float, *, passed_m2: bool = False) -> MagicMock:
+    """A canned ``EvalReport`` with the fields the driver loop formats/reads."""
+    report = MagicMock()
+    report.win_rate = float(win_rate)
+    report.n_episodes = 1
+    report.mean_episode_length = 10.0
+    report.aim_while_invisible = 0.0
+    report.passed_m2 = bool(passed_m2)
+    report.opponent = "scripted_mixed"
+    return report
+
+
+def _canned_evals(
+    monkeypatch,
+    win_rates: List[float],
+    seen: List[float],
+    *,
+    passed_m2: bool = False,
+) -> None:
+    """Stub the eval HANDOFF with a canned win-rate sequence.
+
+    Returns a real ``_EvalOutcome`` — report PLUS the weight snapshot and the
+    grad step the eval was taken at — because that tuple, not a bare report, is
+    what the driver loop selects and saves on.
+    """
+    import agent.train as train_module
+    from distributed.weights import clone_state_dict
+
+    def _stub(**kwargs):
+        rate = win_rates[min(len(seen), len(win_rates) - 1)]
+        seen.append(rate)
+        trainer = kwargs["trainer"]
+        return train_module._EvalOutcome(
+            report=_fake_eval_report(rate, passed_m2=passed_m2),
+            weights=clone_state_dict(trainer.online.state_dict()),
+            grad_step=int(trainer.grad_step),
+        )
+
+    monkeypatch.setattr(train_module, "_eval_via_designated_arena", _stub)
+
+
 def _write_checkpoint(tmp_path, *, payload_key: Optional[str] = "model"):
     """Save a DuelingDRQN checkpoint with DISTINCTIVE (non-default) weights."""
     import torch
@@ -431,6 +472,85 @@ class TestWarmStartWeights:
         missing = str(tmp_path / "nope.pt")
         with pytest.raises(FileNotFoundError, match="nope.pt"):
             Trainer(_multi_cfg(warm_start=missing), net_kwargs=dict(_TINY_NET))
+
+
+class TestWarmWeightsReachTheCollectorsBeforeTheyStart:
+    """The warm weights must be published BEFORE ``pool.start()``, or they miss.
+
+    ``train_multi_arena`` publishes version 0 by hand right before starting the
+    pool. Delete that line (or move it after ``pool.start()``) and the collectors
+    open their first episodes on a RANDOMLY-INITIALIZED net -- the learner's own
+    version-0 publish lands later, because its thread starts after the pool -- so
+    the one run whose whole purpose is not starting from scratch feeds noise into
+    a deliberately fresh replay. Nothing in any log says so.
+    """
+
+    def _run_with_event_log(self, cfg, pads, events):
+        """Drive a run recording (publish, version) and pool-start, in order."""
+        from distributed import actor as actor_module
+        from distributed.weights import WeightStore, clone_state_dict
+
+        class _SpyStore(WeightStore):
+            def publish(self, state_dict, version):
+                # Clone AT RECORD TIME: state_dict holds views into the live net
+                # and the learner mutates them for the rest of the run, so a
+                # deferred comparison against the raw reference would flake.
+                events.append(("publish", int(version), clone_state_dict(state_dict)))
+                super().publish(state_dict, version)
+
+        original_start = actor_module.ActorPool.start
+
+        def _spy_start(pool_self):
+            events.append(("pool_start", -1, None))
+            return original_start(pool_self)
+
+        actor_module.ActorPool.start = _spy_start
+        try:
+            return _run_multi_arena(
+                cfg,
+                pads,
+                weight_store=_SpyStore(),
+                max_grad_steps=3,
+                eval_every_grad_steps=0,
+            )
+        finally:
+            actor_module.ActorPool.start = original_start
+
+    def test_the_warm_weights_are_published_before_the_pool_starts(self, tmp_path):
+        pytest.importorskip("torch")
+        import torch
+
+        path, warm_state = _write_checkpoint(tmp_path)
+        events: List[Tuple[str, int, Any]] = []
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+
+        self._run_with_event_log(_multi_cfg(warm_start=path), pads, events)
+
+        assert events, "nothing was recorded; the run never got going"
+        kind, version, published = events[0]
+        assert (kind, version) == ("publish", 0), (
+            "the collectors were started before any weights were published: "
+            f"first event was {events[0][:2]}. Every arena rolls its opening "
+            "episodes on a randomly-initialized net and the warm start is "
+            "silently thrown away for them."
+        )
+        # ...and they are the WARM weights, not some other net.
+        assert set(published) == set(warm_state)
+        assert all(
+            torch.equal(published[key], warm_state[key].cpu()) for key in warm_state
+        ), "a version-0 snapshot was published, but it was not the warm start"
+
+    def test_a_fresh_run_publishes_nothing_before_the_pool(self):
+        # The hand publish is warm-start-only: a fresh run has nothing to hand
+        # over, and the learner's own publish is the first one.
+        pytest.importorskip("torch")
+
+        events: List[Tuple[str, int, Any]] = []
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+
+        self._run_with_event_log(_multi_cfg(), pads, events)
+
+        assert events[0][0] == "pool_start"
 
 
 class TestWarmStartCheckpointLoader:
@@ -665,21 +785,58 @@ class TestEvaluateStepsAnOpponent:
 class TestEvalOpponentDriver:
     """The eval's opponent must be identical at every eval, or nothing compares."""
 
-    def _sequence(self, driver, n_episodes: int = 4, n_steps: int = 5):
-        macros: List[Tuple[str, int]] = []
-        for _ in range(n_episodes):
+    #: Out of attack range but visible, so ``ScriptedBot.act`` takes the movement
+    #: draw on EVERY step. The in-range fixture ``_view()`` short-circuits to
+    #: ATTACK before touching the RNG at all, which is half of why the reseed
+    #: mutant used to survive: the compared sequences were constants.
+    def _drawing_view(self):
+        return _view(
+            in_attack_range=False,
+            distance=8.0,
+            target_pos=(0.0, 64.0, 8.0),
+            last_known_target_pos=(0.0, 64.0, 8.0),
+        )
+
+    def _episode_sequences(self, driver, step_counts):
+        """Return one macro list PER EPISODE (lengths differ between runs)."""
+        episodes: List[List[Tuple[str, int]]] = []
+        for n_steps in step_counts:
             driver.begin_episode()
-            for _ in range(n_steps):
-                macros.append((driver.preset.value, driver.act(_view())))
-        return macros
+            episodes.append(
+                [
+                    (driver.preset.value, int(driver.act(self._drawing_view())))
+                    for _ in range(n_steps)
+                ]
+            )
+        return episodes
 
     def test_two_evals_face_an_identical_opponent(self):
+        # The per-episode reseed exists for exactly one condition: eval episodes
+        # end on a DEATH whose timing depends on the agent, so two evals of the
+        # same run consume different amounts of opponent RNG per episode. Without
+        # the reseed, episode i's opponent depends on how long episodes 0..i-1
+        # ran, and the win-rate series that SELECTS the shipped checkpoint
+        # compares different fights. Equal-length runs cannot see that at all --
+        # the streams line up either way -- so these two runs are deliberately
+        # ragged.
         from agent.train import build_eval_opponent
 
         factory = build_eval_opponent(_multi_cfg(opponent="scripted"))
         assert factory is not None
 
-        assert self._sequence(factory()) == self._sequence(factory())
+        ragged = self._episode_sequences(factory(), [3, 9, 5, 11])
+        uniform = self._episode_sequences(factory(), [14, 14, 14, 14])
+
+        # Non-constant, or the comparison below would hold for any bot at all.
+        assert len({macro for episode in uniform for _tier, macro in episode}) > 1
+
+        for index, (short, long) in enumerate(zip(ragged, uniform)):
+            assert short == long[: len(short)], (
+                f"eval episode {index} faced a different opponent once the "
+                "earlier episodes had different lengths: the per-episode reseed "
+                "is gone, and the win rate a checkpoint is selected on now "
+                "depends on how long the AGENT survived earlier episodes"
+            )
 
     def test_mixed_alternates_easy_and_hard_by_episode_index(self):
         from agent.train import EvalOpponentDriver
@@ -959,24 +1116,10 @@ class TestSelectionInTheMultiArenaLoop:
     """
 
     def _fake_report(self, win_rate: float):
-        report = MagicMock()
-        report.win_rate = float(win_rate)
-        report.n_episodes = 1
-        report.mean_episode_length = 10.0
-        report.aim_while_invisible = 0.0
-        report.passed_m2 = False
-        report.opponent = "scripted_mixed"
-        return report
+        return _fake_eval_report(win_rate)
 
     def _canned_evals(self, monkeypatch, win_rates: List[float], seen: List[float]):
-        import agent.train as train_module
-
-        def _stub(**kwargs):
-            rate = win_rates[min(len(seen), len(win_rates) - 1)]
-            seen.append(rate)
-            return self._fake_report(rate)
-
-        monkeypatch.setattr(train_module, "_eval_via_designated_arena", _stub)
+        _canned_evals(monkeypatch, win_rates, seen)
 
     def test_the_best_hook_fires_only_on_improvement(self, monkeypatch):
         pytest.importorskip("torch")
@@ -997,7 +1140,7 @@ class TestSelectionInTheMultiArenaLoop:
             max_grad_steps=15,
             checkpoint_every_grad_steps=0,
             checkpoint_hook=lambda _t, step: latest_saves.append(int(step)),
-            best_checkpoint_hook=lambda _t, step, meta: best_saves.append(
+            best_checkpoint_hook=lambda _t, step, meta, _w: best_saves.append(
                 (int(step), dict(meta))
             ),
         )
@@ -1028,7 +1171,9 @@ class TestSelectionInTheMultiArenaLoop:
             eval_every_grad_steps=3,
             eval_episodes=1,
             max_grad_steps=9,
-            best_checkpoint_hook=lambda _t, _s, meta: best_saves.append(dict(meta)),
+            best_checkpoint_hook=lambda _t, _s, meta, _w: best_saves.append(
+                dict(meta)
+            ),
         )
 
         assert best_saves
@@ -1053,7 +1198,7 @@ class TestSelectionInTheMultiArenaLoop:
             eval_episodes=1,
             max_grad_steps=9,
             checkpoint_hook=lambda _t, step: latest_saves.append(int(step)),
-            best_checkpoint_hook=lambda _t, step, _m: best_saves.append(int(step)),
+            best_checkpoint_hook=lambda _t, step, _m, _w: best_saves.append(int(step)),
         )
 
         assert best_saves == [], (
@@ -1062,6 +1207,327 @@ class TestSelectionInTheMultiArenaLoop:
         )
         assert result.best_grad_step == -1
         assert latest_saves, "the final save is what such a run has to fall back on"
+
+
+# ===========================================================================
+# The gate VERDICT and the stop DECISION are two different things.
+# ===========================================================================
+
+
+class TestTheGateVerdictIsIndependentOfStopOnPass:
+    """`passed_m2` must report the gate, not whether the loop chose to stop.
+
+    ``passed`` used to be set only inside ``if report.passed_m2 and
+    stop_on_pass:``. T13 made ``stop_on_pass`` default False under ``--opponent
+    scripted``, which made that branch unreachable, pinned
+    ``MultiArenaResult.passed_m2`` at False forever, and left
+    ``_main_multi_arena`` returning ``0 if passed_m2 else 1`` -- so every
+    successful scripted run trained all night, shipped a good checkpoint, and
+    exited 1.
+    """
+
+    def test_a_passing_run_that_keeps_training_still_reports_passed(
+        self, monkeypatch
+    ):
+        pytest.importorskip("torch")
+
+        seen: List[float] = []
+        _canned_evals(monkeypatch, [1.0], seen, passed_m2=True)
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=12,
+            # The scripted default (T13): clearing the M2 gate is not the
+            # milestone for a moving opponent, so the run keeps going.
+            stop_on_pass=False,
+        )
+
+        assert len(seen) >= 2, (
+            f"only {len(seen)} eval(s) ran; this test has to prove the run kept "
+            "training AFTER a passing eval"
+        )
+        assert result.passed_m2 is True, (
+            "a run that cleared the M2 gate reported passed_m2=False because it "
+            "was configured not to stop -- the CLI turns this into exit code 1"
+        )
+        assert result.stop_reason == "max_grad_steps", (
+            "the loop stopped on the gate despite stop_on_pass=False"
+        )
+
+    def test_stop_on_pass_still_stops_and_still_reports_passed(self, monkeypatch):
+        pytest.importorskip("torch")
+
+        seen: List[float] = []
+        _canned_evals(monkeypatch, [1.0], seen, passed_m2=True)
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=1_000_000,  # only the gate can end this run
+            stop_on_pass=True,
+        )
+
+        assert result.passed_m2 is True
+        assert result.stop_reason == "passed_m2"
+        assert len(seen) == 1, "stop_on_pass=True must break at the FIRST pass"
+
+    def test_a_failing_run_still_reports_not_passed(self, monkeypatch):
+        pytest.importorskip("torch")
+
+        seen: List[float] = []
+        _canned_evals(monkeypatch, [0.4], seen, passed_m2=False)
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=12,
+            stop_on_pass=False,
+        )
+
+        assert seen, "no eval ran; this test proves nothing"
+        assert result.passed_m2 is False
+
+
+# ===========================================================================
+# The startup warnings: a run that cannot save must say so BEFORE it trains.
+# ===========================================================================
+
+
+class TestTheStartupWarningNamesTheMissingFlag:
+    """`--best-checkpoint` alone silently restored the save-nothing blocker.
+
+    The warning was guarded on BOTH hooks being None, but only
+    ``checkpoint_hook`` drives ``_save_latest`` -- which is the periodic AND the
+    final save. So ``--best-checkpoint`` on its own suppressed the warning,
+    disabled the periodic save, made the final save a no-op, and left the run's
+    only write behind a strictly-improving eval win rate above zero.
+    """
+
+    def _warnings_for(self, **hooks) -> List[str]:
+        lines: List[str] = []
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        _run_multi_arena(
+            _multi_cfg(),
+            pads,
+            max_grad_steps=3,
+            eval_every_grad_steps=0,
+            log=lines.append,
+            **hooks,
+        )
+        return [line for line in lines if "WARNING" in line]
+
+    def test_best_checkpoint_without_checkpoint_warns_and_names_checkpoint(self):
+        pytest.importorskip("torch")
+
+        warnings = self._warnings_for(
+            checkpoint_hook=None,
+            best_checkpoint_hook=lambda _t, _s, _m, _w: None,
+        )
+
+        assert any(
+            "--best-checkpoint was given WITHOUT --checkpoint" in w for w in warnings
+        ), (
+            "a run with --best-checkpoint and no --checkpoint started silently: "
+            f"warnings were {warnings}. It saves nothing unless some eval "
+            "strictly improves the win rate above zero."
+        )
+        # The operator has to be told what to DO, not just that something is off.
+        assert any("--checkpoint" in w for w in warnings)
+
+    def test_no_hooks_at_all_still_warns(self):
+        pytest.importorskip("torch")
+
+        warnings = self._warnings_for(checkpoint_hook=None, best_checkpoint_hook=None)
+
+        assert any("save NOTHING" in w for w in warnings)
+
+    def test_a_properly_configured_run_warns_about_neither(self):
+        pytest.importorskip("torch")
+
+        warnings = self._warnings_for(
+            checkpoint_hook=lambda _t, _s: None,
+            best_checkpoint_hook=lambda _t, _s, _m, _w: None,
+        )
+
+        assert not [w for w in warnings if "checkpoint" in w], (
+            f"a fully configured run cried wolf: {warnings}"
+        )
+
+
+# ===========================================================================
+# The "best" checkpoint must hold the network that earned the win rate.
+# ===========================================================================
+
+
+class TestTheBestCheckpointHoldsTheEvaluatedNet:
+    """The save-best path must serialize a SNAPSHOT, never the live net.
+
+    ``DRQNGreedyPolicy`` holds ``trainer.online`` by reference and
+    ``_eval_via_designated_arena`` pauses only the designated collector -- the
+    learner thread keeps stepping the optimizer on the other N-1 arenas for the
+    whole eval AND the whole save. Reading ``trainer.online.state_dict()`` inside
+    the hook therefore ships a net that is thousands of gradient steps past the
+    one the win rate describes (and reads live tensors mid-``optimizer.step()``).
+    """
+
+    def test_the_outcome_weights_do_not_track_the_live_net(self):
+        pytest.importorskip("torch")
+        import torch
+
+        from agent.train import Trainer, _eval_against_opponent
+
+        trainer = Trainer(_multi_cfg(), net_kwargs=dict(_TINY_NET))
+        outcome = _eval_against_opponent(
+            trainer=trainer,
+            evaluate=lambda *_a, **_k: _fake_eval_report(0.5),
+            policy_cls=lambda _net, device=None: ScriptedGreedyPolicy(),
+            shared_transport=GenerativeBridge(),
+            n_episodes=1,
+            timeout_cap=64,
+            env_max_episode_steps=64,
+            eval_step_cap=4,
+            logger=None,
+            is_live=False,
+            base_seed=0,
+            log=None,
+        )
+        taken = {key: value.clone() for key, value in outcome.weights.items()}
+
+        # What the learner thread does for the rest of the eval and the save.
+        with torch.no_grad():
+            for param in trainer.online.parameters():
+                param.add_(1.0)
+
+        assert all(
+            torch.equal(outcome.weights[key], taken[key]) for key in taken
+        ), (
+            "the eval outcome carries VIEWS into the live net, so the 'best' "
+            "checkpoint is whatever the learner produced by save time"
+        )
+        live = trainer.online.state_dict()
+        assert any(
+            not torch.equal(outcome.weights[key], live[key].cpu())
+            for key in outcome.weights
+        ), "the live net did not move; this test cannot detect aliasing"
+        assert outcome.grad_step == int(trainer.grad_step)
+
+    def test_the_driver_hands_the_hook_the_evaluated_snapshot(self, monkeypatch):
+        pytest.importorskip("torch")
+        import torch
+
+        import agent.train as train_module
+
+        sentinel = {"marker": torch.full((2,), 3.0)}
+
+        def _stub(**_kwargs):
+            return train_module._EvalOutcome(
+                report=_fake_eval_report(0.5),
+                weights=sentinel,
+                grad_step=4_242,
+            )
+
+        monkeypatch.setattr(train_module, "_eval_via_designated_arena", _stub)
+
+        got: List[Tuple[int, Any]] = []
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=9,
+            best_checkpoint_hook=lambda _t, step, _m, weights: got.append(
+                (int(step), weights)
+            ),
+        )
+
+        assert got, "the best hook never fired; this test proves nothing"
+        step, weights = got[0]
+        assert weights is sentinel, (
+            "the save-best hook was handed the LIVE net instead of the weights "
+            "the eval scored"
+        )
+        assert step == 4_242, (
+            "the checkpoint was stamped with the grad step at SAVE time, not the "
+            "one the evaluated weights were taken at"
+        )
+        assert result.best_grad_step == 4_242
+
+    def test_the_written_best_file_holds_those_weights(self, monkeypatch, tmp_path):
+        """End to end through ``main()``: the closure must write ``weights``."""
+        pytest.importorskip("torch")
+        import torch
+
+        import eval.logging as logging_module
+
+        import agent.train as train_module
+
+        class _NullLogger:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def log(self, *_a, **_k) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(logging_module, "MetricsLogger", _NullLogger)
+
+        captured: Dict[str, Any] = {}
+
+        def _stub_main_multi(_args, _cfg, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(train_module, "_main_multi_arena", _stub_main_multi)
+
+        best_path = tmp_path / "best.pt"
+        assert (
+            train_module.main(
+                [
+                    "--arenas", "2",
+                    "--opponent", "scripted",
+                    "--checkpoint", str(tmp_path / "latest.pt"),
+                    "--best-checkpoint", str(best_path),
+                ]
+            )
+            == 0
+        )
+        hook = captured.get("best_checkpoint_hook")
+        assert hook is not None, "the CLI wired no save-best hook"
+
+        evaluated = {"marker": torch.full((2,), 7.0)}
+        # What the learner thread has produced by the time the hook runs.
+        live = {"marker": torch.full((2,), -1.0)}
+
+        class _StubNet:
+            def state_dict(self):
+                return live
+
+        class _StubTrainer:
+            online = _StubNet()
+
+        meta = {"win_rate": 0.5, "eval_opponent": "scripted_mixed"}
+        hook(_StubTrainer(), 11, meta, evaluated)
+
+        payload = torch.load(best_path, weights_only=False)
+        assert torch.equal(payload["model"]["marker"], evaluated["marker"]), (
+            "the best checkpoint on disk holds the live net, not the weights the "
+            "win rate it is stamped with was measured on"
+        )
+        assert payload["grad_step"] == 11
+        assert payload["win_rate"] == pytest.approx(0.5)
 
 
 # ===========================================================================

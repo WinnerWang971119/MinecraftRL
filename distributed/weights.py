@@ -38,13 +38,48 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-__all__ = ["WeightStore", "SnapshotPolicy"]
+__all__ = ["WeightStore", "SnapshotPolicy", "clone_state_dict"]
 
 
 # A torch ``state_dict``: parameter/buffer name -> tensor.
 StateDict = Dict[str, torch.Tensor]
 # A zero-arg callable returning a fresh net, e.g. ``lambda: DuelingDRQN(**kwargs)``.
 NetFactory = Callable[[], nn.Module]
+
+
+def clone_state_dict(state_dict: StateDict) -> StateDict:
+    """Return a detached CPU copy of ``state_dict``, decoupled from the live net.
+
+    ``net.state_dict()`` hands back tensor VIEWS into the net's parameters and
+    buffers, so anything that outlives the call - a published snapshot, a
+    checkpoint written on another thread - must copy the storage or it silently
+    tracks the learner's next ``optimizer.step()``.
+
+    Shared by :meth:`WeightStore.publish` (the collector handoff) and
+    ``agent.train``'s save-best path (the checkpoint whose weights must be the
+    ones an eval actually scored). One implementation, so the two can never
+    drift into different notions of "a snapshot".
+
+    Args:
+        state_dict: A live ``net.state_dict()`` (or any name -> tensor mapping).
+
+    Returns:
+        A new dict whose tensor values are ``.detach().clone().cpu()`` copies.
+        Non-tensor entries (none in this net today, but ``state_dict`` may carry
+        them) are passed through by reference.
+    """
+    cloned: StateDict = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            # detach() drops autograd history; clone() copies storage so the
+            # snapshot does not alias the live parameter; .cpu() pins it on CPU
+            # (a no-op when already CPU). Order: detach before clone so the
+            # clone carries no grad graph.
+            cloned[key] = value.detach().clone().cpu()
+        else:
+            # Pass non-tensor state through unchanged (rare; future-proofing).
+            cloned[key] = value
+    return cloned
 
 
 class WeightStore:
@@ -98,17 +133,7 @@ class WeightStore:
         # Clone OUTSIDE the lock: cloning is the expensive part and touches only
         # the caller's tensors, so we do not hold the lock across it. Only the
         # pointer swap below is critical-section work.
-        cloned: StateDict = {}
-        for key, value in state_dict.items():
-            if torch.is_tensor(value):
-                # detach() drops autograd history; clone() copies storage so the
-                # snapshot does not alias the live parameter; .cpu() pins it on CPU
-                # (a no-op when already CPU). Order: detach before clone so the
-                # clone carries no grad graph.
-                cloned[key] = value.detach().clone().cpu()
-            else:
-                # Pass non-tensor state through unchanged (rare; future-proofing).
-                cloned[key] = value
+        cloned = clone_state_dict(state_dict)
 
         with self._lock:
             self._state_dict = cloned
