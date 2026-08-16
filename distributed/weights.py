@@ -56,9 +56,26 @@ def clone_state_dict(state_dict: StateDict) -> StateDict:
     tracks the learner's next ``optimizer.step()``.
 
     Shared by :meth:`WeightStore.publish` (the collector handoff) and
-    ``agent.train``'s save-best path (the checkpoint whose weights must be the
-    ones an eval actually scored). One implementation, so the two can never
-    drift into different notions of "a snapshot".
+    ``agent.train``'s save-best path (the checkpoint that must not hold whatever
+    the learner had reached by save time). One implementation, so the two can
+    never drift into different notions of "a snapshot".
+
+    NOT an atomic read of the net. The loop below walks the ~12 tensors with the
+    learner thread UNPAUSED, and torch releases the GIL inside a large
+    ``clone()``, so the optimizer can step between two keys — or partway through
+    copying one — and the returned dict can mix parameters from ADJACENT gradient
+    steps. Only pausing the learner would prevent that, and no caller does.
+
+    What it does guarantee is what both callers actually need:
+
+      * **Decoupled.** The copy owns its storage, so it never silently tracks a
+        later ``optimizer.step()`` (that is the defect this function exists for).
+      * **Structurally valid.** Every key is present at its right shape and
+        dtype, so the dict always ``load_state_dict``s and a checkpoint written
+        from it always loads.
+      * **Bounded drift.** At worst ~one optimizer step of skew — versus the
+        multi-thousand-step gap between an eval and the save that records it,
+        which is the gap the save-best path uses this to close.
 
     Args:
         state_dict: A live ``net.state_dict()`` (or any name -> tensor mapping).

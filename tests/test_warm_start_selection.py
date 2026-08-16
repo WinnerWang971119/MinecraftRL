@@ -1210,6 +1210,318 @@ class TestSelectionInTheMultiArenaLoop:
 
 
 # ===========================================================================
+# A checkpoint that was SELECTED is not a checkpoint that EXISTS.
+#
+# The best-save hook's failures are swallowed (a full disk at 4am must not end a
+# 12-hour run), but the selector's high-water mark used to advance regardless.
+# The result then reported the peak, and the end-of-run "which file to ship"
+# line printed `best checkpoint: win_rate=0.87 ... at grad_step 15000` for a file
+# nothing had written — with one FAILED line buried in a 12-hour log as the only
+# counter-evidence. Freeze day reads that line, not file mtimes.
+# ===========================================================================
+
+
+class TestTheResultReportsWhatReachedTheDisk:
+    """`best_win_rate` / `best_grad_step` must describe the FILE, not the pick."""
+
+    def test_a_run_whose_every_best_save_failed_reports_no_checkpoint(
+        self, monkeypatch
+    ):
+        pytest.importorskip("torch")
+
+        lines: List[str] = []
+        attempts: List[int] = []
+        _canned_evals(monkeypatch, [0.6], [])
+
+        def _always_fails(_t, step, _meta, _weights):
+            attempts.append(int(step))
+            raise OSError(28, "No space left on device")
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=9,
+            log=lines.append,
+            best_checkpoint_hook=_always_fails,
+        )
+
+        assert attempts, "the best hook never fired; this test proves nothing"
+        assert result.best_grad_step == -1 and result.best_win_rate == -1.0, (
+            "the result advertises a best checkpoint at "
+            f"win_rate={result.best_win_rate} / grad_step={result.best_grad_step}, "
+            "but every save of it raised - nothing was ever written"
+        )
+        # The DECISION is still reported, so "the disk failed" stays
+        # distinguishable from "the agent never won a single eval episode".
+        assert result.best_selected_grad_step == attempts[-1]
+        assert result.best_selected_win_rate == pytest.approx(0.6)
+        assert result.best_save_failures == len(attempts)
+        assert any("BEST checkpoint save FAILED" in line for line in lines)
+
+    def test_a_later_failed_save_leaves_the_earlier_file_reported(self, monkeypatch):
+        """0.25 saves, 0.75 fails: the run must ship the 0.25 file it HAS."""
+        pytest.importorskip("torch")
+
+        saved: List[Tuple[int, float]] = []
+        _canned_evals(monkeypatch, [0.25, 0.75], [])
+
+        def _fails_above_half(_t, step, meta, _weights):
+            if float(meta["win_rate"]) > 0.5:
+                raise RuntimeError("serialization fault")
+            saved.append((int(step), float(meta["win_rate"])))
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=15,
+            best_checkpoint_hook=_fails_above_half,
+        )
+
+        assert saved == [(saved[0][0], pytest.approx(0.25))], (
+            f"expected exactly the 0.25 save to succeed, got {saved}"
+        )
+        assert result.best_win_rate == pytest.approx(0.25)
+        assert result.best_grad_step == saved[0][0]
+        assert result.best_selected_win_rate == pytest.approx(0.75)
+        assert result.best_save_failures == 1
+
+
+class TestTheEndOfRunSummaryNeverNamesAMissingFile:
+    """The last line of the run decides what gets shipped. It must be true.
+
+    ``_main_multi_arena``'s summary is driven entirely by the
+    :class:`MultiArenaResult`, so most of these drive it with crafted results:
+    what they pin is the FORMATTING decision per outcome. The first test instead
+    wires the REAL loop to the REAL summary, because the bug needed both halves —
+    a swallowed save failure AND a result that reported the selection anyway.
+    """
+
+    def _summary(
+        self, monkeypatch, capsys, result: Any = None, **result_fields: Any
+    ) -> str:
+        """Run ``_main_multi_arena`` over a canned result; return what it logged."""
+        import distributed.launcher as launcher_module
+
+        import agent.train as train_module
+
+        monkeypatch.setattr(
+            launcher_module, "SubprocessArenaLauncher", lambda **_k: MagicMock()
+        )
+
+        if result is None:
+            fields: Dict[str, Any] = dict(
+                trainer=MagicMock(),
+                passed_m2=False,
+                grad_steps=9,
+                episodes_received=4,
+                reports=[_fake_eval_report(0.6)],
+                eval_opponent="scripted_mixed",
+            )
+            fields.update(result_fields)
+            result = train_module.MultiArenaResult(**fields)
+        monkeypatch.setattr(
+            train_module, "train_multi_arena", lambda *_a, **_k: result
+        )
+
+        import argparse
+
+        args = argparse.Namespace(
+            port=5555,
+            host="127.0.0.1",
+            mc_port=25565,
+            max_episodes=1,
+            max_grad_steps=9,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+        )
+        train_module._main_multi_arena(
+            args,
+            _multi_cfg(opponent="scripted", arenas=2),
+            logger=None,
+            checkpoint_hook=None,
+        )
+        # `_log` writes to stderr (it is the operator-facing run log).
+        return capsys.readouterr().err
+
+    def test_a_run_whose_saves_all_failed_ends_by_saying_so(
+        self, monkeypatch, capsys
+    ):
+        """End to end: the loop's own result, formatted by the real summary.
+
+        This is the reported failure in one piece — with every best save raising,
+        the run finished announcing ``best_win_rate=0.6`` at ``grad_step 3`` and
+        ZERO files on disk.
+        """
+        pytest.importorskip("torch")
+
+        run_lines: List[str] = []
+        _canned_evals(monkeypatch, [0.6], [])
+
+        def _always_fails(_t, _step, _meta, _weights):
+            raise OSError(28, "No space left on device")
+
+        pads = [PadEnv(GenerativeBridge(), k=4) for _ in range(2)]
+        result = _run_multi_arena(
+            _multi_cfg(opponent="scripted"),
+            pads,
+            eval_every_grad_steps=3,
+            eval_episodes=1,
+            max_grad_steps=9,
+            log=run_lines.append,
+            best_checkpoint_hook=_always_fails,
+        )
+
+        assert result.best_selected_grad_step >= 0, (
+            "no eval was ever selected; this test would pass vacuously"
+        )
+        assert any("BEST checkpoint save FAILED" in line for line in run_lines)
+
+        blob = self._summary(monkeypatch, capsys, result=result)
+
+        assert "best checkpoint: win_rate=" not in blob, (
+            "the end-of-run line named a checkpoint to ship, but every save of "
+            "it raised and nothing was written:\n" + blob
+        )
+        assert "NONE WRITTEN" in blob and "FAILED" in blob, blob
+        assert "do not ship from this line" in blob, blob
+
+    def test_it_says_nothing_was_written_when_every_save_failed(
+        self, monkeypatch, capsys
+    ):
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=-1.0,
+            best_grad_step=-1,
+            best_selected_win_rate=0.87,
+            best_selected_grad_step=15_000,
+            best_save_failures=3,
+        )
+
+        assert "best checkpoint: win_rate=" not in blob, (
+            "the run named a checkpoint to ship after every save of it failed:\n"
+            + blob
+        )
+        assert "NONE WRITTEN" in blob and "all 3 save(s) FAILED" in blob, blob
+        # The selected peak is still stated, so the reader knows WHAT was lost -
+        # and that grepping for the FAILED lines is the next move.
+        assert "win_rate=0.870" in blob and "grad_step 15000" in blob, blob
+        assert "do not ship from this line" in blob, blob
+
+    def test_a_written_checkpoint_is_still_reported_normally(
+        self, monkeypatch, capsys
+    ):
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=0.87,
+            best_grad_step=15_000,
+            best_selected_win_rate=0.87,
+            best_selected_grad_step=15_000,
+        )
+
+        assert (
+            "best checkpoint: win_rate=0.870 vs scripted_mixed at grad_step 15000"
+            in blob
+        ), blob
+        assert "NONE WRITTEN" not in blob and "WARNING" not in blob, blob
+
+    def test_a_partially_saved_run_ships_the_file_and_flags_the_gap(
+        self, monkeypatch, capsys
+    ):
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=0.25,
+            best_grad_step=100,
+            best_selected_win_rate=0.75,
+            best_selected_grad_step=200,
+            best_save_failures=1,
+        )
+
+        assert (
+            "best checkpoint: win_rate=0.250 vs scripted_mixed at grad_step 100"
+            in blob
+        ), blob
+        assert "1 best-checkpoint save(s) FAILED" in blob, blob
+        assert "is NOT on disk" in blob, blob
+
+    def test_a_failure_before_a_good_save_is_not_called_missing(
+        self, monkeypatch, capsys
+    ):
+        """Fail at 0.25, succeed at 0.75: the peak IS on disk. Do not say it isn't.
+
+        The WARNING has to key on persisted-vs-selected DIVERGENCE, not on the
+        failure count — a summary that claims the best net is missing when it is
+        sitting right there is the same false-summary defect, inverted.
+        """
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=0.75,
+            best_grad_step=200,
+            best_selected_win_rate=0.75,
+            best_selected_grad_step=200,
+            best_save_failures=1,
+        )
+
+        assert (
+            "best checkpoint: win_rate=0.750 vs scripted_mixed at grad_step 200"
+            in blob
+        ), blob
+        assert "is NOT on disk" not in blob, (
+            "the run called its shipped checkpoint missing:\n" + blob
+        )
+
+    def test_a_run_with_no_checkpoint_path_says_so(self, monkeypatch, capsys):
+        """Selected, never attempted: not the same as "the agent never won"."""
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=-1.0,
+            best_grad_step=-1,
+            best_selected_win_rate=0.6,
+            best_selected_grad_step=6,
+            best_save_failures=0,
+        )
+
+        assert "best checkpoint: win_rate=" not in blob, blob
+        assert "no checkpoint path was configured" in blob, blob
+        assert "FAILED" not in blob, "no save was attempted, so none failed:\n" + blob
+
+    def test_a_run_that_never_won_keeps_its_own_message(self, monkeypatch, capsys):
+        pytest.importorskip("torch")
+
+        blob = self._summary(
+            monkeypatch,
+            capsys,
+            best_win_rate=-1.0,
+            best_grad_step=-1,
+            best_selected_win_rate=0.0,
+            best_selected_grad_step=-1,
+        )
+
+        assert "won a single" in blob, blob
+        assert "NONE WRITTEN" not in blob, blob
+
+
+# ===========================================================================
 # The gate VERDICT and the stop DECISION are two different things.
 # ===========================================================================
 
@@ -1677,6 +1989,196 @@ class TestBestCheckpointPath:
         from agent.train import _best_checkpoint_path
 
         assert _best_checkpoint_path("runs/m3", None) == "runs/m3.best.pt"
+
+
+class TestCheckpointWritesAreAtomic:
+    """A save interrupted mid-write must not destroy the file it is replacing.
+
+    ``torch.save(payload, path)`` opens the DESTINATION and streams into it, so a
+    crash, an OOM kill, a Ctrl-C, or a full disk partway through leaves a
+    truncated file where the previous good generation used to be — and neither
+    hook keeps a prior generation. ``runs/m3.best.pt`` is the single file the demo
+    loads, and it is rewritten every time a better eval lands, so that window is
+    open on every save of the deliverable.
+
+    Fault injection is a ``torch.save`` that writes some bytes and then raises,
+    which is what a full disk does. It handles both a file object (the atomic
+    path) and a bare path (what the unfixed code passes), so the same test
+    exercises whichever the call site uses.
+    """
+
+    def _hooks(self, monkeypatch, tmp_path):
+        """Pull the REAL save closures out of ``main()`` (call sites, not helpers)."""
+        import eval.logging as logging_module
+
+        import agent.train as train_module
+
+        class _NullLogger:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def log(self, *_a, **_k) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(logging_module, "MetricsLogger", _NullLogger)
+
+        captured: Dict[str, Any] = {}
+
+        def _stub_main_multi(_args, _cfg, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(train_module, "_main_multi_arena", _stub_main_multi)
+
+        latest_path = tmp_path / "latest.pt"
+        best_path = tmp_path / "best.pt"
+        assert (
+            train_module.main(
+                [
+                    "--arenas", "2",
+                    "--opponent", "scripted",
+                    "--checkpoint", str(latest_path),
+                    "--best-checkpoint", str(best_path),
+                ]
+            )
+            == 0
+        )
+        return captured, latest_path, best_path
+
+    @staticmethod
+    def _fault_injected_save():
+        """A ``torch.save`` that half-writes its destination, then fails."""
+
+        def _partial_then_raise(payload, destination, *_a, **_k):
+            chunk = b"TRUNCATED-CHECKPOINT"
+            if hasattr(destination, "write"):
+                destination.write(chunk)
+            else:
+                with open(destination, "wb") as handle:
+                    handle.write(chunk)
+            raise OSError(28, "No space left on device")
+
+        return _partial_then_raise
+
+    @staticmethod
+    def _stub_trainer(value: float):
+        import torch
+
+        class _StubNet:
+            def state_dict(self):
+                return {"marker": torch.full((2,), value)}
+
+        class _StubTrainer:
+            online = _StubNet()
+
+        return _StubTrainer()
+
+    def _leftovers(self, tmp_path, *keep):
+        """Every file in ``tmp_path`` that is not one of the two checkpoints."""
+        kept = {p.name for p in keep}
+        return sorted(p.name for p in tmp_path.iterdir() if p.name not in kept)
+
+    def test_a_failed_best_save_leaves_the_previous_file_loadable(
+        self, monkeypatch, tmp_path
+    ):
+        pytest.importorskip("torch")
+        import torch
+
+        captured, _latest, best_path = self._hooks(monkeypatch, tmp_path)
+        hook = captured["best_checkpoint_hook"]
+
+        good = {"marker": torch.full((2,), 7.0)}
+        hook(self._stub_trainer(-1.0), 11, {"win_rate": 0.5}, good)
+        assert best_path.exists(), "the first (clean) save did not write the file"
+
+        monkeypatch.setattr(torch, "save", self._fault_injected_save())
+        with pytest.raises(OSError):
+            hook(
+                self._stub_trainer(-1.0),
+                22,
+                {"win_rate": 0.9},
+                {"marker": torch.full((2,), 9.0)},
+            )
+
+        payload = torch.load(best_path, weights_only=False)
+        assert payload["grad_step"] == 11 and torch.equal(
+            payload["model"]["marker"], good["marker"]
+        ), (
+            "the interrupted save truncated the deliverable in place; the "
+            "previous good checkpoint is gone and there is no generation behind it"
+        )
+
+    def test_a_failed_best_save_leaves_no_temp_file_behind(
+        self, monkeypatch, tmp_path
+    ):
+        pytest.importorskip("torch")
+        import torch
+
+        captured, _latest, best_path = self._hooks(monkeypatch, tmp_path)
+        hook = captured["best_checkpoint_hook"]
+
+        hook(self._stub_trainer(-1.0), 11, {"win_rate": 0.5}, {"m": torch.zeros(1)})
+
+        monkeypatch.setattr(torch, "save", self._fault_injected_save())
+        for step in (22, 33):
+            with pytest.raises(OSError):
+                hook(
+                    self._stub_trainer(-1.0),
+                    step,
+                    {"win_rate": 0.9},
+                    {"m": torch.ones(1)},
+                )
+
+        assert self._leftovers(tmp_path, best_path) == [], (
+            "a failed save left scratch files next to the deliverable; a later "
+            "run has to be able to trust everything it finds in the run directory"
+        )
+
+    def test_a_failed_periodic_save_leaves_the_previous_file_loadable(
+        self, monkeypatch, tmp_path
+    ):
+        """The latest checkpoint is the fallback when no best was ever selected."""
+        pytest.importorskip("torch")
+        import torch
+
+        captured, latest_path, _best = self._hooks(monkeypatch, tmp_path)
+        hook = captured["checkpoint_hook"]
+
+        hook(self._stub_trainer(7.0), 100)
+        assert latest_path.exists()
+
+        monkeypatch.setattr(torch, "save", self._fault_injected_save())
+        with pytest.raises(OSError):
+            hook(self._stub_trainer(9.0), 200)
+
+        payload = torch.load(latest_path, weights_only=False)
+        assert payload["grad_step"] == 100
+        assert torch.equal(payload["model"]["marker"], torch.full((2,), 7.0))
+        assert self._leftovers(tmp_path, latest_path) == []
+
+    def test_a_clean_save_leaves_exactly_the_checkpoint(self, monkeypatch, tmp_path):
+        pytest.importorskip("torch")
+        import torch
+
+        captured, _latest, best_path = self._hooks(monkeypatch, tmp_path)
+        hook = captured["best_checkpoint_hook"]
+
+        for step in (11, 22, 33):
+            hook(
+                self._stub_trainer(-1.0),
+                step,
+                {"win_rate": 0.5, "eval_opponent": "scripted_mixed"},
+                {"marker": torch.full((2,), float(step))},
+            )
+
+        assert self._leftovers(tmp_path, best_path) == []
+        payload = torch.load(best_path, weights_only=False)
+        assert payload["grad_step"] == 33
+        assert torch.equal(payload["model"]["marker"], torch.full((2,), 33.0))
+        assert payload["eval_opponent"] == "scripted_mixed"
 
 
 # ===========================================================================
