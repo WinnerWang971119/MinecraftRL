@@ -34,6 +34,13 @@ provable with no socket and no live server:
     (the pure-greedy, no-RNG path) and carries the LSTM hidden state across the
     episode. Tests inject a tiny scripted policy with no torch dependency.
 
+  * ``opponent`` (optional) is any :class:`EvalOpponent` — ``begin_episode()`` per
+    episode then ``act(view) -> int`` per step. ``None`` (the default) is the
+    stage-0 stationary dummy, served entirely by the bridge, and keeps the wire
+    line byte-identical to the M2 path. Supplying one makes the eval fight the
+    SAME moving opponent training fights, which is what a scripted-opponent run's
+    win rate has to mean before a checkpoint can be selected on it.
+
 The eval module imports ``torch`` LAZILY (only inside :class:`DRQNGreedyPolicy`
 and the CLI), so importing ``eval.evaluate`` — and running its offline tests —
 never requires torch.
@@ -70,7 +77,9 @@ from eval.logging import MetricsLogger
 __all__ = [
     "REWARD_COMPONENT_KEYS",
     "M2_WIN_RATE_THRESHOLD",
+    "DUMMY_OPPONENT_NAME",
     "GreedyPolicy",
+    "EvalOpponent",
     "DRQNGreedyPolicy",
     "EpisodeOutcome",
     "EvalReport",
@@ -83,6 +92,10 @@ __all__ = [
 # The M2 gate threshold (AC6): >= 95% win rate over 100 eval episodes.
 # ---------------------------------------------------------------------------
 M2_WIN_RATE_THRESHOLD: float = 0.95
+
+#: What :attr:`EvalReport.opponent` says when no opponent policy was stepped —
+#: i.e. the bridge-served stationary dummy, the M1/M2 stage-0 opponent.
+DUMMY_OPPONENT_NAME: str = "dummy"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +122,35 @@ class GreedyPolicy(Protocol):
 
     def act(self, obs: np.ndarray) -> int:
         """Return the greedy action index in ``[0, N_ACTIONS)`` for ``obs``."""
+        ...
+
+
+class EvalOpponent(Protocol):
+    """Structural protocol for an opponent policy the EVAL steps in Python.
+
+    Mirrors ``agent.train.EpisodeOpponent`` minus ``observe_outcome``: an eval
+    scores the AGENT, so nothing is fed back into a curriculum from here.
+
+    Passing one of these to :func:`evaluate` is what makes the eval score the
+    same MOVING opponent training fights. Without it the eval sends no
+    ``opp_action`` and the opponent stands still for the whole episode — which
+    is not "the dummy path" when the run's opponent is a scripted bot, it is a
+    silently different, far easier opponent, and any checkpoint selected on that
+    win rate was selected against the wrong thing.
+    """
+
+    def begin_episode(self) -> None:
+        """Called once per episode, AFTER ``env.reset`` and before the first step."""
+        ...
+
+    def act(self, view: Any) -> int:
+        """Return the opponent's macro (``0..N_ACTIONS-1``) for this window.
+
+        ``view`` is whatever ``env.raw_opponent_view()`` returned, passed
+        through UNTOUCHED (its ``attack_cooldown`` is clamped to exactly 1.0 by
+        its producer and compared against a deliberately tight
+        ``>= 1.0 - 1e-6``; perturbing it makes a scripted bot never attack).
+        """
         ...
 
 
@@ -212,6 +254,12 @@ class EvalReport:
         is_live: ``True`` for a real-bridge run, ``False`` for the offline
             fake-bridge proof (so the artifact is never mistaken for the live AC6
             number).
+        opponent: WHO was fought — :data:`DUMMY_OPPONENT_NAME` when no opponent
+            policy was stepped, else the name of the stepped opponent (e.g.
+            ``"scripted_mixed"``). Recorded because ``win_rate`` is meaningless
+            without it: the same net scores very differently against a stationary
+            target and a moving one, and a checkpoint selected on the wrong one is
+            selected on nothing.
         episodes: Per-episode outcomes, in order.
         notes: Free-form human-readable notes (incl. the AC6/TC13 follow-up).
     """
@@ -230,6 +278,7 @@ class EvalReport:
     aim_while_invisible: float = 0.0
     passed_m2: bool = False
     is_live: bool = False
+    opponent: str = DUMMY_OPPONENT_NAME
     episodes: List[EpisodeOutcome] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -250,6 +299,7 @@ class EvalReport:
             "aim_while_invisible": self.aim_while_invisible,
             "passed_m2": self.passed_m2,
             "is_live": self.is_live,
+            "opponent": self.opponent,
             "notes": list(self.notes),
         }
 
@@ -298,15 +348,26 @@ def evaluate(
     is_live: bool = False,
     max_episode_steps: Optional[int] = None,
     log: Optional[Any] = None,
+    opponent: Optional[EvalOpponent] = None,
+    opponent_name: Optional[str] = None,
 ) -> EvalReport:
     """Run the GREEDY policy for ``n_episodes`` vs the stage opponent (M2 gate).
 
     Each episode: ``policy.reset()`` -> ``env.reset(seed)`` -> loop
     ``policy.act`` / ``env.step`` until ``done``. The policy runs greedy (ε=0)
     throughout — :class:`DRQNGreedyPolicy` drives ``DuelingDRQN.act`` with
-    ``epsilon=0.0``, the deterministic no-RNG path. The opponent is the stage
-    opponent (the stationary dummy at stage 0): the env/bridge drive it, so this
-    loop never steps an opponent policy itself.
+    ``epsilon=0.0``, the deterministic no-RNG path.
+
+    WHO THE AGENT FIGHTS IS AN ARGUMENT, NOT AN ASSUMPTION. With ``opponent ==
+    None`` (the default) the opponent is the stage-0 stationary dummy: the
+    env/bridge drive it, this loop steps no opponent policy, and the wire line is
+    the byte-identical M2 one. Pass an :class:`EvalOpponent` and each decision
+    additionally reads ``env.raw_opponent_view()``, asks that policy for a macro,
+    and sends BOTH in one ``env.step(action, opp_action=...)`` — which is the
+    only way a run whose training opponent MOVES gets a win rate that means
+    anything. Scoring a scripted-opponent run against a stationary target reports
+    a number the agent did not earn, and selecting a checkpoint on it selects
+    against the wrong opponent.
 
     Per episode the per-reward-component breakdown carried in each ``step``
     ``info`` (keys :data:`REWARD_COMPONENT_KEYS`) is accumulated, the aim-bonus
@@ -336,6 +397,14 @@ def evaluate(
             a fake env that never terminates. ``None`` relies on the env's own
             ``done``. (The real env enforces its own ``max_episode_steps``.)
         log: Optional ``str -> None`` progress sink (``None`` silences it).
+        opponent: Optional :class:`EvalOpponent` stepped once per decision (see
+            above). ``None`` == the stationary-dummy path, unchanged. When given,
+            ``env`` must also expose ``raw_opponent_view()`` and accept
+            ``opp_action`` (the real :class:`~env.mc_pvp_env.MCPvPEnv` does).
+        opponent_name: Name recorded on the report's ``opponent`` field. Defaults
+            to :data:`DUMMY_OPPONENT_NAME` when no ``opponent`` is given, and to
+            the opponent's own ``name`` attribute (else ``"opponent"``) when one
+            is.
 
     Returns:
         A populated :class:`EvalReport`.
@@ -351,6 +420,13 @@ def evaluate(
     def _emit(message: str) -> None:
         if log is not None:
             log(message)
+
+    if opponent_name is None:
+        opponent_name = (
+            DUMMY_OPPONENT_NAME
+            if opponent is None
+            else str(getattr(opponent, "name", "opponent"))
+        )
 
     n_wins = 0
     n_losses = 0
@@ -370,6 +446,7 @@ def evaluate(
             episode_index=ep,
             seed=base_seed + ep,
             max_episode_steps=max_episode_steps,
+            opponent=opponent,
         )
         episodes.append(outcome)
 
@@ -436,6 +513,7 @@ def evaluate(
         aim_while_invisible=aim_while_invisible_total,
         passed_m2=passed_m2,
         is_live=bool(is_live),
+        opponent=str(opponent_name),
         episodes=episodes,
     )
 
@@ -446,6 +524,17 @@ def evaluate(
         + ("a LIVE" if is_live else "an OFFLINE")
         + " measurement of the eval harness / component-logging logic."
     )
+    if opponent is not None:
+        # passed_m2 is the M2 gate, and the M2 gate is defined against the
+        # STATIONARY DUMMY (AC6). Scored against a moving opponent the same
+        # arithmetic is a useful selection signal but not that milestone, and the
+        # artifact must not be read as if it were.
+        report.notes.append(
+            f"Scored against the stepped opponent {report.opponent!r}, NOT the "
+            "stationary dummy: win_rate is a scripted-opponent win rate (the "
+            "checkpoint-selection signal) and passed_m2 is therefore NOT the M2 "
+            "gate, which AC6 defines against the dummy."
+        )
 
     # Run summary: the headline gate numbers + the full per-component breakdown.
     if logger is not None:
@@ -462,6 +551,7 @@ def evaluate(
             "aim_while_invisible": report.aim_while_invisible,
             "passed_m2": report.passed_m2,
             "is_live": report.is_live,
+            "opponent": report.opponent,
         }
         # Surface each component sum AND mean under a stable, namespaced key so the
         # breakdown is queryable in the run summary, not just the per-episode series.
@@ -475,7 +565,7 @@ def evaluate(
         f"losses={report.n_losses} timeouts={report.n_timeouts} "
         f"win_rate={report.win_rate:.3f} mean_len={report.mean_episode_length:.1f} "
         f"aim_invisible={report.aim_while_invisible:.3f} "
-        f"passed_m2={report.passed_m2}"
+        f"passed_m2={report.passed_m2} opponent={report.opponent}"
     )
 
     return report
@@ -488,6 +578,7 @@ def _run_one_episode(
     episode_index: int,
     seed: int,
     max_episode_steps: Optional[int],
+    opponent: Optional[EvalOpponent] = None,
 ) -> EpisodeOutcome:
     """Roll out one greedy episode, accumulating per-component reward + the guard.
 
@@ -500,11 +591,23 @@ def _run_one_episode(
     if that obs reports ``visible == false`` AND the step's ``info`` carries a
     nonzero ``r_aim``, that aim bonus is summed into ``aim_while_invisible`` — so a
     spin-farming policy (rewarded for "aiming" at an unseen opponent) is caught.
+
+    With an ``opponent``, the per-decision order mirrors
+    ``agent.train.collect_episode`` EXACTLY — agent action, then one fresh
+    ``env.raw_opponent_view()``, then ONE ``env.step`` carrying both. One
+    ``env.step`` is one decision window and the opponent's swing meter is
+    shadow-tracked by counting those windows, so a skipped, doubled, or cached
+    view desynchronizes the meter (and a view read before the agent acts scores
+    the opponent on a state the agent has already left).
     """
     # Clear the policy's per-episode state (e.g. LSTM hidden) BEFORE the reset obs
     # so no memory leaks across the episode boundary.
     policy.reset()
     obs = env.reset(seed=seed)
+    # Episode boundary for the opponent, AFTER the reset: the reset re-arms the
+    # opponent's shadow swing meter that its ATTACK gate reads.
+    if opponent is not None:
+        opponent.begin_episode()
 
     components: Dict[str, float] = {key: 0.0 for key in REWARD_COMPONENT_KEYS}
     aim_while_invisible = 0.0
@@ -520,7 +623,16 @@ def _run_one_episode(
         # opponent at s' is the spin-farm signal. We therefore read visibility from
         # the post-step obs below, alongside r_aim, so the two always agree.
         action = policy.act(obs)
-        next_obs, reward, done, info = env.step(action)
+        if opponent is None:
+            # The M1/M2 line, unchanged: one positional argument, no opp_action
+            # on the wire at all.
+            next_obs, reward, done, info = env.step(action)
+        else:
+            # ONE view, ONE macro, ONE step. The view is read HERE (never cached
+            # from an earlier step) and passed through untouched so its clamped
+            # attack_cooldown reaches the opponent policy exactly as produced.
+            opp_action = opponent.act(env.raw_opponent_view())
+            next_obs, reward, done, info = env.step(action, opp_action=opp_action)
 
         total_reward += float(reward)
         length += 1

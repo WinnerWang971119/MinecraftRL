@@ -87,12 +87,16 @@ __all__ = [
     "Trainer",
     "train",
     "epsilon_for_episode",
+    "effective_eps_start",
+    "load_checkpoint_state_dict",
     "arena_episode_seed",
     "opponent_seed",
     "EpisodeOpponent",
     "OpponentCurriculum",
     "ScriptedOpponentDriver",
     "build_scripted_opponents",
+    "EvalOpponentDriver",
+    "build_eval_opponent",
     "collect_episode",
     "hidden_snapshot",
     "LearnStats",
@@ -143,6 +147,11 @@ class EnvProtocol(Protocol):
 EvalHook = Callable[["Trainer", int], None]
 #: Called every ``cfg.checkpoint_interval`` gradient steps. T20 owns the body.
 CheckpointHook = Callable[["Trainer", int], None]
+#: Called when an eval produces a NEW BEST win rate (T13's save-best path). Takes
+#: the same ``(trainer, grad_step)`` plus the eval metadata that justified the
+#: save, so the shipped file can record WHAT it scored and against WHOM — this
+#: repo's documented weak spot is exactly that kind of missing run provenance.
+BestCheckpointHook = Callable[["Trainer", int, Mapping[str, Any]], None]
 #: Called every ``cfg.log_interval`` gradient steps with the latest learn stats.
 LogHook = Callable[["Trainer", int, "LearnStats"], None]
 
@@ -176,12 +185,44 @@ class LearnStats:
 # ---------------------------------------------------------------------------
 
 
+def effective_eps_start(cfg: TrainConfig) -> float:
+    """Return the ε the schedule actually STARTS at for this run.
+
+    ``cfg.eps_start`` for a fresh run; ``cfg.warm_start_eps_start`` when
+    ``cfg.warm_start`` names a checkpoint.
+
+    THIS IS THE HALF OF A WARM START THAT IS EASY TO FORGET AND FATAL TO OMIT.
+    A warm start exists to keep a trained policy; the fresh-init default
+    ``eps_start=1.0`` immediately discards it, acting uniformly at random for the
+    first episode and mostly at random for the whole ``eps_decay_episodes``
+    window — which is also the window that fills the (deliberately fresh) replay
+    buffer. The run then relearns from noise having paid for a checkpoint it
+    never used, and nothing about the logs looks wrong.
+
+    It is resolved HERE, inside the one function every ε consumer calls
+    (``distributed.actor.Collector`` imports it, so all N arenas are covered),
+    rather than by rewriting the frozen config: there is then exactly one place
+    the effective schedule is decided and no way for a caller to construct a
+    config whose ε silently disagrees with the run it is driving.
+
+    Args:
+        cfg: The training config.
+
+    Returns:
+        The ε value at episode 0 for this run's schedule.
+    """
+    if cfg.warm_start is None:
+        return float(cfg.eps_start)
+    return float(cfg.warm_start_eps_start)
+
+
 def epsilon_for_episode(episode: int, cfg: TrainConfig) -> float:
     """Return the ε-greedy exploration rate for episode index ``episode``.
 
-    Linear decay from ``cfg.eps_start`` to ``cfg.eps_end`` over the FIRST
-    ``cfg.eps_decay_episodes`` episodes, then flat at ``cfg.eps_end``. The decay
-    is per EPISODE on purpose: episodes are short (tens of decisions), so a
+    Linear decay from :func:`effective_eps_start` (``cfg.eps_start``, or
+    ``cfg.warm_start_eps_start`` under a warm start) to ``cfg.eps_end`` over the
+    FIRST ``cfg.eps_decay_episodes`` episodes, then flat at ``cfg.eps_end``. The
+    decay is per EPISODE on purpose: episodes are short (tens of decisions), so a
     per-step decay would collapse ε in a handful of episodes and kill
     exploration (the documented gotcha in :mod:`agent.seeding`).
 
@@ -190,13 +231,90 @@ def epsilon_for_episode(episode: int, cfg: TrainConfig) -> float:
         cfg: The training config holding the ε schedule.
 
     Returns:
-        ε in ``[cfg.eps_end, cfg.eps_start]``, monotonically non-increasing in
-        ``episode`` and flat within a single episode.
+        ε in ``[cfg.eps_end, effective_eps_start(cfg)]``, monotonically
+        non-increasing in ``episode`` and flat within a single episode.
     """
     ep = max(0, int(episode))
+    start = effective_eps_start(cfg)
     # frac goes 0 -> 1 over the first eps_decay_episodes, then saturates at 1.
     frac = min(ep / float(cfg.eps_decay_episodes), 1.0)
-    return cfg.eps_start + (cfg.eps_end - cfg.eps_start) * frac
+    return start + (cfg.eps_end - start) * frac
+
+
+# ---------------------------------------------------------------------------
+# Warm start — initialize a run from an existing checkpoint (T13).
+#
+# The regime is pinned by the plan and implemented in exactly three places:
+#   1. the WEIGHTS load into the online net AND the target net (here + Trainer);
+#   2. ε RESTARTS at ``cfg.warm_start_eps_start`` (``effective_eps_start`` above);
+#   3. the replay buffer stays FRESH — nothing below restores one, deliberately:
+#      the stored transitions were produced by a different reward regime and a
+#      different (stationary) opponent, and replaying them is how a warm start
+#      turns into a slow relearn of the thing being replaced.
+# ---------------------------------------------------------------------------
+
+#: Keys a checkpoint may wrap its ``state_dict`` under. ``agent.train``'s own CLI
+#: writes ``"model"``; older/alternate artifacts use the others. Mirrors
+#: ``eval.evaluate._load_drqn`` so a checkpoint that evals can also warm-start.
+_CHECKPOINT_STATE_DICT_KEYS: Tuple[str, ...] = (
+    "model",
+    "model_state_dict",
+    "state_dict",
+    "online",
+)
+
+
+def load_checkpoint_state_dict(path: str, *, map_location: Any = "cpu") -> Dict[str, Any]:
+    """Load ``path`` and return the bare network ``state_dict`` inside it.
+
+    Accepts either a raw ``state_dict`` or a checkpoint dict wrapping one under
+    any of :data:`_CHECKPOINT_STATE_DICT_KEYS` (liberal in what it accepts, loud
+    when nothing matches — a warm start that silently loaded nothing would look
+    exactly like a warm start that worked).
+
+    Args:
+        path: Filesystem path to the checkpoint.
+        map_location: ``torch.load`` map location (default CPU).
+
+    Returns:
+        The extracted ``state_dict`` mapping.
+
+    Raises:
+        FileNotFoundError: if ``path`` does not exist — raised with the resolved
+            path so an overnight run fails in the first second rather than at the
+            first checkpoint save.
+        ValueError: if the payload is not a mapping, or is a mapping in which no
+            known wrapper key holds a dict and whose own values are not tensors.
+    """
+    import os
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"warm-start checkpoint not found: {path!r} (resolved to "
+            f"{os.path.abspath(path)})"
+        )
+
+    payload = torch.load(path, map_location=map_location)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"warm-start checkpoint {path!r} holds a "
+            f"{type(payload).__name__}, not a state_dict or a dict wrapping one"
+        )
+
+    for key in _CHECKPOINT_STATE_DICT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+
+    # A raw state_dict: a flat mapping whose values are tensors.
+    if payload and all(torch.is_tensor(v) for v in payload.values()):
+        return payload
+
+    raise ValueError(
+        f"warm-start checkpoint {path!r} carries no network weights: expected a "
+        f"raw state_dict or one of {list(_CHECKPOINT_STATE_DICT_KEYS)}, found keys "
+        f"{sorted(payload)[:8]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +386,7 @@ def arena_episode_seed(cfg: TrainConfig, arena_id: int, local_ep: int) -> int:
 #: driver owns three independent RNG streams — the EASY/HARD mixture draw, and
 #: one per ``ScriptedBot`` — and they must not collide with each other or with
 #: another arena's.
-_OPPONENT_SEED_ROLES: Tuple[str, ...] = ("mixture", "easy", "hard")
+_OPPONENT_SEED_ROLES: Tuple[str, ...] = ("mixture", "easy", "hard", "eval")
 
 
 def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
@@ -294,7 +412,8 @@ def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
         cfg: The training config (supplies ``seed`` and ``seed_stride``).
         arena_id: 0-based arena index.
         role: One of :data:`_OPPONENT_SEED_ROLES` — ``"mixture"``, ``"easy"``,
-            or ``"hard"``.
+            ``"hard"``, or ``"eval"`` (the periodic eval's own opponent, which
+            :func:`build_eval_opponent` seeds from a band no collector owns).
 
     Returns:
         The integer seed for that arena's stream.
@@ -620,6 +739,138 @@ def build_scripted_opponents(
     return curriculum, opponent_for
 
 
+class EvalOpponentDriver:
+    """The PERIODIC EVAL's opponent: fixed tier schedule, fully deterministic.
+
+    Satisfies ``eval.evaluate.EvalOpponent`` (``begin_episode`` / ``act``). It is
+    deliberately NOT a :class:`ScriptedOpponentDriver`: it never touches the
+    curriculum and never scores anything back into it, because an eval measures
+    the agent and must not move the training distribution it is measuring.
+
+    Two properties make its win rate comparable across the whole run, which is
+    the entire point — a checkpoint is SELECTED on this number:
+
+      * **Fixed tier schedule.** ``"mixed"`` alternates EASY/HARD strictly by
+        episode index (even -> EASY, odd -> HARD); ``"easy"`` / ``"hard"`` pin
+        one tier. It never samples the curriculum's mixture, which SHIFTS when
+        the gate fires — two evals either side of that shift would score
+        different opponents under one name.
+      * **Per-episode reseed from a fixed base.** Episode ``i``'s bot is reseeded
+        to ``base_seed + i``. Without this, episode ``i``'s opponent RNG state
+        would depend on how many decisions the earlier episodes took, which
+        depends on the agent — so the "same" eval opponent would drift as the
+        agent improved and the win-rate series would compare different fights.
+        This is a DETERMINISTIC reseed, not the forbidden per-episode entropy
+        reseed: rerunning the same eval replays the same opponent exactly.
+
+    Args:
+        cfg: The training config (supplies the preset choice).
+        base_seed: Seed for episode 0; episode ``i`` uses ``base_seed + i``.
+        preset_choice: One of ``"mixed"`` / ``"easy"`` / ``"hard"``; defaults to
+            ``cfg.eval_opponent_preset``.
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        *,
+        base_seed: int,
+        preset_choice: Optional[str] = None,
+    ) -> None:
+        choice = str(
+            cfg.eval_opponent_preset if preset_choice is None else preset_choice
+        )
+        if choice not in ("mixed", "easy", "hard"):
+            raise ValueError(
+                f"eval opponent preset must be 'mixed', 'easy' or 'hard', got "
+                f"{choice!r}"
+            )
+        self._choice = choice
+        self._base_seed = int(base_seed)
+        self._bots: Dict[ScriptedPreset, ScriptedBot] = {
+            ScriptedPreset.EASY: ScriptedBot(ScriptedPreset.EASY, seed=self._base_seed),
+            ScriptedPreset.HARD: ScriptedBot(ScriptedPreset.HARD, seed=self._base_seed),
+        }
+        # -1 so the first begin_episode() lands on episode 0 (EASY under "mixed").
+        self._episode_index = -1
+        self._preset = (
+            ScriptedPreset.HARD if choice == "hard" else ScriptedPreset.EASY
+        )
+
+    @property
+    def name(self) -> str:
+        """Stable name for the report / logs (``"scripted_mixed"`` etc.)."""
+        return f"scripted_{self._choice}"
+
+    @property
+    def preset(self) -> ScriptedPreset:
+        """The tier the CURRENT eval episode is being fought at."""
+        return self._preset
+
+    def begin_episode(self) -> None:
+        """Advance to the next eval episode: pick its tier and reseed its bot."""
+        self._episode_index += 1
+        if self._choice == "easy":
+            self._preset = ScriptedPreset.EASY
+        elif self._choice == "hard":
+            self._preset = ScriptedPreset.HARD
+        else:
+            # Strict alternation, not a draw: an RNG'd mixture would make two
+            # evals of the same length face different tier sequences.
+            self._preset = (
+                ScriptedPreset.EASY
+                if self._episode_index % 2 == 0
+                else ScriptedPreset.HARD
+            )
+        # reset(<int>) DOES re-seed (reset() with no argument is a no-op on the
+        # RNG — the gym convention the training driver relies on). Here the
+        # re-seed is what we want: every eval replays an identical opponent.
+        self._bots[self._preset].reset(self._base_seed + self._episode_index)
+
+    def act(self, view: OpponentView) -> int:
+        """Return the active bot's macro, passing ``view`` through untouched."""
+        return int(self._bots[self._preset].act(view))
+
+
+def build_eval_opponent(
+    cfg: TrainConfig, *, preset_choice: Optional[str] = None
+) -> Optional[Callable[[], EvalOpponentDriver]]:
+    """Return a factory for the eval's opponent, or ``None`` for the dummy path.
+
+    ``cfg.opponent == "dummy"`` yields ``None``: the stationary dummy is served
+    by the bridge, there is no opponent policy to step, and the eval keeps its
+    byte-identical M2 wire line.
+
+    The returned callable builds a FRESH :class:`EvalOpponentDriver` per eval,
+    all from the same base seed, so eval #1 and eval #40 face exactly the same
+    opponent behavior and their win rates are comparable — which is what makes
+    "select the checkpoint with the highest scripted win rate" a real criterion
+    rather than a comparison of two different fights.
+
+    The base seed comes from arena band ``cfg.arenas`` — one past the last
+    collector — so the eval opponent's RNG can never coincide with any arena's
+    training opponent or episode stream.
+
+    Args:
+        cfg: The training config.
+        preset_choice: Optional override of ``cfg.eval_opponent_preset``.
+
+    Returns:
+        ``() -> EvalOpponentDriver``, or ``None`` on the dummy path.
+    """
+    if cfg.opponent != "scripted":
+        return None
+
+    base_seed = opponent_seed(cfg, arena_id=int(cfg.arenas), role="eval")
+
+    def _build() -> EvalOpponentDriver:
+        return EvalOpponentDriver(
+            cfg, base_seed=base_seed, preset_choice=preset_choice
+        )
+
+    return _build
+
+
 # ---------------------------------------------------------------------------
 # Reentrant rollout — the actor-side collection path (shared by N=1 and N>1).
 #
@@ -927,7 +1178,8 @@ class Trainer:
         net_kwargs: Optional architecture overrides forwarded to BOTH
             ``DuelingDRQN`` constructions (e.g. smaller hidden sizes for a fast
             unit test). ``obs_dim``/``n_actions`` still assert against the frozen
-            contracts inside the net.
+            contracts inside the net. A ``cfg.warm_start`` checkpoint must match
+            this architecture — the load is ``strict=True``.
         seed_global: When True (default) call :func:`agent.seeding.seed_everything`
             with ``cfg.seed`` at construction so the whole run is reproducible.
     """
@@ -950,6 +1202,19 @@ class Trainer:
         net_kwargs = dict(net_kwargs or {})
         self.online = DuelingDRQN(**net_kwargs).to(self.device)
         self.target = DuelingDRQN(**net_kwargs).to(self.device)
+
+        # WARM START: replace the fresh init with the checkpoint's weights BEFORE
+        # the target is copied, so θ_target == θ_online == the loaded policy. A
+        # target left at its random init would spend the first thousands of steps
+        # bootstrapping the loaded net toward noise — the same "warm start thrown
+        # away" failure as leaving ε at 1.0, one layer down. strict=True: a shape
+        # or key mismatch (a checkpoint from a different architecture) must abort
+        # the run, never load a partial policy.
+        if cfg.warm_start is not None:
+            state_dict = load_checkpoint_state_dict(
+                str(cfg.warm_start), map_location=self.device
+            )
+            self.online.load_state_dict(state_dict)
         # Target starts as an exact copy of the online net (θ_target = θ_online).
         self.target.load_state_dict(self.online.state_dict())
         # The target net is never optimized directly — only soft-updated. Freezing
@@ -982,7 +1247,10 @@ class Trainer:
 
         self.grad_step = 0  # number of completed gradient steps
         self.episode_count = 0  # number of collected episodes
-        self.last_epsilon = cfg.eps_start  # ε of the most recent episode
+        # ε of the most recent episode. Seeded from the EFFECTIVE schedule start
+        # (the warm-start restart when one is configured) so the very first
+        # progress line and metrics row report the ε the run will actually use.
+        self.last_epsilon = effective_eps_start(cfg)
 
     # ------------------------------------------------------------------
     # Rollout / collection
@@ -1747,8 +2015,8 @@ def train_vs_dummy(
                 # Eval BORROWS the training env's (now idle) transport instead of
                 # opening a second connection — the bridge serves exactly one
                 # connection, so a fresh eval socket would steal the stream out from
-                # under training and abort the run. See _eval_against_dummy.
-                report = _eval_against_dummy(
+                # under training and abort the run. See _eval_against_opponent.
+                report = _eval_against_opponent(
                     trainer=trainer,
                     evaluate=evaluate,
                     policy_cls=DRQNGreedyPolicy,
@@ -1818,7 +2086,7 @@ def train_vs_dummy(
 run_m2 = train_vs_dummy
 
 
-def _eval_against_dummy(
+def _eval_against_opponent(
     *,
     trainer: "Trainer",
     evaluate: Callable[..., Any],
@@ -1832,8 +2100,15 @@ def _eval_against_dummy(
     is_live: bool,
     base_seed: int,
     log: Optional[Callable[[str], None]],
+    opponent: Optional[Any] = None,
 ) -> Any:
-    """Run ONE greedy (ε=0) eval of the current online net vs the dummy.
+    """Run ONE greedy (ε=0) eval of the current online net vs the stage opponent.
+
+    ``opponent`` is ``None`` on the stationary-dummy path (the bridge serves the
+    dummy and no ``opp_action`` goes on the wire) and an
+    :class:`EvalOpponentDriver` when the run fights the scripted opponent — in
+    which case the eval steps it exactly as collection does, so the win rate this
+    returns is a win rate against the SAME moving opponent training faces.
 
     The bridge serves EXACTLY ONE connection, so eval must not open a second one:
     a fresh eval socket adopts the stream and the bridge destroys the training
@@ -1881,6 +2156,7 @@ def _eval_against_dummy(
             is_live=is_live,
             max_episode_steps=eval_step_cap,
             log=log,
+            opponent=opponent,
         )
     finally:
         # Do NOT close eval_env: it borrows training's socket and must not send
@@ -1889,6 +2165,12 @@ def _eval_against_dummy(
         if was_training:
             trainer.online.train()
     return report
+
+
+#: Historical name for :func:`_eval_against_opponent`, from when the eval could
+#: only ever fight the stationary dummy. Kept because ``eval/combat_probe.py``
+#: names it in prose.
+_eval_against_dummy = _eval_against_opponent
 
 
 def _close_quietly(env: Any) -> None:
@@ -1931,7 +2213,7 @@ def _close_quietly(env: Any) -> None:
 # Periodic GREEDY eval runs on ONE designated arena (arena 0) via the collector
 # pause/handoff protocol: pause the designated collector at its episode boundary,
 # wait for it to park idle, BORROW its (idle) env/transport, run eval reusing the
-# single-connection ``_eval_against_dummy`` borrow, then resume. Eval opens NO new
+# single-connection ``_eval_against_opponent`` borrow, then resume. Eval opens NO new
 # connection on ANY arena — the bridge serves exactly one connection per arena (a
 # recorded gotcha that aborted a live run before).
 #
@@ -1962,6 +2244,17 @@ class MultiArenaResult:
             scripted opponent (``cfg.opponent == "scripted"``), else ``None``. Kept
             on the result so a caller can read the final mixture / gate state
             without reaching into the pool.
+        best_win_rate: Highest eval win rate seen, i.e. the score of the
+            SAVE-BEST checkpoint. ``-1.0`` when no eval ran.
+        best_grad_step: Learner grad step at which ``best_win_rate`` was measured
+            (``-1`` when nothing was ever saved as best) — the number that says
+            WHICH checkpoint the best file holds.
+        eval_opponent: Who the periodic eval fought (``"dummy"`` or e.g.
+            ``"scripted_mixed"``). Recorded because ``best_win_rate`` cannot be
+            compared across runs — or trusted at all — without it.
+        checkpoints_saved: How many times the periodic/final checkpoint hook
+            fired. Reported so a run that saved NOTHING is visible in the result
+            rather than only discoverable on disk at 8am.
     """
 
     trainer: "Trainer"
@@ -1973,6 +2266,10 @@ class MultiArenaResult:
     stop_reason: str = "max_grad_steps"
     is_live: bool = False
     curriculum: Optional["OpponentCurriculum"] = None
+    best_win_rate: float = -1.0
+    best_grad_step: int = -1
+    eval_opponent: str = "dummy"
+    checkpoints_saved: int = 0
 
     def __post_init__(self) -> None:
         if self.reports is None:
@@ -1985,6 +2282,47 @@ class MultiArenaResult:
 #: ``MCPvPEnv`` over a ``TcpBridgeClient(host, base_port + arena_id)``; tests inject
 #: a factory returning a fake env.
 EnvFactoryFor = Callable[[int], Callable[[], "EnvProtocol"]]
+
+
+class _BestCheckpointSelector:
+    """Decide which eval report is worth saving as THE checkpoint to ship.
+
+    Selection is by **win rate, not recency**: a later checkpoint is kept only if
+    it scored strictly higher than every earlier one. (The plain periodic hook
+    saves the latest net separately; that file is the fallback, not the pick.)
+
+    Two rules, both deliberate:
+
+      * **strictly greater** — ties keep the EARLIER checkpoint. Two evals at the
+        same win rate are the same evidence, and the earlier net got there with
+        less overfitting to the eval opponent's fixed seed.
+      * **must beat zero** — the first eval always beats the ``-1.0`` initial
+        best, so without this a run whose agent never won a single eval episode
+        would ship its FIRST eval's net (barely trained) in a file named "best".
+        Until something is actually won there is no evidence to select on, and
+        the honest answer is that no best checkpoint exists.
+
+    Args:
+        min_win_rate: A report must strictly exceed this to be selectable
+            (default 0.0 — it must have won at least one eval episode).
+    """
+
+    def __init__(self, *, min_win_rate: float = 0.0) -> None:
+        self.best_win_rate: float = -1.0
+        self.best_grad_step: int = -1
+        self._min_win_rate = float(min_win_rate)
+
+    def consider(self, win_rate: float, grad_step: int) -> bool:
+        """Record this eval; return True iff it is the new checkpoint to ship."""
+        rate = float(win_rate)
+        if rate <= self.best_win_rate:
+            return False
+        self.best_win_rate = rate
+        if rate <= self._min_win_rate:
+            # Tracked as the high-water mark, but not worth shipping yet.
+            return False
+        self.best_grad_step = int(grad_step)
+        return True
 
 
 def _eval_via_designated_arena(
@@ -2003,16 +2341,24 @@ def _eval_via_designated_arena(
     base_seed: int,
     log: Optional[Callable[[str], None]],
     pause_timeout: float,
+    opponent: Optional[Any] = None,
 ) -> Optional[Any]:
     """Run ONE greedy eval on the designated arena via the pause/handoff protocol.
 
     Pauses the designated arena's collector at its next EPISODE BOUNDARY, waits for
     it to confirm paused-and-idle (no reply in flight on its single bridge
     connection), BORROWS its idle env's transport, runs the eval through
-    :func:`_eval_against_dummy` (which builds a separate ``MCPvPEnv`` with
+    :func:`_eval_against_opponent` (which builds a separate ``MCPvPEnv`` with
     ``auto_connect=False`` over that shared transport — never a second connection),
     then resumes the collector. Eval opens NO connection on any OTHER arena; they
     keep collecting throughout.
+
+    ``opponent`` (``None`` on the dummy path) is the Python-stepped opponent
+    policy the eval fights; it is threaded straight through to
+    :func:`_eval_against_opponent`. The borrowed connection is the arena's, but
+    the opponent is the EVAL's own — a fresh, fixed-seed driver per eval, never
+    the collector's curriculum-driven one, so the eval neither perturbs training's
+    opponent RNG nor inherits its drifting mixture.
 
     Returns the eval report, or ``None`` if the designated collector could not be
     brought to an idle boundary within ``pause_timeout`` (e.g. it is mid-relaunch),
@@ -2043,7 +2389,7 @@ def _eval_via_designated_arena(
         if shared_transport is None:
             return None
 
-        return _eval_against_dummy(
+        return _eval_against_opponent(
             trainer=trainer,
             evaluate=evaluate,
             policy_cls=policy_cls,
@@ -2056,6 +2402,7 @@ def _eval_via_designated_arena(
             is_live=is_live,
             base_seed=base_seed,
             log=log,
+            opponent=opponent,
         )
     finally:
         # Always resume the collector, even if eval raised, so a single arena is
@@ -2084,6 +2431,9 @@ def train_multi_arena(
     net_kwargs: Optional[Dict[str, int]] = None,
     logger: Optional[Any] = None,
     checkpoint_hook: Optional[CheckpointHook] = None,
+    best_checkpoint_hook: Optional[BestCheckpointHook] = None,
+    checkpoint_every_grad_steps: Optional[int] = None,
+    eval_opponent_factory: Optional[Callable[[], Any]] = None,
     is_live: bool = False,
     log: Optional[Callable[[str], None]] = None,
     poll_interval: float = 0.05,
@@ -2150,10 +2500,39 @@ def train_multi_arena(
         timeout_cap / env_max_episode_steps / rollout_step_cap: Episode-length knobs,
             forwarded to eval / the collectors (see ``train_vs_dummy``).
         stop_on_pass: Stop as soon as an eval clears the M2 gate (default True).
+            NOTE for a scripted-opponent retrain: ``passed_m2`` is the M2 gate,
+            which AC6 defines against the STATIONARY DUMMY. Leaving this True on a
+            run whose eval fights a moving opponent stops the night the first time
+            the agent has a good eval, which is not the milestone and not the
+            plan. ``agent.train``'s CLI therefore defaults it to False whenever
+            ``--opponent scripted`` is selected.
         device / net_kwargs: Forwarded to the learner :class:`Trainer` AND used to
             build each collector's snapshot net (same architecture as the learner).
         logger: Optional metrics logger (per-eval components + throughput).
-        checkpoint_hook: Optional ``(trainer, grad_step) -> None`` (save-best / final).
+        checkpoint_hook: Optional ``(trainer, grad_step) -> None`` for the LATEST
+            net. Fired on a cadence (see ``checkpoint_every_grad_steps``) and once
+            more at the end of the run — both INDEPENDENT of eval, because a run
+            with eval disabled that saves nothing all night is the worst outcome
+            this function can produce. Also fired on an eval improvement when no
+            ``best_checkpoint_hook`` is given (the historical single-file
+            behavior).
+        best_checkpoint_hook: Optional ``(trainer, grad_step, meta) -> None`` for
+            the SAVE-BEST net, fired only when an eval strictly improves the win
+            rate (see :class:`_BestCheckpointSelector`); ``meta`` carries the
+            win rate, the eval opponent and the episode count that justified the
+            save. Keep it pointed at a DIFFERENT
+            path from ``checkpoint_hook``: sharing one path means the next
+            periodic save overwrites the best net with a more recent, worse one —
+            selection by recency wearing selection-by-win-rate's clothes.
+        checkpoint_every_grad_steps: Grad steps between periodic ``checkpoint_hook``
+            saves. ``None`` (the default) uses ``cfg.checkpoint_interval``; ``0``
+            disables the periodic save (the FINAL save still happens).
+        eval_opponent_factory: Optional ``() -> EvalOpponent`` building the
+            opponent policy the periodic eval steps; a FRESH one is built per eval
+            so every eval faces an identical opponent. ``None`` (the default)
+            means the eval is built from ``cfg`` via :func:`build_eval_opponent` —
+            which yields ``None`` on the dummy path, keeping the M2 eval's wire
+            line byte-identical.
         is_live: Marks reports/result as live vs offline.
         log: Optional ASCII-only ``str -> None`` sink (Windows cp1252-safe).
         poll_interval: Seconds between the driver's budget/health polls.
@@ -2220,6 +2599,11 @@ def train_multi_arena(
         raise ValueError(
             f"eval_every_grad_steps must be >= 0, got {eval_every_grad_steps}"
         )
+    if checkpoint_every_grad_steps is not None and checkpoint_every_grad_steps < 0:
+        raise ValueError(
+            "checkpoint_every_grad_steps must be >= 0 or None, got "
+            f"{checkpoint_every_grad_steps}"
+        )
     if is_live and jvm_probe is None:
         # A LIVE run with no tier 2 is a configuration the fault policy says must not
         # exist: the shared Paper JVM could die and every pad would sit restarting
@@ -2265,6 +2649,18 @@ def train_multi_arena(
     opponent_for: Optional[Callable[[int], EpisodeOpponent]] = None
     if cfg.opponent == "scripted":
         curriculum, opponent_for = build_scripted_opponents(cfg)
+
+    # --- the EVAL's own opponent (T13) --------------------------------------
+    # Separate from the collectors' drivers on purpose: the eval must fight the
+    # same KIND of opponent training does (or its win rate scores a stationary
+    # target and selects the wrong checkpoint) while staying identical across
+    # evals (or two win rates are not comparable and "select the best" is
+    # meaningless). None on the dummy path.
+    if eval_opponent_factory is None:
+        eval_opponent_factory = build_eval_opponent(cfg)
+    eval_opponent_name = "dummy"
+    if eval_opponent_factory is not None:
+        eval_opponent_name = str(getattr(eval_opponent_factory(), "name", "opponent"))
 
     # --- per-arena snapshot policies (same net architecture as the learner) --
     # Each collector owns its own net clone (built from the SAME net_kwargs so the
@@ -2342,13 +2738,42 @@ def train_multi_arena(
     # --- eval wiring (lazy: keep the eval dependency at the call boundary) ----
     reports: List[Any] = []
     last_report: Optional[Any] = None
-    best_win_rate = -1.0
+    selector = _BestCheckpointSelector()
     passed = False
     stop_reason = "max_grad_steps"
     do_eval = eval_every_grad_steps > 0
     if do_eval:
         from eval.evaluate import DRQNGreedyPolicy, evaluate
     next_eval_at = eval_every_grad_steps  # first eval boundary (grad steps)
+
+    # --- checkpoint cadence (INDEPENDENT of eval) ---------------------------
+    # The reason this exists: the only save on this path used to sit inside the
+    # eval-improvement branch, so `--eval-every-grad-steps 0` trained all night
+    # and wrote ZERO checkpoints, and `Trainer._fire_hooks` / cfg.checkpoint_interval
+    # are dead here (the learner calls trainer.learn() directly, never
+    # trainer.train()). Both the periodic save below and the final save in the
+    # `finally` are unconditional on eval.
+    checkpoint_every = (
+        int(cfg.checkpoint_interval)
+        if checkpoint_every_grad_steps is None
+        else int(checkpoint_every_grad_steps)
+    )
+    do_periodic_checkpoint = checkpoint_hook is not None and checkpoint_every > 0
+    next_checkpoint_at = checkpoint_every
+    checkpoints_saved = 0
+
+    def _save_latest(grad_step: int, why: str) -> None:
+        """Fire the LATEST-net hook, never letting a save failure kill the run."""
+        nonlocal checkpoints_saved
+        if checkpoint_hook is None:
+            return
+        try:
+            checkpoint_hook(trainer, int(grad_step))
+        except Exception as exc:  # noqa: BLE001 - a bad path must not end the night
+            _emit(f"[multi] checkpoint save FAILED at grad_step {grad_step}: {exc}")
+            return
+        checkpoints_saved += 1
+        _emit(f"[multi] checkpoint saved ({why}) at grad_step {grad_step}")
 
     def _maybe_log_mean_epsilon(grad_step: int) -> None:
         # The logged epsilon is per-arena under N collectors; log the MEAN across the
@@ -2377,11 +2802,40 @@ def train_multi_arena(
             else "opponent=dummy, "
         )
         + (
-            f"eval every {eval_every_grad_steps} grad steps on arena {designated_arena}"
+            f"eval every {eval_every_grad_steps} grad steps on arena "
+            f"{designated_arena} vs {eval_opponent_name}"
             if do_eval
             else "eval disabled"
         )
+        + (
+            f", checkpoint every {checkpoint_every} grad steps"
+            if do_periodic_checkpoint
+            else ", periodic checkpoint OFF"
+        )
+        + (f", stop_on_pass={'on' if stop_on_pass else 'off'}")
     )
+    if checkpoint_hook is None and best_checkpoint_hook is None:
+        # Said at the START, loudly. A multi-hour run that saves nothing is
+        # unrecoverable at 8am, and the only symptom is an empty runs/ directory.
+        _emit(
+            "[multi] WARNING: no checkpoint hook configured - this run will train "
+            "and save NOTHING. Pass --checkpoint (and optionally "
+            "--best-checkpoint) before starting an overnight run."
+        )
+    if cfg.warm_start is not None:
+        _emit(
+            f"[multi] warm start from {cfg.warm_start} - online+target initialized "
+            f"from it, replay FRESH, epsilon restarts at "
+            f"{effective_eps_start(cfg):.3f} (not {cfg.eps_start:.3f})"
+        )
+        # Hand the collectors the warm weights BEFORE they roll their first
+        # episode. The learner publishes an identical version-0 snapshot the
+        # instant its thread starts, but the pool starts first, so without this a
+        # collector can open with a randomly-initialized net — a small amount of
+        # garbage in a deliberately fresh replay, from the one run that exists to
+        # not start from scratch. Re-publishing version 0 is harmless: collectors
+        # reload only on a STRICTLY greater version and the weights are the same.
+        weight_store.publish(trainer.online.state_dict(), 0)
 
     pool.start()
     learner_thread.start()
@@ -2428,6 +2882,12 @@ def train_multi_arena(
                 stop_reason = "max_episodes"
                 break
 
+            # --- periodic checkpoint of the LATEST net (eval-independent) -------
+            if do_periodic_checkpoint and grad_step >= next_checkpoint_at:
+                _save_latest(grad_step, "periodic")
+                # Re-read grad_step: saving takes time and the learner kept going.
+                next_checkpoint_at = int(trainer.grad_step) + checkpoint_every
+
             # --- periodic designated-arena eval via pause/handoff ---------------
             if do_eval and grad_step >= next_eval_at:
                 _maybe_log_mean_epsilon(grad_step)
@@ -2446,6 +2906,14 @@ def train_multi_arena(
                     base_seed=cfg.seed,
                     log=log,
                     pause_timeout=eval_pause_timeout,
+                    # A FRESH opponent per eval, from the same fixed seed: every
+                    # eval fights the identical opponent, so the win-rate series
+                    # measures the AGENT and nothing else.
+                    opponent=(
+                        eval_opponent_factory()
+                        if eval_opponent_factory is not None
+                        else None
+                    ),
                 )
                 # Advance the boundary past the CURRENT grad step so a long eval (the
                 # learner kept stepping during the borrow) does not immediately re-fire.
@@ -2454,16 +2922,46 @@ def train_multi_arena(
                 if report is not None:
                     reports.append(report)
                     last_report = report
-                    if report.win_rate > best_win_rate:
-                        best_win_rate = report.win_rate
-                        if checkpoint_hook is not None:
-                            checkpoint_hook(trainer, int(trainer.grad_step))
+                    eval_grad_step = int(trainer.grad_step)
+                    # Selection is by WIN RATE, not recency (see the selector).
+                    if selector.consider(report.win_rate, eval_grad_step):
+                        if best_checkpoint_hook is not None:
+                            try:
+                                best_checkpoint_hook(
+                                    trainer,
+                                    eval_grad_step,
+                                    {
+                                        "win_rate": float(report.win_rate),
+                                        "eval_opponent": eval_opponent_name,
+                                        "eval_episodes": int(report.n_episodes),
+                                        "mean_episode_length": float(
+                                            report.mean_episode_length
+                                        ),
+                                        "passed_m2": bool(report.passed_m2),
+                                    },
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                _emit(
+                                    "[multi] BEST checkpoint save FAILED at "
+                                    f"grad_step {eval_grad_step}: {exc}"
+                                )
+                            else:
+                                _emit(
+                                    f"[multi] best checkpoint saved: win_rate="
+                                    f"{report.win_rate:.3f} vs {eval_opponent_name} "
+                                    f"at grad_step {eval_grad_step}"
+                                )
+                        else:
+                            # Legacy single-hook callers keep the old save-best
+                            # behavior; the periodic/final saves are additional.
+                            _save_latest(eval_grad_step, "best")
                     _emit(
-                        f"[multi grad_step {int(trainer.grad_step)}] "
+                        f"[multi grad_step {eval_grad_step}] "
                         f"win_rate={report.win_rate:.3f} "
                         f"mean_len={report.mean_episode_length:.1f} "
                         f"aim_invisible={report.aim_while_invisible:.3f} "
-                        f"passed_m2={report.passed_m2}"
+                        f"passed_m2={report.passed_m2} "
+                        f"opponent={eval_opponent_name}"
                     )
                     if report.passed_m2 and stop_on_pass:
                         passed = True
@@ -2489,6 +2987,15 @@ def train_multi_arena(
             pool_abort_error = exc
         learner_thread.join(timeout=5.0)
 
+        # --- the FINAL save ------------------------------------------------
+        # After the join, so the state_dict cannot be read while the learner is
+        # mid-optimizer-step. Inside the `finally`, so a run that ends on a
+        # learner error, a pool abort, or a Ctrl-C at 4am still leaves the night's
+        # weights on disk — the old code had no final save here at all, and
+        # _save_latest swallows its own failures so teardown can never mask the
+        # error that got us here.
+        _save_latest(int(trainer.grad_step), "final")
+
     # --- surface a learner error or a pool abort LOUDLY ----------------------
     if learner.error is not None:
         # The learner stores and re-raises the ORIGINAL exception (a WatchdogError on
@@ -2510,6 +3017,10 @@ def train_multi_arena(
         stop_reason=stop_reason,
         is_live=bool(is_live),
         curriculum=curriculum,
+        best_win_rate=selector.best_win_rate,
+        best_grad_step=selector.best_grad_step,
+        eval_opponent=eval_opponent_name,
+        checkpoints_saved=checkpoints_saved,
     )
 
 
@@ -2606,6 +3117,70 @@ def _build_parser() -> "Any":
         "(the single-arena loop steps no opponent policy and refuses rather than "
         "silently fighting the dummy).",
     )
+    # -- curriculum knobs (all default to TrainConfig's own values) ----------
+    # Every one of these defaults to None and is applied only when given, so
+    # TrainConfig stays the single source of the defaults and an argparse default
+    # can never drift away from the dataclass it configures. They exist because
+    # the plan's declared fallback ("train EASY-only, keep HARD as a demo knob")
+    # needs opponent_mix_easy=1.0, and without a flag taking that fallback means
+    # editing dataclass defaults on freeze day.
+    parser.add_argument(
+        "--opponent-mix-easy", type=float, default=None,
+        help="probability an episode draws the EASY preset BEFORE the win-rate "
+        "gate fires (default: TrainConfig's 0.8). For the plan's EASY-ONLY "
+        "schedule cut pass BOTH this and --opponent-mix-easy-after as 1.0: this "
+        "one alone only holds until the gate fires, after which the mixture "
+        "shifts to --opponent-mix-easy-after (0.2) and HARD becomes the majority "
+        "tier - the opposite of the cut.",
+    )
+    parser.add_argument(
+        "--opponent-mix-easy-after", type=float, default=None,
+        help="probability of EASY AFTER the gate fires (default: 0.2). Not 0.0 on "
+        "purpose: the curriculum is a gated MIXTURE, and EASY episodes are what "
+        "keep the gate's own window fed.",
+    )
+    parser.add_argument(
+        "--opponent-gate-winrate", type=float, default=None,
+        help="rolling win rate vs EASY that shifts the mixture (default: 0.6).",
+    )
+    parser.add_argument(
+        "--opponent-gate-window", type=int, default=None,
+        help="EASY episodes in the rolling gate window; it must be FULL before the "
+        "gate is evaluated (default: 50).",
+    )
+    parser.add_argument(
+        "--eval-opponent-preset", type=str, default=None,
+        choices=("mixed", "easy", "hard"),
+        help="which scripted tier the PERIODIC EVAL fights with --opponent "
+        "scripted (default: mixed - EASY/HARD alternating by episode index). It is "
+        "deliberately NOT the training mixture, which shifts when the gate fires: "
+        "two evals either side of that shift would score different opponents and "
+        "the checkpoint selection would compare numbers that do not mean the same "
+        "thing.",
+    )
+    parser.add_argument(
+        "--warm-start", type=str, default=None,
+        help="path to a checkpoint whose weights initialize this run (online AND "
+        "target). The replay buffer is deliberately NOT restored, and the epsilon "
+        "schedule restarts at --warm-start-eps-start instead of eps_start.",
+    )
+    parser.add_argument(
+        "--warm-start-eps-start", type=float, default=None,
+        help="epsilon the schedule restarts at under --warm-start (default: 0.25, "
+        "the plan's 0.2-0.3 band). Ignored without --warm-start. Leaving this at "
+        "the fresh-init 1.0 would spend the whole decay window acting mostly at "
+        "random and throw the warm start away.",
+    )
+    parser.add_argument(
+        "--stop-on-pass", dest="stop_on_pass", action="store_true", default=None,
+        help="stop the run as soon as an eval clears the M2 gate. DEFAULT: on for "
+        "--opponent dummy, OFF for --opponent scripted (the M2 gate is defined "
+        "against the stationary dummy, so it is not this retrain's finish line).",
+    )
+    parser.add_argument(
+        "--no-stop-on-pass", dest="stop_on_pass", action="store_false",
+        help="run the full budget even if an eval clears the M2 gate.",
+    )
     parser.add_argument(
         "--seed", type=int, default=0,
         help="base RNG seed (overrides TrainConfig.seed) (default: 0).",
@@ -2620,7 +3195,23 @@ def _build_parser() -> "Any":
     )
     parser.add_argument(
         "--checkpoint", type=str, default=None,
-        help="optional path to write the final DRQN checkpoint (state_dict).",
+        help="optional path for the LATEST DRQN checkpoint (state_dict). On the "
+        "multi-arena path it is rewritten periodically and once at the end, "
+        "INDEPENDENT of eval - so a run with eval disabled still leaves weights.",
+    )
+    parser.add_argument(
+        "--best-checkpoint", type=str, default=None,
+        help="multi-arena only: path for the SAVE-BEST checkpoint, written only "
+        "when an eval strictly improves the win rate against the eval opponent. "
+        "Defaults to --checkpoint with a '.best' suffix. Keep it distinct from "
+        "--checkpoint: one path for both means the next periodic save overwrites "
+        "the best net with a more recent, worse one.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-grad-steps", type=int, default=None,
+        help="multi-arena only: grad steps between periodic --checkpoint saves "
+        "(default: TrainConfig.checkpoint_interval; 0 disables the periodic save, "
+        "the final save still happens).",
     )
     parser.add_argument(
         "--no-progress", action="store_true",
@@ -2632,6 +3223,101 @@ def _build_parser() -> "Any":
         "(the on-TTY bar redraws faster) (default: 30).",
     )
     return parser
+
+
+#: ``(argparse dest, TrainConfig field, cast)`` for every flag that overrides a
+#: config default only when it is actually given. Kept as a table so adding a
+#: knob is one line and cannot forget the ``is not None`` guard that keeps
+#: TrainConfig the single source of defaults.
+_CONFIG_OVERRIDE_FLAGS: Tuple[Tuple[str, str, Callable[[Any], Any]], ...] = (
+    ("opponent_mix_easy", "opponent_mix_easy", float),
+    ("opponent_mix_easy_after", "opponent_mix_easy_after", float),
+    ("opponent_gate_winrate", "opponent_gate_winrate", float),
+    ("opponent_gate_window", "opponent_gate_window", int),
+    ("eval_opponent_preset", "eval_opponent_preset", str),
+    ("warm_start", "warm_start", str),
+    ("warm_start_eps_start", "warm_start_eps_start", float),
+)
+
+
+def _config_from_args(args: Any) -> TrainConfig:
+    """Build the run's :class:`TrainConfig` from parsed CLI args.
+
+    Always stamps ``seed`` / ``arenas`` / ``opponent`` (they have real argparse
+    defaults); applies every entry of :data:`_CONFIG_OVERRIDE_FLAGS` only when the
+    flag was actually passed, so an omitted flag keeps the dataclass default
+    rather than re-declaring it in two places.
+
+    ``TrainConfig.__post_init__`` validates the result, so a bad CLI value (a
+    mixture outside [0, 1], an unknown eval preset, an empty ``--warm-start``)
+    fails here — before a fleet is touched — with the field named.
+
+    Args:
+        args: The parsed argparse namespace.
+
+    Returns:
+        The validated config for this run.
+    """
+    import dataclasses
+
+    overrides: Dict[str, Any] = {
+        "seed": int(args.seed),
+        "arenas": int(args.arenas),
+        "opponent": str(args.opponent),
+    }
+    for dest, field_name, cast in _CONFIG_OVERRIDE_FLAGS:
+        value = getattr(args, dest, None)
+        if value is not None:
+            overrides[field_name] = cast(value)
+    return dataclasses.replace(TrainConfig(), **overrides)
+
+
+def _resolve_stop_on_pass(explicit: Optional[bool], cfg: TrainConfig) -> bool:
+    """Resolve ``--stop-on-pass`` / ``--no-stop-on-pass``, defaulting by opponent.
+
+    An explicit flag always wins. With neither, the default is ``True`` for the
+    dummy (today's M2 behavior, unchanged) and ``False`` for the scripted
+    opponent.
+
+    The asymmetry is not a preference, it is what the gate MEANS. ``passed_m2``
+    is AC6's gate: >= 95% win rate **against the stationary dummy**. A retrain
+    whose eval fights a moving opponent that clears the same arithmetic has not
+    certified M2, so stopping the night on it ends a multi-hour run early on a
+    verdict about a different opponent — and a warm-started agent can clear it in
+    its very first eval, reporting success minutes in having learned nothing.
+
+    Args:
+        explicit: The parsed flag (``None`` when neither form was given).
+        cfg: The run config, read for ``cfg.opponent``.
+
+    Returns:
+        Whether the run stops as soon as an eval clears the M2 gate.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return cfg.opponent == "dummy"
+
+
+def _best_checkpoint_path(
+    checkpoint: Optional[str], explicit: Optional[str]
+) -> Optional[str]:
+    """Return where the SAVE-BEST checkpoint goes (``None`` == no best save).
+
+    An explicit ``--best-checkpoint`` wins; otherwise it is derived from
+    ``--checkpoint`` by inserting ``.best`` before the extension
+    (``runs/m3.pt`` -> ``runs/m3.best.pt``). Deriving rather than sharing is the
+    point: the periodic/final hook rewrites ``--checkpoint`` on a cadence, so a
+    best net saved to the same path survives only until the next periodic save —
+    which is selection by recency with extra steps.
+    """
+    if explicit:
+        return explicit
+    if not checkpoint:
+        return None
+    import os
+
+    root, ext = os.path.splitext(checkpoint)
+    return f"{root}.best{ext or '.pt'}"
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2665,13 +3351,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Honor the CLI seed by replacing it on the frozen config. For N>1 also stamp the
     # arena count onto the (frozen) config so the multi-arena stack reads it. The
-    # opponent source is stamped the same way (TrainConfig validates the choice).
-    cfg = dataclasses.replace(
-        TrainConfig(),
-        seed=int(args.seed),
-        arenas=int(args.arenas),
-        opponent=str(args.opponent),
-    )
+    # opponent source, the curriculum knobs, the eval opponent and the warm start
+    # are stamped the same way (TrainConfig validates every one of them).
+    cfg = _config_from_args(args)
 
     # Refuse the one combination that cannot be honored, before anything starts:
     # the single-arena loop steps no opponent policy, so --opponent scripted there
@@ -2711,11 +3393,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_episodes": args.max_episodes,
             "eval_episodes": args.eval_episodes,
             "code_version": code_version(),
+            # The run's own record of the knobs that decide what it learns and
+            # what its win rate means. `code_version` cannot stand in for any of
+            # them (same reasoning as the reward coefficients below).
+            "opponent_mix_easy": cfg.opponent_mix_easy,
+            "opponent_mix_easy_after": cfg.opponent_mix_easy_after,
+            "opponent_gate_winrate": cfg.opponent_gate_winrate,
+            "opponent_gate_window": cfg.opponent_gate_window,
+            "eval_opponent_preset": cfg.eval_opponent_preset,
+            "warm_start": cfg.warm_start,
+            "eps_start_effective": effective_eps_start(cfg),
+            "eps_end": cfg.eps_end,
+            "eps_decay_episodes": cfg.eps_decay_episodes,
             **reward_cfg,
         },
     )
 
     checkpoint_path = args.checkpoint
+    best_checkpoint_path = _best_checkpoint_path(
+        checkpoint_path, getattr(args, "best_checkpoint", None)
+    )
 
     def _save_checkpoint(trainer: "Trainer", grad_step: int) -> None:
         if checkpoint_path is None:
@@ -2729,6 +3426,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             checkpoint_path,
         )
 
+    def _save_best_checkpoint(
+        trainer: "Trainer", grad_step: int, meta: Mapping[str, Any]
+    ) -> None:
+        """Write the SAVE-BEST net, stamped with the eval that justified it."""
+        if best_checkpoint_path is None:
+            return
+        torch.save(
+            {
+                "model": trainer.online.state_dict(),
+                "grad_step": grad_step,
+                "code_version": code_version(),
+                # Freeze day has to know WHAT this file scored and against WHOM;
+                # a bare state_dict is how a run's provenance gets lost.
+                **dict(meta),
+            },
+            best_checkpoint_path,
+        )
+
     # N>1 dispatches to the multi-arena live run; N=1 falls through to TODAY'S EXACT
     # single-arena path below (untouched so M2/TC8b cannot regress, AC1/TC15).
     if int(args.arenas) > 1:
@@ -2738,6 +3453,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cfg,
                 logger=logger,
                 checkpoint_hook=_save_checkpoint if checkpoint_path else None,
+                best_checkpoint_hook=(
+                    _save_best_checkpoint if best_checkpoint_path else None
+                ),
             )
         finally:
             logger.close()
@@ -2753,6 +3471,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_grad_steps=args.max_grad_steps,
             eval_every_episodes=args.eval_every_episodes,
             eval_episodes=args.eval_episodes,
+            stop_on_pass=_resolve_stop_on_pass(
+                getattr(args, "stop_on_pass", None), cfg
+            ),
             logger=logger,
             checkpoint_hook=_save_checkpoint if checkpoint_path else None,
             is_live=True,
@@ -2787,6 +3508,7 @@ def _main_multi_arena(
     *,
     logger: Any,
     checkpoint_hook: Optional[CheckpointHook],
+    best_checkpoint_hook: Optional[BestCheckpointHook] = None,
 ) -> int:
     """Live multi-arena (N>1) run: wire real clients + the subprocess launcher.
 
@@ -2881,6 +3603,14 @@ def _main_multi_arena(
         )
         return 1
 
+    # AC18's last inch. The dummy is knockback-immune and speed-pinned by the
+    # datapack; the bridge undoes both ONLY when it is launched with
+    # `--dummy-knockback-immune false`, and nothing was ever passing that. A
+    # scripted-opponent run against an immune, speed-0 bot trains against a
+    # target that cannot be knocked back and (on a minecraft-data bump) cannot
+    # walk — with clean logs the whole way.
+    dummy_knockback_immune = cfg.opponent == "dummy"
+
     # The shutdown signal must exist BEFORE the launcher: the launcher takes its
     # polling sleep as a constructor argument, and that sleep is the only hook that
     # can interrupt its bounded wait from outside.
@@ -2889,6 +3619,7 @@ def _main_multi_arena(
         bridge_base_port=base_port,
         mc_port=mc_port,
         sleep=launcher_shutdown.sleep,
+        dummy_knockback_immune=dummy_knockback_immune,
     )
 
     def _log(message: str) -> None:
@@ -2896,6 +3627,21 @@ def _main_multi_arena(
         # console encode crash mid-run (recorded gotcha).
         safe = message.encode("ascii", "backslashreplace").decode("ascii")
         print(safe, file=sys.stderr, flush=True)
+
+    if not dummy_knockback_immune:
+        # This launcher only ever spawns a REPLACEMENT bridge for a pad that
+        # died. The pads this run connects to were booted by
+        # server/setup/start-pads.sh, which does not pass the flag — so say so
+        # here rather than let a whole night train against immune opponents on
+        # the strength of a kwarg that only covers relaunches.
+        _log(
+            "[multi] opponent=scripted: relaunched bridges get "
+            "--dummy-knockback-immune false. The pads booted BEFORE this run were "
+            "not launched by this process - boot the fleet with "
+            "DUMMY_KNOCKBACK_IMMUNE=false or the opponents already running stay "
+            "knockback-immune and speed-pinned (AC18). Verify by hitting one and "
+            "watching it move; the datapack's tellraw cannot be trusted for this."
+        )
 
     result = train_multi_arena(
         cfg,
@@ -2905,8 +3651,13 @@ def _main_multi_arena(
         max_grad_steps=args.max_grad_steps,
         eval_every_grad_steps=args.eval_every_grad_steps,
         eval_episodes=args.eval_episodes,
+        stop_on_pass=_resolve_stop_on_pass(getattr(args, "stop_on_pass", None), cfg),
+        checkpoint_every_grad_steps=getattr(
+            args, "checkpoint_every_grad_steps", None
+        ),
         logger=logger,
         checkpoint_hook=checkpoint_hook,
+        best_checkpoint_hook=best_checkpoint_hook,
         is_live=True,
         log=_log,
         # Tier 2: the shared JVM, on the same port the launcher just got. The host
@@ -2922,13 +3673,25 @@ def _main_multi_arena(
     _log(
         f"[multi done] reason={result.stop_reason} "
         f"episodes={result.episodes_received} grad_steps={result.grad_steps} "
-        f"passed_m2={result.passed_m2}"
+        f"passed_m2={result.passed_m2} checkpoints_saved={result.checkpoints_saved}"
     )
     if report is not None:
         _log(
             f"  last eval: win_rate={report.win_rate:.3f} "
             f"mean_len={report.mean_episode_length:.1f} "
             f"aim_invisible={report.aim_while_invisible:.3f}"
+        )
+    # WHICH FILE TO SHIP. Printed at the end of the run because freeze day picks a
+    # checkpoint from this line, not from file mtimes.
+    if result.best_grad_step >= 0:
+        _log(
+            f"  best checkpoint: win_rate={result.best_win_rate:.3f} vs "
+            f"{result.eval_opponent} at grad_step {result.best_grad_step}"
+        )
+    elif result.reports:
+        _log(
+            f"  no best checkpoint: no eval vs {result.eval_opponent} won a single "
+            "episode, so the latest periodic/final checkpoint is all there is"
         )
     return 0 if result.passed_m2 else 1
 
