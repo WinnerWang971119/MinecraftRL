@@ -77,7 +77,7 @@ const {
   MacroExecutor,
 } = require('./actions');
 
-const { validateOutbound } = require('./transport');
+const { validateOutbound, encodeMessage } = require('./transport');
 const { buildEventsBlock, assembleStateMsg, ArenaBots, ACTION_REPEAT } = require('./bot');
 // Recorder spies live in the shared testkit so a change to the EventAggregator
 // recorder surface cannot be applied here and silently missed in bot.test.js.
@@ -531,6 +531,59 @@ test('assembleStateMsg tolerates an empty/not-ready snapshot and still validates
   assert.doesNotThrow(() => validateOutbound(msg));
   assert.deepEqual(msg.self.pos, [0, 0, 0]);
   assert.equal(msg.self.held_item, '');
+});
+
+// ---------------------------------------------------------------------------
+// THE SWING REPORT (T11b) — assembleStateMsg's optional `opp_action_executed`.
+//
+// The whole point of the field being OPTIONAL is that the M1/M2 dummy path's
+// encoded line is unchanged: absent means "no opp_action was sent, assume any
+// swing fired" (bridge/schema.md, the swing-report table). A key emitted
+// unconditionally — even as null — would rewrite every state line the
+// stationary-dummy path has ever produced, so the omission is asserted on the
+// ENCODED bytes and not only on the object.
+// ---------------------------------------------------------------------------
+
+/** The minimal, schema-valid parts every assembleStateMsg case below shares. */
+function stateParts(extra = {}) {
+  return {
+    self: {},
+    opponent: {},
+    events: new EventAggregator().drain(),
+    wallDistances: [8, 8, 8, 8],
+    tick: 4,
+    codeVersion: 'test-stamp',
+    ...extra,
+  };
+}
+
+test('assembleStateMsg OMITS opp_action_executed when no opponent action was requested', () => {
+  for (const parts of [stateParts(), stateParts({ oppActionExecuted: null })]) {
+    const msg = assembleStateMsg(parts);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(msg, 'opp_action_executed'),
+      false,
+      'the key is absent, not null',
+    );
+    assert.equal(
+      encodeMessage(msg).includes('opp_action_executed'),
+      false,
+      'and absent from the bytes on the wire',
+    );
+    assert.doesNotThrow(() => validateOutbound(msg));
+  }
+});
+
+test('assembleStateMsg carries the swing report verbatim when it is a boolean', () => {
+  for (const executed of [true, false]) {
+    const msg = assembleStateMsg(stateParts({ oppActionExecuted: executed }));
+    assert.equal(msg.opp_action_executed, executed);
+    assert.doesNotThrow(() => validateOutbound(msg), 'the optional key is schema-valid');
+    // Appended after code_version, so the fields that were already on the wire
+    // keep their order (JSON.stringify emits insertion order).
+    const keys = Object.keys(msg);
+    assert.equal(keys[keys.length - 1], 'opp_action_executed');
+  }
 });
 
 // ===========================================================================
