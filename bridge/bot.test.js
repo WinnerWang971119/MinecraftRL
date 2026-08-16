@@ -999,6 +999,42 @@ test('a stale read-back wait does NOT close the window a retry already opened', 
   );
 });
 
+test('a superseded read-back wait logs NOTHING, even though its own `seen` never fills', async () => {
+  // Same supersession as the test above, but pinning the OTHER half of the
+  // contract: the identity-guarded finally keeps the stale handler from
+  // closing the retry's window, but that alone does not stop the stale
+  // handler from walking its own (permanently empty) `seen` map afterward and
+  // printing two false "NOT confirmed" lines — on the exact line RUNBOOK Step
+  // 2c tells the operator to trust as the confirmation. The prior test does
+  // not capture console.error, so it passes whether or not those false lines
+  // print; this one binds it.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 30 });
+  const retryWindow = new Map();
+  const realChat = arena.dummy.chat;
+  arena.dummy.chat = (cmd) => {
+    realChat(cmd);
+    if (typeof cmd === 'string' && cmd.endsWith('base get')) {
+      arena._attributeReadback = retryWindow;
+      arena._resetEpoch += 1; // the retry owns the episode now
+    }
+  };
+
+  const errors = await withCapturedErrors(() =>
+    arena.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.ok(
+    arena.dummy.chatLog.some((cmd) => cmd.endsWith('base get')),
+    'the read-back must actually have been reached, or this proves nothing',
+  );
+  assert.deepEqual(
+    errors,
+    [],
+    'a superseded handler must log nothing — the retry, not this handler, speaks for this reset',
+  );
+});
+
 test('the read-back rides the beacon channel WITHOUT disturbing it', async () => {
   // Both live on the dummy's `message` events. The beacon is matched on exact
   // text and the read-back structurally, so neither can consume the other's
