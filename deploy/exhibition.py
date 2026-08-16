@@ -8,9 +8,9 @@ coordinates so a classmate can join and find the arena without being talked
 through it.
 
 ``python -m deploy.exhibition --reset`` is the SEPARATE between-challengers
-command (T6): it heals and repositions both sides, arms the next challenger and
-re-drives play — once per invocation, never by itself. See "THE RESET COMMAND"
-below.
+command (T6): it heals, repositions and re-arms both sides (one iron sword
+each), hands the slot to the next challenger and re-drives play — once per
+invocation, never by itself. See "THE RESET COMMAND" below.
 
 This module deliberately does the ORDERING ``server/setup/start-pads.sh``
 already gets right — preflight gates before anything is spawned, write
@@ -96,13 +96,18 @@ discarded at startup for the same reason.
 
 THE HUMAN SIDE. ``formatHumanResetCommands`` (``bridge/bot.js``) resets the
 LEARNER only; the datapack has no template for a challenger, and the wire has no
-slot for one. That is invisible in the common case — a human who DIES respawns
-at full health — but a match ending in the AGENT's death leaves the human
-carrying partial health into the next round, i.e. it goes wrong exactly when
-somebody has just beaten the AI in front of a room. The only command channel
-this process can reach is Paper's own console, so ``run()`` starts Paper with a
-stdin PIPE and writes the heal/reposition lines into it
-(:func:`human_reset_commands`, mirroring the dummy's datapack template).
+slot for one. Two things go wrong without a human-side reset. Health is the
+quiet one: it is invisible in the common case — a human who DIES respawns at
+full health — but a match ending in the AGENT's death leaves the human carrying
+partial health into the next round, i.e. it goes wrong exactly when somebody has
+just beaten the AI in front of a room. GEAR is the loud one: the datapack hands
+the learner a fresh iron sword every reset and nothing in the stack ever armed
+the challenger, so a bare fist (1 damage) faced an iron sword (6). The only
+command channel this process can reach is Paper's own console, so ``run()``
+starts Paper with a stdin PIPE and writes the heal, reposition and re-arm lines
+into it (:func:`human_reset_commands`). Re-arming is idempotent by construction
+(a sword-scoped ``clear`` before the ``give``), so a broken sword fixes itself
+at the next reset and repeated resets never pile swords up.
 Best-effort by construction: every command is echoed to the exhibition log, a
 write failure is reported with the commands that did not run, and
 ``--no-paper-console`` turns the channel off. It needs a PINNED
@@ -247,6 +252,15 @@ PAD_SPAWN_Y = 64
 #: own template is the mirror image, -90. The two must stay opposite or both
 #: fighters spawn pointing the same way.
 CHALLENGER_SPAWN_YAW = 90
+
+#: The challenger's weapon, and the whole of their gear. Mirrors the LEARNER's
+#: line -- ``$give $(learner) minecraft:iron_sword 1`` in
+#: ``spawn_learner_pad.mcfunction`` -- because the fight has to be symmetric:
+#: the agent is re-armed on every reset, so a barehanded human is 1 damage
+#: against 6. NOT the dummy's template, which gives its opponent nothing at all.
+#: No armor: the checkpoint never trained against an armored opponent, so armor
+#: is deliberately out of scope rather than merely forgotten.
+CHALLENGER_WEAPON = "minecraft:iron_sword"
 
 
 def _ascii_log(message: str) -> None:
@@ -553,24 +567,43 @@ def reset_command_hint(log_dir: Path) -> str:
 
 
 def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[str]:
-    """Paper CONSOLE lines that heal and reposition the human challenger.
+    """Paper CONSOLE lines that heal, reposition and re-arm the human
+    challenger.
 
-    Mirrors the dummy's datapack template (``spawn_dummy_pad.mcfunction``)
-    applied to a player instead of a bot: teleport to the opponent slot facing
-    the learner, clear leftover effects, then restore health and food. Same
-    amplifiers (``instant_health 1 9``, ``saturation 1 19``), same
-    clear-then-give ORDER — an instant effect is applied on its first tick, so a
-    clear issued afterwards can strip it before it ever lands, which is the bug
-    that ordering exists to remove.
+    Two datapack templates, not one, because the human is the dummy's
+    understudy in position and the learner's equal in gear:
 
-    Deliberately NOT included, and both are for T15's runbook rather than
-    silent omissions: no ``clear`` (taking a person's items is not "heal and
-    reposition"), and no ``give`` of a weapon (the datapack gives the dummy none
-    either, and a per-reset give would pile up swords in the human's inventory).
+    * HEAL AND REPOSITION mirror the dummy's template
+      (``spawn_dummy_pad.mcfunction``) applied to a player instead of a bot:
+      teleport to the opponent slot facing the learner, clear leftover effects,
+      then restore health and food. Same amplifiers (``instant_health 1 9``,
+      ``saturation 1 19``), same clear-then-give ORDER — an instant effect is
+      applied on its first tick, so a clear issued afterwards can strip it
+      before it ever lands, which is the bug that ordering exists to remove.
+    * GEAR mirrors the LEARNER's template instead
+      (``spawn_learner_pad.mcfunction``'s ``$give $(learner)
+      minecraft:iron_sword 1``), because the agent is re-armed with a fresh
+      iron sword on EVERY reset and a barehanded challenger swings for 1 damage
+      against 6. The dummy's template is the wrong model for this one line: it
+      arms its opponent with nothing, which is right for a passive training
+      target and wrong for a person. One sword and no armor — the checkpoint
+      never trained against an armored opponent, so armor is out of scope.
+
+    THE GEAR CLEAR IS SCOPED TO THE SWORD, AND THAT IS THE WHOLE MECHANISM. A
+    bare ``give`` really would pile a sword per reset into the challenger's
+    inventory; ``clear <name> minecraft:iron_sword`` immediately before it makes
+    the pair idempotent, so any number of resets leaves exactly one sword at
+    full durability and a broken sword fixes itself at the next reset. Do NOT
+    "simplify" it back to a lone ``give``, and do NOT widen it to a blanket
+    ``clear`` (which the dummy's template does use): taking a person's unrelated
+    items is not part of heal-and-reposition, and the narrow clear is the only
+    part that has to be there.
 
     NO LEADING SLASH. These go to the server console, whose commands are
-    slash-free — unlike ``formatHumanResetCommands``' output, which the bridge
-    feeds to ``bot.chat()`` and which therefore must keep its ``/``.
+    slash-free. ``formatHumanResetCommands`` (``bridge/bot.js``) is NOT a mirror
+    of this list — it resets the LEARNER, and the learner's own sword arrives
+    through the ``arena:spawn_learner_pad`` call inside it — but its output does
+    keep a ``/`` because the bridge feeds it to ``bot.chat()``.
 
     Raises:
         ValueError: on a username that is not a Minecraft username, or a pad
@@ -603,6 +636,11 @@ def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[st
         f"effect clear {challenger_username}",
         f"effect give {challenger_username} minecraft:instant_health 1 9 true",
         f"effect give {challenger_username} minecraft:saturation 1 19 true",
+        # Scoped clear THEN give: see the docstring. The clear is what keeps
+        # this idempotent across an evening of resets; the give is what makes
+        # the fight symmetric.
+        f"clear {challenger_username} {CHALLENGER_WEAPON}",
+        f"give {challenger_username} {CHALLENGER_WEAPON} 1",
     ]
 
 
@@ -1173,36 +1211,43 @@ def _reset_human_side(
     paper_console: bool,
     log: Callable[[str], None] = _ascii_log,
 ) -> bool:
-    """Heal and reposition the human before the next match. True iff it ran.
+    """Heal, reposition and re-arm the human before the next match. True iff it
+    ran.
 
     The learner's half of the reset is the bridge's job and happens inside
-    :func:`play_one_match`'s ``env.reset()``; this is the half nothing else
-    covers. Never fatal — an unhealed challenger is a worse match, a crashed
-    launcher is no match at all — but never silent either: every path that
-    cannot heal says so and prints what would have run.
+    :func:`play_one_match`'s ``env.reset()`` — sword included, via the
+    datapack. This is the half nothing else covers. Never fatal — an unhealed,
+    unarmed challenger is a worse match, a crashed launcher is no match at all
+    — but never silent either: every path that cannot run these says so and
+    prints what would have run.
     """
     if challenger_username is None:
         log(
-            "NOT healing or repositioning the human: no --challenger-username "
-            "was pinned, and nothing on the wire tells this process who "
-            "claimed the challenger slot (the state message has no field for "
-            "it). If the last match ended in the AGENT's death, your "
-            "challenger starts this one on whatever health they had left. "
-            "Restart the exhibition with --challenger-username <name> to fix "
-            "it for the rest of the demo."
+            "NOT healing or repositioning the human, and NOT arming them: no "
+            "--challenger-username was pinned, and nothing on the wire tells "
+            "this process who claimed the challenger slot (the state message "
+            "has no field for it). Your challenger gets no iron sword, so they "
+            "fight the agent's sword bare-fisted; and if the last match ended "
+            "in the AGENT's death, they start this one on whatever health they "
+            "had left. Restart the exhibition with --challenger-username "
+            "<name> to fix it for the rest of the demo."
         )
         return False
     commands = human_reset_commands(anchor, challenger_username)
     if not paper_console:
         log(
-            "--no-paper-console: not healing or repositioning "
-            f"{challenger_username}. Run these from an opped account if the "
-            "last match ended in the AGENT's death:"
+            "--no-paper-console: not healing, repositioning or arming "
+            f"{challenger_username}. Run these from an opped account before "
+            "the next match -- the gear lines matter every time, the heal "
+            "only if the last match ended in the AGENT's death:"
         )
         for command in commands:
             log(f"  {command}")
         return False
-    log(f"healing and repositioning {challenger_username} via the Paper console.")
+    log(
+        f"healing, repositioning and arming {challenger_username} via the "
+        "Paper console."
+    )
     return send_paper_console_commands(paper_proc, commands, log=log)
 
 
@@ -1230,8 +1275,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "ARM THE NEXT CHALLENGER in an exhibition that is already running, "
-            "then exit. Heals and repositions both fighters, releases the "
-            "challenger slot and plays exactly ONE more match -- one reset "
+            "then exit. Heals, repositions and re-arms both fighters (one iron "
+            "sword each), releases the challenger slot and plays exactly ONE "
+            "more match -- one reset "
             "command, one match, never automatic. Starts nothing and never "
             "connects to the bridge (a second TCP client would evict the "
             "running agent); it hands a request file to the live launcher, "
@@ -1244,8 +1290,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help=(
             "do NOT open a console pipe to Paper. The pipe is how a reset "
-            "heals and repositions the HUMAN (the datapack resets the learner "
-            "only), so turning it off means a challenger who beat the agent "
+            "heals, repositions and arms the HUMAN (the datapack resets the "
+            "learner only), so turning it off means an unarmed challenger "
+            "against the agent's iron sword, and one who beat the agent "
             "carries their leftover health into the next match; the commands "
             "are printed instead. An escape hatch, not a default."
         ),
