@@ -409,6 +409,16 @@ class SubprocessArenaLauncher:
         mc_port: The shared Minecraft port every bridge connects to. Default 25565.
         bridge_base_port: Bridge port base; pad ``i`` uses ``base + i``. Default 5555.
         node: The Node executable (resolved on PATH).
+        dummy_knockback_immune: Whether each pad's dummy bot stays the M2 stationary
+            target. ``True`` (the default) emits NO flag at all, so the argv -- and
+            therefore the bridge's behavior -- is byte-identical to before this
+            keyword existed. ``False`` appends ``--dummy-knockback-immune false``,
+            which makes the bridge undo the datapack's knockback-resistance and
+            movement-speed pins after every confirmed reset. That is the ONLY way
+            AC18 is reachable in a real run: the exhibition path runs with a human
+            opponent, where the bridge's override branch never fires, so a scripted
+            opponent that can be knocked back and can walk exists on the TRAINING
+            path or nowhere.
         bridge_ready_timeout_seconds / bridge_ready_poll_seconds: Bounded wait for a
             freshly spawned bridge's port to accept a connection (the join gate).
         bridge_port_free_timeout_seconds: Shorter bound on waiting for a dying
@@ -429,6 +439,7 @@ class SubprocessArenaLauncher:
         mc_port: int = _DEFAULT_MC_PORT,
         bridge_base_port: int = _DEFAULT_BRIDGE_BASE_PORT,
         node: str = _DEFAULT_NODE,
+        dummy_knockback_immune: bool = True,
         bridge_ready_timeout_seconds: float = _DEFAULT_BRIDGE_READY_TIMEOUT_SECONDS,
         bridge_ready_poll_seconds: float = _DEFAULT_BRIDGE_READY_POLL_SECONDS,
         bridge_port_free_timeout_seconds: float = _DEFAULT_BRIDGE_PORT_FREE_TIMEOUT_SECONDS,
@@ -443,6 +454,16 @@ class SubprocessArenaLauncher:
         self._mc_port = int(mc_port)
         self._bridge_base_port = int(bridge_base_port)
         self._node = node
+        # Validated, not coerced: `bool("false")` is True, and a launcher that
+        # forwarded a string here would silently keep every dummy immune while the
+        # caller believed otherwise -- the exact silent failure this flag exists to
+        # end. run.js applies the same strictness to the flag value itself.
+        if not isinstance(dummy_knockback_immune, bool):
+            raise TypeError(
+                "dummy_knockback_immune must be a bool, got "
+                f"{dummy_knockback_immune!r} ({type(dummy_knockback_immune).__name__})"
+            )
+        self._dummy_knockback_immune = dummy_knockback_immune
         self._bridge_ready_timeout_seconds = float(bridge_ready_timeout_seconds)
         self._bridge_ready_poll_seconds = float(bridge_ready_poll_seconds)
         self._bridge_port_free_timeout_seconds = float(bridge_port_free_timeout_seconds)
@@ -471,6 +492,11 @@ class SubprocessArenaLauncher:
         is passed EXPLICITLY because run.js refuses to derive an anchor from an
         index -- defaulting it would stack pad i on pad 0. Usernames are passed
         explicitly too so the argv is self-describing in a process listing.
+
+        ``--dummy-knockback-immune`` is the one flag that is OMITTED at its default.
+        Every other value here is passed explicitly, but this one is appended only
+        when it is ``False``, so the default argv stays byte-identical to the one
+        every existing run (and ``test_bridge_argv_is_exact``) was built against.
         """
         anchor = pad_anchor(pad_index)
         bridge_port = self._bridge_base_port + pad_index
@@ -492,6 +518,8 @@ class SubprocessArenaLauncher:
             "--dummy-username",
             dummy_username,
         ]
+        if not self._dummy_knockback_immune:
+            bridge_command += ["--dummy-knockback-immune", "false"]
 
         return PadSpec(
             pad_index=pad_index,
@@ -686,6 +714,7 @@ def plan(
     bridge_base_port: int = _DEFAULT_BRIDGE_BASE_PORT,
     repo_root: Optional[str] = None,
     node: str = _DEFAULT_NODE,
+    dummy_knockback_immune: bool = True,
 ) -> List[Dict[str, object]]:
     """Build the per-pad launch plan WITHOUT constructing any live state.
 
@@ -708,6 +737,7 @@ def plan(
         mc_port=mc_port,
         bridge_base_port=bridge_base_port,
         node=node,
+        dummy_knockback_immune=dummy_knockback_immune,
     )
     return launcher.plan(n_pads)
 

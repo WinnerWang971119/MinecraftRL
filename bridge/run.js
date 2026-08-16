@@ -64,6 +64,12 @@ process.on('unhandledRejection', (reason) => {
  *   'padOrigin' "<x>,<z>" -> the padOriginX / padOriginZ pair;
  *   'padIndex'  a 0-based non-negative integer.
  *
+ * Three more kinds were added below the original four, each with its own
+ * parse* function and its own reason to be stricter than Number()/Boolean():
+ *   'opponentMode'        exactly "bot" or "human";
+ *   'challengerUsername'  a Minecraft username, no reserved values;
+ *   'boolean'             exactly "true" or "false".
+ *
  * Forwarded into ArenaBots(config) -> { ...DEFAULT_BOT_CONFIG, ...config }, so
  * the config keys here MUST match bot.js DEFAULT_BOT_CONFIG names exactly.
  */
@@ -88,6 +94,22 @@ const CONFIG_SPECS = Object.freeze([
     flag: '--challenger-username',
     env: 'CHALLENGER_USERNAME',
     kind: 'challengerUsername',
+  },
+  // PER-OPPONENT MOBILITY TOGGLE (T11c). Same story as the two above: bot.js
+  // has carried `dummyKnockbackImmune` since T11c's first half, but nothing a
+  // real run starts could set it — no flag, no env var, and
+  // distributed/launcher.py (the only thing that spawns training bridges)
+  // passed seven flags, none of them this. AC18 is only exercisable on the
+  // TRAINING path (exhibition runs opponentMode='human', where the override
+  // branch is keyed off `_opponentIsBot()` and never fires), so without this
+  // entry the scripted opponent stays knockback-immune and pinned to zero
+  // movement speed in every run that matters. Omitting it reproduces the
+  // training path exactly (true).
+  {
+    key: 'dummyKnockbackImmune',
+    flag: '--dummy-knockback-immune',
+    env: 'DUMMY_KNOCKBACK_IMMUNE',
+    kind: 'boolean',
   },
 ]);
 
@@ -228,6 +250,30 @@ function parseChallengerUsername(raw, source) {
 }
 
 /**
+ * Parse a boolean flag/env value: exactly `true` or `false` (T11c).
+ *
+ * Held to parseOpponentMode's case-sensitive strictness, and for the same
+ * reason — one canonical form, no silent fallback. The shell idioms a launcher
+ * might reach for (`1`, `0`, `yes`, `TRUE`, an empty string) are all REJECTED
+ * rather than guessed at: the dangerous direction is `--dummy-knockback-immune 0`
+ * being read as truthy, which would leave the scripted opponent immune and
+ * immobile for a whole overnight run while the argv says otherwise. (An empty
+ * ENV var is read as unset by parseBridgeConfig before it reaches here, so a
+ * launcher that always exports the variable can still say "use the default".)
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error.
+ * @returns {boolean} The parsed value.
+ */
+function parseBoolean(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  if (text !== 'true' && text !== 'false') {
+    throw new Error(`${source} must be "true" or "false", got ${showRaw(raw)}`);
+  }
+  return text === 'true';
+}
+
+/**
  * The bot usernames implied by a pad index.
  *
  * `i == 0` is DELIBERATELY `learner_bot` / `dummy_bot` and not `learner_0`, so
@@ -351,6 +397,8 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
       config[spec.key] = parseOpponentMode(raw, source);
     } else if (spec.kind === 'challengerUsername') {
       config[spec.key] = parseChallengerUsername(raw, source);
+    } else if (spec.kind === 'boolean') {
+      config[spec.key] = parseBoolean(raw, source);
     } else {
       // Hosts / usernames pass through as trimmed strings. Reject an
       // all-whitespace value rather than connecting a blank username.
@@ -407,6 +455,24 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
       `--challenger-username "${config.challengerUsername}" requires ` +
         `--opponent-mode ${OPPONENT_MODE_HUMAN} (a pinned challenger is read by nothing ` +
         `in "${OPPONENT_MODE_BOT}" mode, where the opponent is this pad's dummy bot)`,
+    );
+  }
+
+  // The mirror image of the check above, and inert in the same silent way: the
+  // override branch in handleReset is keyed on `_opponentIsBot()`, so asking for
+  // a knockback-able opponent in 'human' mode does NOTHING. A human already
+  // takes knockback and already walks — there is no dummy bot to un-pin — so an
+  // operator who passes this expecting an effect has misread the flag, and the
+  // exhibition would run with them believing they changed something.
+  //
+  // Only `false` is refused. `true` is the default: passing it explicitly in
+  // 'human' mode is redundant rather than a misunderstanding, and refusing it
+  // would break a launcher that always exports DUMMY_KNOCKBACK_IMMUNE=true.
+  if (config.dummyKnockbackImmune === false && config.opponentMode === OPPONENT_MODE_HUMAN) {
+    throw new Error(
+      `--dummy-knockback-immune false is read by nothing in "${OPPONENT_MODE_HUMAN}" mode ` +
+        '(there is no dummy bot to un-pin; a human challenger already takes knockback and ' +
+        'moves at normal speed) — drop the flag, or drop --opponent-mode',
     );
   }
 
@@ -498,5 +564,6 @@ module.exports = {
   parsePadIndex,
   parseOpponentMode,
   parseChallengerUsername,
+  parseBoolean,
   usernamesForPad,
 };

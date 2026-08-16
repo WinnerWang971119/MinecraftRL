@@ -33,6 +33,7 @@ const {
   parsePadIndex,
   parseOpponentMode,
   parseChallengerUsername,
+  parseBoolean,
   usernamesForPad,
 } = require('./run');
 
@@ -435,6 +436,124 @@ test('a pinned challenger with no --opponent-mode human is refused, not silently
   );
 });
 
+// ===========================================================================
+// PER-OPPONENT MOBILITY TOGGLE (T11c). bot.js has carried
+// `dummyKnockbackImmune` since T11c's first half, and — exactly like the
+// exhibition keys above — NOTHING wired it: no flag, no env var, and
+// distributed/launcher.py passed seven flags, none of them this. So AC18 ("the
+// scripted opponent takes knockback") was unreachable outside unit tests, and
+// the exhibition path cannot stand in for it: exhibition runs opponentMode
+// 'human', where the bridge's override branch never fires. Training is the
+// only path that can exercise it, and this is the flag that turns it on.
+// ===========================================================================
+
+test('parseBridgeConfig omits dummyKnockbackImmune when it is not given (the training default)', () => {
+  // ABSENT, not `true`: an omitted key falls through to DEFAULT_BOT_CONFIG,
+  // which is what keeps the no-flags path byte-identical to today.
+  assert.deepEqual(parseBridgeConfig([], {}), {});
+  assert.deepEqual(parseBridgeConfig([], { DUMMY_KNOCKBACK_IMMUNE: '' }), {});
+});
+
+test('parseBridgeConfig wires --dummy-knockback-immune through to ArenaBots', () => {
+  assert.deepEqual(parseBridgeConfig(['--dummy-knockback-immune', 'false'], {}), {
+    dummyKnockbackImmune: false,
+  });
+  assert.deepEqual(parseBridgeConfig(['--dummy-knockback-immune', 'true'], {}), {
+    dummyKnockbackImmune: true,
+  });
+  // The env form, and the CLI-wins precedence, matching every other spec.
+  assert.deepEqual(parseBridgeConfig([], { DUMMY_KNOCKBACK_IMMUNE: 'false' }), {
+    dummyKnockbackImmune: false,
+  });
+  assert.deepEqual(
+    parseBridgeConfig(['--dummy-knockback-immune', 'true'], { DUMMY_KNOCKBACK_IMMUNE: 'false' }),
+    { dummyKnockbackImmune: true },
+  );
+  // The `=` form parseFlags also accepts.
+  assert.deepEqual(parseBridgeConfig(['--dummy-knockback-immune=false'], {}), {
+    dummyKnockbackImmune: false,
+  });
+});
+
+test('parseBridgeConfig refuses the shell truthiness idioms rather than guessing', () => {
+  // The dangerous direction is `0`/`no` read as truthy: the operator's argv
+  // would say "this opponent takes knockback" while every episode of an
+  // overnight run trained against an immune, immobile dummy.
+  for (const bad of ['0', '1', 'yes', 'no', 'TRUE', 'False', '', 'on']) {
+    assert.throws(
+      () => parseBridgeConfig(['--dummy-knockback-immune', bad], {}),
+      /--dummy-knockback-immune must be "true" or "false"/,
+      `--dummy-knockback-immune ${bad} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => parseBridgeConfig([], { DUMMY_KNOCKBACK_IMMUNE: 'nope' }),
+    /DUMMY_KNOCKBACK_IMMUNE must be "true" or "false"/,
+  );
+});
+
+test('--dummy-knockback-immune false is refused in human mode, where it is read by nothing', () => {
+  // The mirror of the pinned-challenger rule above. handleReset's override
+  // branch is keyed on `_opponentIsBot()`, so in an exhibition this flag does
+  // NOTHING — and a human already takes knockback and already walks. An
+  // operator who passes it there has misread the flag.
+  assert.throws(
+    () => parseBridgeConfig(['--opponent-mode', 'human', '--dummy-knockback-immune', 'false'], {}),
+    /is read by nothing in "human" mode/,
+  );
+  // `true` is the default, so passing it explicitly is redundant rather than a
+  // misunderstanding — and refusing it would break a launcher that always
+  // exports the variable.
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', '--dummy-knockback-immune', 'true'], {}),
+    { opponentMode: 'human', dummyKnockbackImmune: true },
+  );
+  // The combination that matters is legal and needs no --opponent-mode at all:
+  // 'bot' is the default.
+  assert.deepEqual(parseBridgeConfig(['--dummy-knockback-immune', 'false'], {}), {
+    dummyKnockbackImmune: false,
+  });
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'bot', '--dummy-knockback-immune', 'false'], {}),
+    { opponentMode: 'bot', dummyKnockbackImmune: false },
+  );
+});
+
+test('the toggle composes with a full launcher argv without disturbing it', () => {
+  // The exact shape distributed/launcher.py emits for a non-immune pad.
+  assert.deepEqual(
+    parseBridgeConfig(
+      [
+        '--port',
+        '25565',
+        '--bridge-port',
+        '5556',
+        '--pad-index',
+        '1',
+        '--pad-origin',
+        '512,0',
+        '--learner-username',
+        'learner_1',
+        '--dummy-username',
+        'dummy_1',
+        '--dummy-knockback-immune',
+        'false',
+      ],
+      {},
+    ),
+    {
+      port: 25565,
+      bridgePort: 5556,
+      padIndex: 1,
+      padOriginX: 512,
+      padOriginZ: 0,
+      learnerUsername: 'learner_1',
+      dummyUsername: 'dummy_1',
+      dummyKnockbackImmune: false,
+    },
+  );
+});
+
 test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher and tests', () => {
   assert.deepEqual(parsePadOrigin('512,1024', '--pad-origin'), { x: 512, z: 1024 });
   assert.equal(parsePadIndex('7', '--pad-index'), 7);
@@ -445,4 +564,6 @@ test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher
   // No reserved values: this returns a username or throws, never null.
   assert.equal(parseChallengerUsername('auto', '--challenger-username'), 'auto');
   assert.equal(parseChallengerUsername('AUTO', '--challenger-username'), 'AUTO');
+  assert.equal(parseBoolean('false', '--dummy-knockback-immune'), false);
+  assert.equal(parseBoolean(' true ', '--dummy-knockback-immune'), true);
 });

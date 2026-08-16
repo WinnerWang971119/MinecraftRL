@@ -269,6 +269,50 @@ class TestPlan:
             "--dummy-username", "dummy_1",
         ]
 
+    def test_the_default_argv_carries_no_knockback_flag_at_all(self):
+        """T11c: the toggle must be INVISIBLE at its default.
+
+        Every other launch parameter is passed explicitly, but this one is
+        appended only when it is False. Emitting ``--dummy-knockback-immune true``
+        by default would change the argv every existing run was built against for
+        no behavioral gain.
+        """
+        for entry in plan(4):
+            assert "--dummy-knockback-immune" not in entry["bridge_command"]
+
+    def test_a_non_immune_fleet_appends_the_flag_to_every_pad(self):
+        """T11c/AC18: the ONLY way a scripted opponent can take knockback.
+
+        The exhibition path cannot stand in for this -- it runs with a human
+        opponent, where the bridge's override branch never fires -- so if the
+        flag does not reach the bridge argv here, ``knockback_immune=False``
+        reaches nothing at all and the retrain trains against an immune,
+        immobile target.
+        """
+        entries = plan(3, repo_root="/repo", dummy_knockback_immune=False)
+        for entry in entries:
+            argv = entry["bridge_command"]
+            assert argv[-2:] == ["--dummy-knockback-immune", "false"]
+        # The rest of the argv is untouched -- the flag is appended, not woven in.
+        assert entries[1]["bridge_command"][:-2] == [
+            "node",
+            "/repo/bridge/run.js",
+            "--port", "25565",
+            "--bridge-port", "5556",
+            "--pad-index", "1",
+            "--pad-origin", "512,0",
+            "--learner-username", "learner_1",
+            "--dummy-username", "dummy_1",
+        ]
+
+    def test_the_flag_must_be_a_real_bool(self):
+        # `bool("false")` is True, so a string forwarded from a config layer
+        # would silently keep every dummy immune while the caller believed it had
+        # turned the toggle off.
+        for bad in ["false", "true", 0, 1, None]:
+            with pytest.raises(TypeError):
+                SubprocessArenaLauncher(dummy_knockback_immune=bad)
+
     def test_every_pad_passes_an_explicit_anchor(self):
         # run.js makes `--pad-index i>0` without `--pad-origin` a hard startup
         # failure, because defaulting would stack pad i on pad 0.
@@ -334,6 +378,51 @@ def test_emitted_argv_round_trips_through_run_js(tmp_path):
         assert config["port"] == 25565
         assert config["learnerUsername"] == learner
         assert config["dummyUsername"] == dummy
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None or not (REPO_ROOT / "bridge" / "node_modules").is_dir(),
+    reason="node and bridge/node_modules are required to drive run.js's real parser",
+)
+def test_non_immune_argv_round_trips_through_run_js(tmp_path):
+    """T11c: the knockback flag must survive the same seam as every other flag.
+
+    Two halves that can drift silently: launcher.py writes the flag name and
+    value, run.js's CONFIG_SPECS decides which names exist and what values they
+    accept (strictly -- ``0``/``yes`` are hard startup failures). If they ever
+    disagree the bridge would refuse to start on a scripted-opponent run, or --
+    worse, if the name were merely unknown to a laxer parser -- start immune.
+    """
+    pads = 3
+    entries = plan(pads, repo_root=str(REPO_ROOT), dummy_knockback_immune=False)
+    argvs = [entry["bridge_command"][2:] for entry in entries]  # drop node + run.js
+    script = tmp_path / "check.js"
+    script.write_text(
+        "const { parseBridgeConfig } = require(process.argv[2]);\n"
+        "const argvs = JSON.parse(process.argv[3]);\n"
+        "const out = argvs.map((a) => parseBridgeConfig(a, {}));\n"
+        "process.stdout.write(JSON.stringify(out));\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "node",
+            str(script),
+            str(REPO_ROOT / "bridge" / "run.js"),
+            json.dumps(argvs),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert len(parsed) == pads
+    for config in parsed:
+        # A real JSON false, not the string "false": run.js coerced it, so the
+        # ArenaBots constructor's boolean check will pass rather than throw.
+        assert config["dummyKnockbackImmune"] is False
 
 
 # ---------------------------------------------------------------------------
