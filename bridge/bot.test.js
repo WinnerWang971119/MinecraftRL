@@ -69,7 +69,19 @@ const {
   formatHumanResetCommands,
   formatSetupPadCommand,
   formatDeathObjectiveCommands,
+  formatKnockbackResistanceCommand,
+  formatMovementSpeedCommand,
+  formatAttributeGetCommand,
   RL_DEATHS_OBJECTIVE,
+  KNOCKBACK_RESISTANCE_ATTRIBUTE,
+  KNOCKBACK_RESISTANCE_IMMUNE_VALUE,
+  KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE,
+  MOVEMENT_SPEED_ATTRIBUTE,
+  MOVEMENT_SPEED_STATIONARY_VALUE,
+  MOVEMENT_SPEED_MOBILE_VALUE,
+  ATTRIBUTE_GET_TRANSLATE_KEY,
+  KNOCKBACK_RESISTANCE_NAME_KEY,
+  MOVEMENT_SPEED_NAME_KEY,
 } = require('./bot');
 // The REAL executor and the REAL weapon period drive the cooldown tests below:
 // MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
@@ -196,6 +208,84 @@ function answerResetLikeTheServer(arena, { delayMs = 5 } = {}) {
 /** The exact shape of the reset macro call the fixture answers. */
 const RESET_PAD_CALL =
   /^\/function arena:reset_pad \{x:(\d+),z:(\d+),learner:"([A-Za-z0-9_]+)",dummy:"([A-Za-z0-9_]+)",nonce:(\d+)\}$/;
+
+/** The shape of the read-back the override issues (T11c). */
+const ATTRIBUTE_GET_CALL = /^\/attribute ([A-Za-z0-9_]+) (\S+) base get$/;
+
+/**
+ * The REAL prismarine-chat renderer, at the pinned protocol version, so the
+ * `/attribute ... base get` fixture below builds its reply exactly the way
+ * mineflayer will hand one to `_onBotMessage` — a ChatMessage, not a
+ * hand-rolled object with a convenient toString(). A stand-in here would be a
+ * fake more capable than the client (nothing would then prove the bridge can
+ * read `with[2]` out of a JSON *number*), which is the failure mode this
+ * suite's other fixtures are written to avoid. It costs ~90 ms to load;
+ * mineflayer itself is never required by these tests.
+ */
+const ChatMessage = require('prismarine-chat')('1.21.1');
+
+/**
+ * The attribute-id -> description-id mapping the SERVER applies. Verified
+ * against server/versions/1.21.1/paper-1.21.1.jar: AttributeCommand's
+ * `getAttributeDescription` is `Component.translatable(attr.getDescriptionId())`
+ * and 1.21.1's Attributes registers those ids as `attribute.name.generic.*`.
+ */
+const ATTRIBUTE_NAME_KEYS = Object.freeze({
+  [KNOCKBACK_RESISTANCE_ATTRIBUTE]: KNOCKBACK_RESISTANCE_NAME_KEY,
+  [MOVEMENT_SPEED_ATTRIBUTE]: MOVEMENT_SPEED_NAME_KEY,
+});
+
+/**
+ * Answer the override's `/attribute ... base get` on the DUMMY's connection the
+ * way Paper does (T11c).
+ *
+ * The component is the one AttributeCommand.getAttributeBase builds:
+ * `Component.translatable("commands.attribute.base_value.get.success",
+ *   getAttributeDescription(attr), entity.getName(), Double.valueOf(v))` — so
+ * the value rides as a JSON NUMBER, not a string, which is exactly why the
+ * bridge compares numerically instead of textually (`base set 0.0` comes back
+ * through JSON.parse as `0`).
+ *
+ * Delivered on a timer for the same TIMING FIDELITY reason
+ * `answerResetLikeTheServer` documents: a reply is a round trip and cannot land
+ * inside the synchronous span of the command that asked for it.
+ *
+ * @param {object} arena An ArenaBots with an EventEmitter dummy.
+ * @param {object} [opts]
+ * @param {Record<string, number>} [opts.values] Override what the server reports
+ *   per attribute id; defaults to the values the override actually sets.
+ * @param {string[]} [opts.silentFor] Attribute ids to answer with NOTHING.
+ * @param {number} [opts.delayMs]
+ */
+function answerAttributeGetsLikeTheServer(arena, { values = {}, silentFor = [], delayMs = 2 } = {}) {
+  const applied = {
+    [KNOCKBACK_RESISTANCE_ATTRIBUTE]: Number(KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE),
+    [MOVEMENT_SPEED_ATTRIBUTE]: Number(MOVEMENT_SPEED_MOBILE_VALUE),
+    ...values,
+  };
+  const inner = arena.dummy.chat;
+  arena.dummy.chat = (cmd) => {
+    inner(cmd);
+    const parsed = ATTRIBUTE_GET_CALL.exec(typeof cmd === 'string' ? cmd : '');
+    if (parsed === null) {
+      return;
+    }
+    const [, username, attribute] = parsed;
+    if (silentFor.includes(attribute)) {
+      return;
+    }
+    const nameKey = ATTRIBUTE_NAME_KEYS[attribute];
+    setTimeout(() => {
+      arena.dummy.emit(
+        'message',
+        new ChatMessage({
+          translate: ATTRIBUTE_GET_TRANSLATE_KEY,
+          with: [{ translate: nameKey }, { text: username }, applied[attribute]],
+        }),
+      );
+    }, delayMs);
+  };
+}
 
 /**
  * Read-back gate options that PARK the gate: `now` never advances (so the gate
@@ -531,6 +621,398 @@ test('handleReset issues ONE reset command, acks ok:true, then sends the initial
 });
 
 // ===========================================================================
+// PER-OPPONENT MOBILITY OVERRIDE (T11c). spawn_dummy_pad.mcfunction always
+// pins knockback_resistance to 1.0 AND movement_speed to 0.0 — right for the
+// M2 stationary dummy, wrong for a scripted opponent
+// (OpponentConfig.knockback_immune=False), which must be knockable AND able to
+// walk. These pin the bridge-side override handleReset issues instead of a new
+// macro key, and the read-back that proves the server accepted it.
+// ===========================================================================
+
+test('dummyKnockbackImmune defaults to true and handleReset then sends the dummy NOTHING (M2 byte-identical)', async () => {
+  const sent = [];
+  const bots = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
+  assert.equal(bots.dummyKnockbackImmune, true, 'the default must reproduce M2 exactly');
+  bots.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  bots.dummy = mockDummy();
+
+  await bots.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  assert.equal(sent[0].ok, true);
+  assert.deepEqual(
+    bots.learner.chatLog,
+    ['/function arena:reset_pad {x:0,z:0,learner:"learner_bot",dummy:"dummy_bot",nonce:1}'],
+    'still exactly the one reset macro',
+  );
+  assert.deepEqual(
+    bots.dummy.chatLog,
+    [],
+    'a true (immune) opponent needs no override: the datapack\'s own 1.0 already applies',
+  );
+});
+
+test('dummyKnockbackImmune=false makes handleReset un-pin BOTH attributes, via the DUMMY\'s own connection only (AC18)', async () => {
+  const sent = [];
+  const bots = new ArenaBots(
+    { dummyKnockbackImmune: false },
+    { transport: { send: (msg) => sent.push(msg) } },
+  );
+  bots.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
+  bots.dummy = mockDummy();
+
+  await bots.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  assert.equal(sent[0].ok, true);
+  // The learner's half is UNCHANGED — still the single reset_pad macro, same
+  // string, same count. A regression here would mean the toggle leaked into
+  // the byte-inert bot-mode path the plan explicitly protects.
+  assert.deepEqual(bots.learner.chatLog, [
+    '/function arena:reset_pad {x:0,z:0,learner:"learner_bot",dummy:"dummy_bot",nonce:1}',
+  ]);
+  // BOTH overrides ride the DUMMY's own connection, addressed to itself — never
+  // the learner's — so neither can be mistaken for a second reset-authority
+  // command. The movement half is NOT optional: the datapack pins the opponent
+  // to speed 0.0, and a ScriptedBot whose APPROACH/STRAFE/RETREAT do nothing is
+  // a stationary target wearing a scripted opponent's name.
+  //
+  // No `base get` follows here: this fake models no chat channel (mockDummy has
+  // no `on`), so no reply could ever arrive and the read-back is skipped as
+  // vacuous — the same tolerance _resetWasConfirmed extends to the same fakes.
+  assert.deepEqual(bots.dummy.chatLog, [
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base set ${KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE}`,
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base set ${MOVEMENT_SPEED_MOBILE_VALUE}`,
+  ]);
+});
+
+test('dummyKnockbackImmune=false still sends NO override when the datapack reset was never confirmed', async () => {
+  // Exactly the silent-abort trap the rest of this suite already covers for
+  // the reset ack itself: both gates match (the post-kill posture looks like
+  // a fresh reset) but no beacon arrives, so `confirmed` is false. Overriding
+  // here would assume the datapack's own `base set 1.0` already ran — which,
+  // in this scenario, it did not (the whole function aborted at instantiation)
+  // — and the override could be composing on top of an unknown prior state.
+  const sent = [];
+  const errors = [];
+  const arena = new ArenaBots(
+    { dummyKnockbackImmune: false },
+    {
+      transport: { send: (msg) => sent.push(msg) },
+      readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
+    },
+  );
+  arena.learner = liveBot('learner_bot');
+  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.wireDamageEvents();
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+  } finally {
+    console.error = realError;
+  }
+
+  assert.equal(sent[0].ok, false, 'a state that merely LOOKS reset is not a reset');
+  assert.deepEqual(
+    arena.dummy.chatLog,
+    [],
+    'no override without proof the datapack (and its base set 1.0) actually ran',
+  );
+});
+
+test('an ArenaBots built with a non-boolean dummyKnockbackImmune fails at construction', () => {
+  for (const bad of ['false', 0, 1, null, 'true']) {
+    assert.throws(
+      () => new ArenaBots({ dummyKnockbackImmune: bad }, { transport: { send: () => {} } }),
+      /dummyKnockbackImmune must be a boolean/,
+      `dummyKnockbackImmune=${String(bad)} must be rejected`,
+    );
+  }
+});
+
+// --- the read-back: proof the SERVER accepted the override -----------------
+// _sendCommand chats and returns, so on its own the override is exactly the
+// fire-and-forget silent failure the datapack's beacon exists to eliminate. A
+// bad attribute id after a version bump, or a dummy that is not opped, would
+// leave the opponent immune and immobile with nothing in any log. These pin the
+// `base get` round trip that closes it — and pin that it stays LOG-ONLY, since
+// a reply-shape drift must never be able to abort a training run.
+
+/** Run `body` with console.error captured. */
+async function withCapturedErrors(body) {
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    await body();
+  } finally {
+    console.error = realError;
+  }
+  return errors;
+}
+
+/** A confirmed, non-immune reset on EventEmitter bots (the live-ish shape). */
+function nonImmuneArena(sent, readbackOptions = {}) {
+  const arena = new ArenaBots(
+    { dummyKnockbackImmune: false },
+    {
+      transport: { send: (msg) => sent.push(msg) },
+      readbackOptions: { timeoutMs: 0, pollIntervalMs: 1, ...readbackOptions },
+    },
+  );
+  arena.learner = liveBot('learner_bot');
+  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.wireDamageEvents();
+  answerResetLikeTheServer(arena);
+  return arena;
+}
+
+test('the override is READ BACK: each base set is followed by a base get on the same connection', async () => {
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 500 });
+  answerAttributeGetsLikeTheServer(arena);
+
+  const errors = await withCapturedErrors(() =>
+    arena.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.equal(sent[0].ok, true);
+  // SET then GET, in that order, for BOTH attributes: the get must follow its
+  // own set or it reads the datapack's value and confirms the wrong thing.
+  assert.deepEqual(arena.dummy.chatLog, [
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base set ${KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE}`,
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base set ${MOVEMENT_SPEED_MOBILE_VALUE}`,
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base get`,
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base get`,
+  ]);
+  // SILENCE IS THE CONFIRMATION, exactly like the rl_deaths read-back: a healthy
+  // override says nothing at all, so the ABSENCE of these lines is what an
+  // operator watching the console reads as "the opponent can be knocked back".
+  assert.deepEqual(errors, [], 'a confirmed override is silent');
+  // The window closes with the reset: a reply that arrives late must not be
+  // credited to the next one.
+  assert.equal(arena._attributeReadback, null);
+});
+
+test('a server that never answers the read-back is named LOUDLY, per attribute, without failing the reset', async () => {
+  const sent = [];
+  // attributeReadbackTimeoutMs: 0 models the reply never coming (a bad
+  // attribute id after a version bump, an un-opped dummy, sendCommandFeedback
+  // off) without making the test wait for a real timeout.
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 0 });
+
+  const errors = await withCapturedErrors(() =>
+    arena.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.equal(sent[0].ok, true, 'LOG-ONLY: an unconfirmed override must not abort the run');
+  for (const attribute of [KNOCKBACK_RESISTANCE_ATTRIBUTE, MOVEMENT_SPEED_ATTRIBUTE]) {
+    assert.ok(
+      errors.some((line) => line.includes(attribute) && line.includes('NOT confirmed')),
+      `${attribute} must be named on stderr when the server stays silent`,
+    );
+  }
+  assert.ok(
+    errors.some((line) => line.includes('not opped')),
+    'the log must name the causes, not just the symptom',
+  );
+});
+
+test('one attribute confirming does not cover for the other', async () => {
+  // The realistic partial failure: knockback_resistance is fine and
+  // movement_speed is the one that broke (it is the id that changed name in
+  // 1.21.2 and again in 1.21.4). A per-attribute report is what keeps that from
+  // hiding behind an all-or-nothing gate.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 60 });
+  answerAttributeGetsLikeTheServer(arena, { silentFor: [MOVEMENT_SPEED_ATTRIBUTE] });
+
+  const errors = await withCapturedErrors(() =>
+    arena.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.ok(
+    errors.some((line) => line.includes(MOVEMENT_SPEED_ATTRIBUTE) && line.includes('NOT confirmed')),
+    'the silent attribute is reported',
+  );
+  assert.ok(
+    !errors.some((line) => line.includes(KNOCKBACK_RESISTANCE_ATTRIBUTE)),
+    'the attribute that DID confirm is not reported',
+  );
+});
+
+test('a server that applies a DIFFERENT value than we set is reported as REJECTED', async () => {
+  // The case a "did the command run?" check cannot see: the server answers, so
+  // the round trip is healthy, but the value is not ours — e.g. something
+  // re-pinned the dummy between the set and the get.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 500 });
+  answerAttributeGetsLikeTheServer(arena, {
+    values: { [KNOCKBACK_RESISTANCE_ATTRIBUTE]: Number(KNOCKBACK_RESISTANCE_IMMUNE_VALUE) },
+  });
+
+  const errors = await withCapturedErrors(() =>
+    arena.handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.equal(sent[0].ok, true, 'still log-only');
+  assert.ok(
+    errors.some(
+      (line) => line.includes(KNOCKBACK_RESISTANCE_ATTRIBUTE) && line.includes('REJECTED'),
+    ),
+    'a wrong value is a different diagnosis from a missing reply, and must read that way',
+  );
+  assert.ok(
+    !errors.some((line) => line.includes(MOVEMENT_SPEED_ATTRIBUTE)),
+    'the attribute that landed correctly is not reported',
+  );
+});
+
+test('the read-back accepts the value as a JSON NUMBER, which is how Paper sends it', () => {
+  // `base set 0.0` comes back through JSON.parse as the JS number 0, so a
+  // TEXTUAL comparison against the "0.0" we sent would flag every healthy
+  // override as rejected. Driven through the real ChatMessage so the test
+  // cannot agree with the code by construction.
+  const arena = new ArenaBots({ dummyKnockbackImmune: false }, { transport: { send: () => {} } });
+  arena._attributeReadback = new Map();
+  arena._captureAttributeReadback(
+    new ChatMessage({
+      translate: ATTRIBUTE_GET_TRANSLATE_KEY,
+      with: [{ translate: KNOCKBACK_RESISTANCE_NAME_KEY }, { text: 'dummy_bot' }, 0.0],
+    }),
+  );
+  assert.equal(arena._attributeReadback.get(KNOCKBACK_RESISTANCE_NAME_KEY), 0);
+});
+
+test('the read-back ignores every message that is not an attribute reply', () => {
+  const arena = new ArenaBots({ dummyKnockbackImmune: false }, { transport: { send: () => {} } });
+  arena._attributeReadback = new Map();
+  const ignored = [
+    null,
+    undefined,
+    'a plain string',
+    new ChatMessage({ text: '[arena] reset_ok dummy 0 0 dummy_bot 1' }),
+    // Right key, an attribute we never set.
+    new ChatMessage({
+      translate: ATTRIBUTE_GET_TRANSLATE_KEY,
+      with: [{ translate: 'attribute.name.generic.max_health' }, { text: 'dummy_bot' }, 20],
+    }),
+    // Right key, truncated args.
+    new ChatMessage({
+      translate: ATTRIBUTE_GET_TRANSLATE_KEY,
+      with: [{ translate: KNOCKBACK_RESISTANCE_NAME_KEY }],
+    }),
+  ];
+  for (const message of ignored) {
+    arena._captureAttributeReadback(message);
+  }
+  assert.equal(arena._attributeReadback.size, 0);
+});
+
+test('a reset superseded DURING the read-back wait does not ack', async () => {
+  // The read-back adds an await point AFTER the two epoch guards inside
+  // handleReset's try, so it needs its own. Without it a stale handler would
+  // ack a reset the retry already owns and desync the request/reply stream —
+  // the exact failure the other two guards exist to prevent.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 60 });
+  answerAttributeGetsLikeTheServer(arena, { silentFor: [MOVEMENT_SPEED_ATTRIBUTE] });
+  // TRIGGERED BY THE READ-BACK ITSELF, not by a timer. A timer racing the
+  // causality wait would trip the epoch guard that already exists INSIDE the
+  // try, and the test would pass without the new guard ever running — it did,
+  // until a mutation run caught it. The `base get` is only ever chatted after
+  // `confirmed` is true and the two earlier guards are behind us, so hooking it
+  // puts the retry exactly where it must be: between asking and reading.
+  const askAgain = arena.dummy.chat;
+  arena.dummy.chat = (cmd) => {
+    askAgain(cmd);
+    if (typeof cmd === 'string' && cmd.endsWith('base get')) {
+      arena._resetEpoch += 1; // what a retry's `++this._resetEpoch` does
+    }
+  };
+
+  await withCapturedErrors(() => arena.handleReset({ type: 'reset', episode: 0, seed: 0 }));
+
+  assert.ok(
+    arena.dummy.chatLog.some((cmd) => cmd.endsWith('base get')),
+    'the read-back must actually have been reached, or this proves nothing',
+  );
+  assert.deepEqual(sent, [], 'a stale handler acks nothing at all');
+});
+
+test('a dummy that loses its connection mid-override strands no read-back window', async () => {
+  // The override adds a new place where the DUMMY's chat() runs, and this repo
+  // has been bitten before by a flag raised on one path and stranded on
+  // another. A throw here propagates exactly as the learner's does (see
+  // "handleReset rejects on a throwing chat()"), and must leave
+  // _attributeReadback closed so a stray reply cannot be credited to the next
+  // reset.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 60 });
+  // Throw on the READ-BACK specifically, not on the `base set` above it: the
+  // window is armed by then, so this is the only arrangement that exercises the
+  // finally that closes it.
+  const realChat = arena.dummy.chat;
+  arena.dummy.chat = (cmd) => {
+    if (typeof cmd === 'string' && cmd.endsWith('base get')) {
+      throw new Error('cannot chat: bot is not spawned');
+    }
+    realChat(cmd);
+  };
+
+  await assert.rejects(
+    () => withCapturedErrors(() => arena.handleReset({ type: 'reset', episode: 0, seed: 0 })),
+    /cannot chat/,
+  );
+
+  assert.equal(arena._attributeReadback, null, 'the capture window is not left open');
+  assert.equal(arena._suppressOpponentEvents, false, 'and suppression is not stranded either');
+  assert.deepEqual(sent, [], 'a reset that threw must not ack');
+});
+
+test('a stale read-back wait does NOT close the window a retry already opened', async () => {
+  // Reset is reconnect-and-retry, so a retry can run its whole gate sequence
+  // and arm its own capture window while this handler is still parked. If the
+  // stale handler's cleanup nulled the window unconditionally, the RETRY's
+  // replies would land on a closed window and it would log two false "NOT
+  // confirmed" lines — false alarms on the exact line RUNBOOK Step 2c tells the
+  // operator to trust, which is worse than no read-back at all.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 30 });
+  // A retry arming its own window, timed off this handler's own `base get` so
+  // it lands strictly inside the wait (a timer would race the causality gate).
+  const retryWindow = new Map();
+  const realChat = arena.dummy.chat;
+  arena.dummy.chat = (cmd) => {
+    realChat(cmd);
+    if (typeof cmd === 'string' && cmd.endsWith('base get')) {
+      arena._attributeReadback = retryWindow;
+      arena._resetEpoch += 1; // the retry owns the episode now
+    }
+  };
+
+  await withCapturedErrors(() => arena.handleReset({ type: 'reset', episode: 0, seed: 0 }));
+
+  assert.equal(
+    arena._attributeReadback,
+    retryWindow,
+    "the stale handler must not close a window it did not open",
+  );
+});
+
+test('the read-back rides the beacon channel WITHOUT disturbing it', async () => {
+  // Both live on the dummy's `message` events. The beacon is matched on exact
+  // text and the read-back structurally, so neither can consume the other's
+  // message — and the beacon is what gates the override in the first place.
+  const sent = [];
+  const arena = nonImmuneArena(sent, { attributeReadbackTimeoutMs: 500 });
+  answerAttributeGetsLikeTheServer(arena);
+
+  await withCapturedErrors(() => arena.handleReset({ type: 'reset', episode: 0, seed: 0 }));
+
+  assert.deepEqual(arena._resetConfirm, { nonce: 1, learner: true, dummy: true });
+});
+
+// ===========================================================================
 // RESET CAUSALITY (the gate verifies template MATCH, not that the reset ran).
 //
 // After a kill cycle the natural post-respawn state IS the template state: the
@@ -753,6 +1235,135 @@ test('spawn_dummy_pad clears before it gives, gives the dummy NO weapon, and end
   assert.ok(
     lines[lines.length - 1].startsWith('$tellraw $(dummy)'),
     'the causality beacon must stay the LAST line',
+  );
+});
+
+test('the datapack\'s knockback attribute id and default value are pinned against bot.js (T11c)', () => {
+  // spawn_dummy_pad.mcfunction stays the single source of truth for what
+  // "immune" means; bot.js's override composes its OWN command from module
+  // constants rather than re-reading this file live, so a drift between the
+  // two — e.g. someone flattening the `generic.` infix here without touching
+  // bot.js — must fail HERE, in CI, not during a live exhibition where the
+  // override would silently target an attribute id the server does not have.
+  const lines = datapackLines('spawn_dummy_pad.mcfunction');
+  const kbLine = lines.find((line) => line.includes('knockback_resistance'));
+  assert.ok(kbLine, 'spawn_dummy_pad.mcfunction must set knockback_resistance somewhere');
+  const parsed = /^\$attribute \$\(dummy\) (\S+) base set (\S+)$/.exec(kbLine);
+  assert.ok(parsed, `unexpected knockback attribute line shape: ${kbLine}`);
+  const [, attributeId, value] = parsed;
+  assert.equal(
+    attributeId,
+    KNOCKBACK_RESISTANCE_ATTRIBUTE,
+    "bot.js's override must address the SAME attribute id this file applies",
+  );
+  assert.equal(
+    value,
+    KNOCKBACK_RESISTANCE_IMMUNE_VALUE,
+    'bot.js\'s notion of "what immune means" must match what this file actually sets',
+  );
+});
+
+test('the datapack\'s movement_speed attribute id and pinned value match bot.js (T11c)', () => {
+  // The knockback twin, and the more load-bearing of the two: this is the line
+  // whose value the plan calls "a belt-and-suspenders anti-drift measure" and
+  // which pins a scripted opponent to zero speed. If someone flattens the
+  // `generic.` infix here, or changes the pinned 0.0, the bridge's override
+  // would target an id the server does not have — and APPROACH/STRAFE/RETREAT
+  // would go inert with a completely clean log. Fail HERE instead.
+  const lines = datapackLines('spawn_dummy_pad.mcfunction');
+  const speedLine = lines.find((line) => line.includes('movement_speed'));
+  assert.ok(speedLine, 'spawn_dummy_pad.mcfunction must set movement_speed somewhere');
+  const parsed = /^\$attribute \$\(dummy\) (\S+) base set (\S+)$/.exec(speedLine);
+  assert.ok(parsed, `unexpected movement_speed attribute line shape: ${speedLine}`);
+  const [, attributeId, value] = parsed;
+  assert.equal(
+    attributeId,
+    MOVEMENT_SPEED_ATTRIBUTE,
+    "bot.js's override must address the SAME attribute id this file applies",
+  );
+  assert.equal(
+    value,
+    MOVEMENT_SPEED_STATIONARY_VALUE,
+    'bot.js\'s notion of "what stationary means" must match what this file actually sets',
+  );
+});
+
+test('formatKnockbackResistanceCommand renders the immune and non-immune attribute commands', () => {
+  assert.equal(
+    formatKnockbackResistanceCommand('dummy_bot', true),
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base set ${KNOCKBACK_RESISTANCE_IMMUNE_VALUE}`,
+  );
+  assert.equal(
+    formatKnockbackResistanceCommand('dummy_bot', false),
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base set ${KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE}`,
+  );
+});
+
+test('formatKnockbackResistanceCommand rejects a bad username or a non-boolean immune flag', () => {
+  assert.throws(
+    () => formatKnockbackResistanceCommand('bad name', false),
+    /dummy username must be a Minecraft username/,
+  );
+  for (const bad of ['false', 0, null, undefined]) {
+    assert.throws(
+      () => formatKnockbackResistanceCommand('dummy_bot', bad),
+      /knockback immune flag must be a boolean/,
+      `immune=${String(bad)} must be rejected`,
+    );
+  }
+});
+
+test('formatMovementSpeedCommand renders the stationary and mobile attribute commands', () => {
+  assert.equal(
+    formatMovementSpeedCommand('dummy_bot', true),
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base set ${MOVEMENT_SPEED_STATIONARY_VALUE}`,
+  );
+  assert.equal(
+    formatMovementSpeedCommand('dummy_bot', false),
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base set ${MOVEMENT_SPEED_MOBILE_VALUE}`,
+  );
+  // 0.1 is a vanilla PLAYER's walking speed, not a round number someone liked:
+  // Player.createAttributes() in the pinned jar adds MOVEMENT_SPEED at
+  // 0.10000000149011612d, and prismarine-physics uses the same 0.1 fallback.
+  assert.equal(Number(MOVEMENT_SPEED_MOBILE_VALUE), 0.1);
+});
+
+test('formatMovementSpeedCommand rejects a bad username or a non-boolean stationary flag', () => {
+  assert.throws(
+    () => formatMovementSpeedCommand('bad name', false),
+    /dummy username must be a Minecraft username/,
+  );
+  for (const bad of ['false', 0, null, undefined]) {
+    assert.throws(
+      () => formatMovementSpeedCommand('dummy_bot', bad),
+      /movement stationary flag must be a boolean/,
+      `stationary=${String(bad)} must be rejected`,
+    );
+  }
+});
+
+test('formatAttributeGetCommand renders a read-back only for the two attributes the override writes', () => {
+  assert.equal(
+    formatAttributeGetCommand('dummy_bot', KNOCKBACK_RESISTANCE_ATTRIBUTE),
+    `/attribute dummy_bot ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base get`,
+  );
+  assert.equal(
+    formatAttributeGetCommand('dummy_bot', MOVEMENT_SPEED_ATTRIBUTE),
+    `/attribute dummy_bot ${MOVEMENT_SPEED_ATTRIBUTE} base get`,
+  );
+  // Not a general-purpose accessor: a typo'd id would produce a command whose
+  // reply nothing is waiting for, which reads exactly like a server that never
+  // answered.
+  for (const bad of ['minecraft:generic.max_health', 'generic.movement_speed', '', null]) {
+    assert.throws(
+      () => formatAttributeGetCommand('dummy_bot', bad),
+      /unsupported read-back attribute/,
+      `attribute=${String(bad)} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => formatAttributeGetCommand('bad name', MOVEMENT_SPEED_ATTRIBUTE),
+    /dummy username must be a Minecraft username/,
   );
 });
 

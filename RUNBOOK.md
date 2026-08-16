@@ -194,6 +194,32 @@ verdict" (a transport abort), never "pass".
 `--expect-anchor 512,0` points it at a non-zero pad. Read the module docstring before
 concluding anything from a red first cycle — see issue #28 above.
 
+### Step 2c — the opponent's mobility, when you run a scripted opponent
+
+Only for runs launched with `--dummy-knockback-immune false` (the flag
+`distributed/launcher.py` appends when `dummy_knockback_immune=False`). The default —
+the M2 stationary dummy — needs none of this.
+
+**Do not read `kb_resist=1.0` off the arena debug line.** `spawn_dummy_pad.mcfunction`
+prints it as a hard-coded literal on every reset, and it is telling you what the
+datapack just did, not what the opponent ends up with: on a scripted-opponent run the
+bridge's `/attribute` override lands moments later and sets knockback resistance to
+`0.0` and movement speed to `0.1`. The same caveat covers the word `idle` on that line.
+
+Two checks, in this order:
+
+- **The bridge read-back.** After each reset the bridge asks the server what it
+  actually applied. Like the `rl_deaths` objective, **the absence of the line is the
+  confirmation** — a healthy override says nothing. What you must never see:
+  `[bridge] pad N minecraft:generic.movement_speed override NOT confirmed` (or its
+  `knockback_resistance` twin, or an `override REJECTED` line). If one appears, the
+  named causes are: the attribute id changed with the Minecraft version, the dummy is
+  not opped, or the server has `sendCommandFeedback` off. It is deliberately log-only
+  and never fails a reset, so nothing else will stop the run for you.
+- **Hit it (AC18).** Datapack and attribute failures are silent here by tradition, so
+  the read-back is corroboration, not proof. Join the pad, hit the opponent, and watch
+  it get displaced; then watch it walk. A clean boot log has never proved either.
+
 ---
 
 ## Step 3 — M1 plumbing (AC3 / TC11)

@@ -36,6 +36,42 @@
 #   1. knockback_resistance = 1.0 so hits never shove it off its spawn.
 #   2. movement_speed = 0.0 as a belt-and-suspenders anti-drift measure.
 #
+# PER-OPPONENT MOBILITY OVERRIDE (T11c). BOTH lines above are UNCONDITIONAL
+# here on purpose — this file has exactly one behavior, the M2 stationary
+# dummy, and stays that way. A scripted opponent
+# (OpponentConfig.knockback_immune=False) needs the OPPOSITE of both: an
+# opponent that can never be knocked back makes the fight unreal, and one
+# pinned to zero movement speed cannot chase, strafe or retreat at all. That
+# can't be expressed as a macro key here without breaking BOTH of this
+# function's callers (arena:reset_pad and the pad-0 arena:spawn_dummy wrapper),
+# which forward only {x,z,dummy,nonce} and would abort — silently,
+# whole-function — the moment either omits a new required key. So the toggle is
+# NOT in this file: bridge/bot.js's handleReset issues two separate, non-macro
+# `/attribute ... base set` overrides (knockback_resistance 0.0, movement_speed
+# 0.1), addressed to the dummy's own connection, ONLY when
+# dummyKnockbackImmune is false, and ONLY once THIS function's own causality
+# beacon (the last line below) confirms it already ran — see bridge/bot.js's
+# "PER-OPPONENT MOBILITY OVERRIDE" section. When dummyKnockbackImmune is true
+# (the default), the bridge sends nothing at all and these lines are the only
+# things that ever set the attributes — byte-identical to before this toggle
+# existed.
+#
+# DO NOT conclude that the movement_speed pin is inert and can be left alone.
+# The reasoning that gets there ("Mineflayer's physics ignores the server
+# attribute") is FALSE. prismarine-physics/index.js:546-570 DOES consult it and
+# scales acceleration by it; it merely MISSES on 1.21.1, because physics looks
+# the attribute up under `minecraft:generic.movement_speed` while mineflayer
+# stores the wire key verbatim and 1.21.1 decodes that key as
+# `generic.movement_speed`, with no namespace. Nor does the server rubber-band
+# a client that moves faster than its attribute allows: ServerGamePacketListenerImpl
+# in server/versions/1.21.1/paper-1.21.1.jar has ZERO references to Attributes,
+# and its "moved too quickly" gate is a fixed 300.0f/100.0f constant pair. So a
+# speed-0 opponent walks BY ACCIDENT OF A VERSION STRING — 1.20.6 matched the
+# keys and would freeze the bot; 1.21.4 renames the attribute to
+# `minecraft:movement_speed` and misses again. A minecraft-data bump in either
+# direction silently freezes APPROACH/STRAFE/RETREAT with clean logs, which is
+# why the bridge overrides the value instead of relying on the miss.
+#
 # ATTRIBUTE IDS: THIS STACK REQUIRES THE `generic.` INFIX. Use
 # `minecraft:generic.knockback_resistance` and `minecraft:generic.movement_speed`.
 #
@@ -131,6 +167,10 @@ $effect give $(dummy) minecraft:saturation 1 19 true
 #     silently un-pin the dummy.
 #     `generic.` infix REQUIRED on Paper 1.21.1 — see the header block. These
 #     are the only two /attribute lines in the whole datapack.
+#     UNCONDITIONAL, always 1.0 / always 0.0, always run — see the
+#     "PER-OPPONENT MOBILITY OVERRIDE (T11c)" note near the top of this file
+#     for why a scripted opponent's knockback_immune=False is NOT handled here,
+#     and why the movement_speed line is NOT inert.
 $attribute $(dummy) minecraft:generic.knockback_resistance base set 1.0
 $attribute $(dummy) minecraft:generic.movement_speed base set 0.0
 
@@ -144,6 +184,13 @@ $attribute $(dummy) minecraft:generic.movement_speed base set 0.0
 #     above, so this records (x+3, 64, z) — inside this pad, never pad 0.
 $execute as $(dummy) at @s run spawnpoint @s ~ ~ ~
 
+# DEBUG LINE — DO NOT READ `kb_resist=1.0` AS THE FINAL VALUE (T11c).
+#     It is a hard-coded literal, printed unconditionally. It is accurate about
+#     what THIS function just did, and misleading about what the opponent ends
+#     up with: on a scripted-opponent run the bridge's override lands moments
+#     later and sets knockback_resistance to 0.0 and movement_speed to 0.1. The
+#     same caveat applies to the word "idle". Verify knockback by HITTING the
+#     opponent and watching it move, never from this line.
 $tellraw @a[tag=arena_debug] {"text":"[arena] dummy $(dummy) reset @ anchor $(x),$(z) +3.5X (kb_resist=1.0, idle, spawnpoint pinned).","color":"gold"}
 
 # --- RESET CAUSALITY BEACON. MUST STAY THE LAST LINE OF THIS FILE. ----------

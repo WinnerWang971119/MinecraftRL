@@ -152,6 +152,140 @@ const OPPONENT_HEALTH_OWN_CONNECTION = 'own-connection';
 const OPPONENT_HEALTH_UNAVAILABLE = 'unavailable';
 
 // ---------------------------------------------------------------------------
+// PER-OPPONENT MOBILITY OVERRIDE (T11c). TWO attributes, one flag.
+//
+// spawn_dummy_pad.mcfunction unconditionally pins BOTH of the dummy's mobility
+// attributes on every reset — `knockback_resistance = 1.0` so hits never shove
+// it off its spawn, and `movement_speed = 0.0` as its own header calls it, a
+// "belt-and-suspenders anti-drift measure". Both are right for the M2
+// stationary dummy and both are wrong for a scripted opponent
+// (`OpponentConfig.knockback_immune=False`), whose whole job is to chase,
+// strafe and retreat: an opponent that can never be knocked back makes the
+// fight unreal, and one pinned to zero speed cannot fight at all.
+//
+// WHY movement_speed IS OVERRIDDEN TOO, stated correctly because the wrong
+// reason is easy to reach for. It is NOT true that Mineflayer's physics
+// ignores the server attribute:
+//   - `prismarine-physics/index.js:546-570` DOES consult it —
+//     `if (entity.attributes[physics.movementSpeedAttribute])` then
+//     `acceleration = attributeSpeed * (0.1627714 / inertia**3)`, else it
+//     falls back to `physics.playerSpeed` (0.1).
+//   - It misses today on a NAMESPACE KEY MISMATCH specific to 1.21.1: physics
+//     looks up `mcData.attributesByName.movementSpeed.resource`, which is
+//     `"minecraft:generic.movement_speed"`, while mineflayer stores the wire
+//     key VERBATIM (`entity.attributes[prop.key]`, entities.js:578-580) and
+//     the 1.21.1 packet mapper decodes that key as `"generic.movement_speed"`
+//     — no namespace. The two strings never meet, so the lookup falls back to
+//     0.1 and the opponent walks.
+//   - The server cannot rubber-band it back either: `ServerGamePacketListenerImpl`
+//     in server/versions/1.21.1/paper-1.21.1.jar has ZERO references to
+//     `Attributes`; the "moved too quickly" gate is a fixed 300.0f/100.0f
+//     constant pair. Movement is client-authoritative here.
+// So a `movement_speed = 0.0` opponent walks BY ACCIDENT, on the strength of a
+// version string: 1.20.6 matched the keys (the bot would be frozen) and 1.21.4
+// uses `minecraft:movement_speed` (miss again). A `minecraft-data` bump in
+// either direction silently freezes APPROACH/STRAFE/RETREAT with clean logs.
+// Overriding the attribute back to a real walking speed is what makes the
+// scripted opponent's mobility depend on something we control.
+//
+// The datapack file cannot express this conditionally without adding a new
+// REQUIRED macro key — and both of its callers, `arena:reset_pad` and the
+// pad-0 `arena:spawn_dummy` wrapper, forward only {x,z,dummy,nonce}. A macro
+// function errors (aborting the WHOLE function, silently) if a referenced key
+// is absent, so adding one here would abort every reset through either caller
+// until they were also updated — out of this task's scope and a needless
+// hazard for the M2 path this toggle must leave untouched. So the toggle
+// lives bridge-side instead: `_knockbackOverrideCommand()` and
+// `_movementSpeedOverrideCommand()` render plain (non-macro)
+// `/attribute ... base set` commands, issued by handleReset ONLY when
+// dummyKnockbackImmune is false, and ONLY once the datapack's own reset is
+// CONFIRMED to have run (see the causality wait in handleReset) — that
+// ordering guarantee is what stops the overrides racing the datapack's own
+// `base set` lines across the two bots' separate connections. When
+// dummyKnockbackImmune is true (the default) this code path sends NOTHING,
+// so the M2 stationary-dummy path is untouched, byte-identical to before this
+// toggle existed.
+const KNOCKBACK_RESISTANCE_ATTRIBUTE = 'minecraft:generic.knockback_resistance';
+
+/**
+ * The literal `base set` value spawn_dummy_pad.mcfunction itself applies —
+ * pinned by a test against the committed file so the two cannot drift.
+ */
+const KNOCKBACK_RESISTANCE_IMMUNE_VALUE = '1.0';
+
+/** Vanilla default (no resistance): what a non-immune opponent gets. */
+const KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE = '0.0';
+
+/** The second half of the same override. Same `generic.` infix rule. */
+const MOVEMENT_SPEED_ATTRIBUTE = 'minecraft:generic.movement_speed';
+
+/**
+ * The literal `base set` value spawn_dummy_pad.mcfunction itself applies —
+ * pinned by a test against the committed file, exactly like its knockback twin.
+ */
+const MOVEMENT_SPEED_STATIONARY_VALUE = '0.0';
+
+/**
+ * A vanilla PLAYER's default walking speed: what a mobile opponent gets back.
+ *
+ * 0.1 is not a guess — `Player.createAttributes()` in
+ * server/versions/1.21.1/paper-1.21.1.jar adds `Attributes.MOVEMENT_SPEED` at
+ * `0.10000000149011612d` (the float 0.1 widened), and prismarine-physics uses
+ * the same 0.1 as its `playerSpeed` fallback. Restoring exactly that value is
+ * what makes the scripted opponent move at a normal player's pace whether or
+ * not the client-side lookup happens to find the attribute.
+ */
+const MOVEMENT_SPEED_MOBILE_VALUE = '0.1';
+
+// ---------------------------------------------------------------------------
+// OVERRIDE READ-BACK (T11c). `_sendCommand` chats and returns: nothing in it
+// can tell a command the server ACCEPTED from one it rejected. That is the
+// exact silent-failure class the datapack's causality beacon exists to
+// eliminate, and issuing the override from the bridge would re-introduce it —
+// a bad attribute id after a version bump, or a dummy that is not opped on
+// some future pad topology, would leave the opponent immune and immobile with
+// nothing anywhere in the log.
+//
+// So each `base set` is followed by a `base get` on the SAME connection
+// (commands from one client are processed in order server-side) and the reply
+// is matched STRUCTURALLY off the dummy's own message channel. Verified
+// against the pinned jar rather than assumed:
+//   - `AttributeCommand.getAttributeBase` sends
+//     `Component.translatable("commands.attribute.base_value.get.success",
+//        getAttributeDescription(attr), entity.getName(), Double.valueOf(v))`
+//     — so `translate` is the key below, `with[0].translate` is the
+//     attribute's description id, and `with[2]` is the value.
+//   - `getAttributeDescription` is `Component.translatable(descriptionId)`,
+//     and 1.21.1 registers the ids as `attribute.name.generic.*`.
+//   - Both keys and the message key itself ARE present in minecraft-data's
+//     1.21.1 language table, so the same reply also renders as readable
+//     English ("Base value of attribute Speed for entity dummy_bot is 0.1")
+//     for anyone reading the raw log.
+// LOG-ONLY, never a gate: a reply-shape drift or a server with
+// `sendCommandFeedback` off must be able to make this loud, never to abort a
+// training run.
+// ---------------------------------------------------------------------------
+
+/** The translate key of a successful `/attribute ... base get` reply. */
+const ATTRIBUTE_GET_TRANSLATE_KEY = 'commands.attribute.base_value.get.success';
+
+/** `with[0].translate` for each attribute the override touches. */
+const KNOCKBACK_RESISTANCE_NAME_KEY = 'attribute.name.generic.knockback_resistance';
+const MOVEMENT_SPEED_NAME_KEY = 'attribute.name.generic.movement_speed';
+
+/**
+ * Tolerance when comparing the read-back value to the one we set.
+ *
+ * The comparison is NUMERIC, not textual, and deliberately so: Paper sends the
+ * value as a JSON number, so `base set 0.0` comes back through JSON.parse as
+ * the JS number 0 and would never string-equal the `"0.0"` we sent.
+ */
+const ATTRIBUTE_READBACK_EPSILON = 1e-9;
+
+/** Bounded wait for both `base get` replies. Overridable via readbackOptions. */
+const ATTRIBUTE_READBACK_TIMEOUT_MS = 500;
+
+// ---------------------------------------------------------------------------
 // HUMAN DEATH DETECTION (T2). A human challenger has no Mineflayer connection,
 // so the `death` event that makes opponent_died work in 'bot' mode does not
 // exist for them — and neither does a health channel (mineflayer never
@@ -290,6 +424,14 @@ const DEFAULT_BOT_CONFIG = Object.freeze({
   // The challenger's username in 'human' mode. null => the first player in the
   // learner's entity view that is not one of THIS pad's own bots.
   challengerUsername: null,
+  // PER-OPPONENT MOBILITY TOGGLE (T11c). true reproduces the M2 stationary-
+  // dummy path exactly — spawn_dummy_pad.mcfunction's own `base set 1.0`
+  // (knockback resistance) and `base set 0.0` (movement speed) are left
+  // standing untouched, and handleReset sends the dummy NOTHING. A scripted
+  // opponent (OpponentConfig.knockback_immune=False) sets this false, which
+  // undoes BOTH pins: the name follows OpponentConfig's field, but the flag
+  // means "this opponent is a mobile combatant, not the M2 stationary target".
+  dummyKnockbackImmune: true,
 });
 
 // ---------------------------------------------------------------------------
@@ -546,6 +688,80 @@ function formatHumanResetCommands(args) {
       `@e[type=!minecraft:player,distance=..${PAD_SWEEP_RADIUS}]`,
     `/function arena:spawn_learner_pad {x:${x},z:${z},learner:"${learner}",nonce:${nonce}}`,
   ];
+}
+
+/**
+ * The per-opponent knockback-resistance command (T11c) — a plain, non-macro
+ * `/attribute` call, so a bad value here fails loudly per-line server-side
+ * (a normal command error) rather than voiding a whole datapack function.
+ *
+ * `immune=true` renders the SAME value spawn_dummy_pad.mcfunction already
+ * applies unconditionally (redundant with it, never sent by handleReset in
+ * that case — see PER-OPPONENT KNOCKBACK TOGGLE above). `immune=false`
+ * renders the override a scripted, non-immune opponent needs.
+ *
+ * @param {string} dummyUsername The dummy/opponent bot's Minecraft username.
+ * @param {boolean} immune Whether the opponent should be knockback-immune.
+ * @returns {string} A chat-ready command string.
+ */
+function formatKnockbackResistanceCommand(dummyUsername, immune) {
+  const dummy = assertMacroUsername(dummyUsername, 'dummy username');
+  if (typeof immune !== 'boolean') {
+    throw new Error(`knockback immune flag must be a boolean, got ${showValue(immune)}`);
+  }
+  const value = immune ? KNOCKBACK_RESISTANCE_IMMUNE_VALUE : KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE;
+  return `/attribute ${dummy} ${KNOCKBACK_RESISTANCE_ATTRIBUTE} base set ${value}`;
+}
+
+/**
+ * The second half of the same override (T11c): the opponent's walking speed.
+ *
+ * A SIBLING of formatKnockbackResistanceCommand rather than a widened version
+ * of it — the two attributes have different ids, different pinned values and
+ * different datapack lines, and one function that renders "whichever attribute
+ * you name" would drop exactly the per-attribute pinning the tests rely on.
+ *
+ * `stationary=true` renders the SAME value spawn_dummy_pad.mcfunction already
+ * applies unconditionally (redundant with it, never sent by handleReset in that
+ * case). `stationary=false` renders the vanilla player walking speed a mobile
+ * scripted opponent needs — see MOVEMENT_SPEED_MOBILE_VALUE for where 0.1
+ * comes from.
+ *
+ * @param {string} dummyUsername The dummy/opponent bot's Minecraft username.
+ * @param {boolean} stationary Whether the opponent should be pinned in place.
+ * @returns {string} A chat-ready command string.
+ */
+function formatMovementSpeedCommand(dummyUsername, stationary) {
+  const dummy = assertMacroUsername(dummyUsername, 'dummy username');
+  if (typeof stationary !== 'boolean') {
+    throw new Error(`movement stationary flag must be a boolean, got ${showValue(stationary)}`);
+  }
+  const value = stationary ? MOVEMENT_SPEED_STATIONARY_VALUE : MOVEMENT_SPEED_MOBILE_VALUE;
+  return `/attribute ${dummy} ${MOVEMENT_SPEED_ATTRIBUTE} base set ${value}`;
+}
+
+/**
+ * The read-back half of the override (T11c): ask the server what it actually
+ * applied. Pure string rendering; the reply is matched in
+ * `_captureAttributeReadback`.
+ *
+ * `base get` takes an optional scale argument, deliberately omitted: the
+ * command defaults it to 1.0, so the reply carries the raw base value and the
+ * comparison needs no un-scaling.
+ *
+ * @param {string} dummyUsername The dummy/opponent bot's Minecraft username.
+ * @param {string} attribute A namespaced attribute id (with the 1.21.1 `generic.` infix).
+ * @returns {string} A chat-ready command string.
+ */
+function formatAttributeGetCommand(dummyUsername, attribute) {
+  const dummy = assertMacroUsername(dummyUsername, 'dummy username');
+  if (attribute !== KNOCKBACK_RESISTANCE_ATTRIBUTE && attribute !== MOVEMENT_SPEED_ATTRIBUTE) {
+    // Not a generic escape hatch: only the two attributes this override writes
+    // may be read back, so a typo cannot quietly produce a command whose reply
+    // nothing is waiting for.
+    throw new Error(`unsupported read-back attribute ${showValue(attribute)}`);
+  }
+  return `/attribute ${dummy} ${attribute} base get`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1247,26 @@ class ArenaBots {
     /** @type {'bot'|'human'} Which kind of opponent this pad is fighting. */
     this.opponentMode = opponentMode;
 
+    // PER-OPPONENT MOBILITY TOGGLE (T11c). Validated HERE, with the rest of
+    // the identity config, for the same reason opponentMode is: a bad value
+    // should fail at process start, not silently leave a scripted opponent
+    // immune and immobile (or a stationary dummy knockback-able) for a whole run.
+    const dummyKnockbackImmune =
+      this.config.dummyKnockbackImmune === undefined ? true : this.config.dummyKnockbackImmune;
+    if (typeof dummyKnockbackImmune !== 'boolean') {
+      throw new Error(
+        `dummyKnockbackImmune must be a boolean, got ${showValue(dummyKnockbackImmune)}`,
+      );
+    }
+    /**
+     * @type {boolean} Whether the dummy/opponent bot is knockback-immune.
+     * True (the default) is the M2 stationary dummy: handleReset sends the
+     * dummy no override at all, so the datapack's own `base set 1.0` stands.
+     * False is a scripted opponent (knockback_immune=False): handleReset
+     * overrides it back down once the datapack's reset is confirmed.
+     */
+    this.dummyKnockbackImmune = dummyKnockbackImmune;
+
     // The challenger's username in 'human' mode, or null for "whoever is here
     // that is not one of our own bots". A light type check is enough: unlike
     // the bot usernames this value never reaches a datapack macro (T1 resolves
@@ -1101,6 +1337,10 @@ class ArenaBots {
     // merged over DEFAULT_READBACK inside handleReset. Injectable so the gate
     // timing is tunable and, crucially, so tests can drive the gate with a fake
     // clock instead of burning real wall-clock on a never-matching mock bot.
+    // Also carries `attributeReadbackTimeoutMs` (T11c), the separate bound on
+    // the override's `base get` round trip — separate because that wait happens
+    // AFTER the gates have already resolved and has nothing left of their
+    // budget to borrow.
     this._readbackOptions = deps.readbackOptions || {};
 
     // Iron sword ~1.6 atk/s in 1.9+ combat -> ticks for a full swing recharge.
@@ -1249,6 +1489,13 @@ class ArenaBots {
     // not prove the reset ran, and a beacon stamped with an older nonce proves
     // only that an older reset ran.
     this._resetConfirm = { nonce: 0, learner: false, dummy: false };
+
+    // OVERRIDE READ-BACK WINDOW (T11c). Null except while
+    // _confirmAttributeOverrides is waiting for the dummy's `base get` replies;
+    // a Map of attribute-name key -> the value the server reports. Null is the
+    // closed window, so a reply that arrives after its own reset gave up is
+    // dropped rather than credited to the next one.
+    this._attributeReadback = null;
 
     // While true, opponent (dummy) health events are DISCARDED and the
     // opponent-health baseline is left untouched. Set for the duration of
@@ -1592,6 +1839,15 @@ class ArenaBots {
     if (text === this._resetConfirmationText(role)) {
       this._resetConfirm[role] = true;
     }
+
+    // ADDITIVE (T11c): the override read-back rides the same channel but is
+    // matched STRUCTURALLY (translate key + args), never on `text`, so it
+    // cannot perturb the exact beacon comparison above. Only the dummy's own
+    // connection can answer a command the dummy issued, and the window is open
+    // only while _confirmAttributeOverrides is waiting.
+    if (role === 'dummy' && this._attributeReadback !== null) {
+      this._captureAttributeReadback(jsonMsg);
+    }
   }
 
   /**
@@ -1737,6 +1993,152 @@ class ArenaBots {
       learner: this.config.learnerUsername,
       nonce,
     });
+  }
+
+  /**
+   * The knockback-resistance override for a non-immune opponent (T11c).
+   * Callers must gate on `!this.dummyKnockbackImmune` themselves — this
+   * always renders the "not immune" command, never the redundant immune one.
+   *
+   * @returns {string} `/attribute <dummy> minecraft:generic.knockback_resistance base set 0.0`
+   */
+  _knockbackOverrideCommand() {
+    return formatKnockbackResistanceCommand(this.config.dummyUsername, false);
+  }
+
+  /**
+   * The movement-speed override for a MOBILE opponent (T11c) — the second half
+   * of the same toggle, gated by the same flag on the same branch. Callers gate
+   * on `!this.dummyKnockbackImmune` themselves; this always renders the mobile
+   * command, never the redundant stationary one.
+   *
+   * @returns {string} `/attribute <dummy> minecraft:generic.movement_speed base set 0.1`
+   */
+  _movementSpeedOverrideCommand() {
+    return formatMovementSpeedCommand(this.config.dummyUsername, false);
+  }
+
+  /**
+   * Ask the server what it actually applied, and say so LOUDLY when the answer
+   * is missing or wrong (T11c). Log-only by design — see the OVERRIDE READ-BACK
+   * block near the top of this file.
+   *
+   * FAKE TOLERANCE, same trade `_resetWasConfirmed` already documents: a unit
+   * fake with no `on` models no chat channel at all, so no reply can ever
+   * arrive and waiting for one would burn the whole budget and cry wolf on
+   * every test. Such a dummy is treated as vacuously read back. A real
+   * Mineflayer bot is always an EventEmitter, so the check is live wherever it
+   * can mean anything.
+   *
+   * @param {number} budgetMs Bounded wait for both replies.
+   * @returns {Promise<void>} Resolves once both replies arrived or the budget expired.
+   */
+  async _confirmAttributeOverrides(budgetMs) {
+    const dummy = this.dummy;
+    if (!dummy || typeof dummy.on !== 'function') {
+      return;
+    }
+    // ARM BEFORE ASKING, and re-arm per reset: a reply that arrives after its
+    // own reset gave up must not satisfy the next one. Same rule the beacon
+    // nonce enforces, expressed here by the capture window being closed.
+    const seen = new Map();
+    this._attributeReadback = seen;
+    const expected = [
+      [
+        KNOCKBACK_RESISTANCE_NAME_KEY,
+        KNOCKBACK_RESISTANCE_ATTRIBUTE,
+        KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE,
+      ],
+      [MOVEMENT_SPEED_NAME_KEY, MOVEMENT_SPEED_ATTRIBUTE, MOVEMENT_SPEED_MOBILE_VALUE],
+    ];
+    try {
+      for (const [, attribute] of expected) {
+        this._sendCommand(dummy, formatAttributeGetCommand(this.config.dummyUsername, attribute));
+      }
+      await waitForConfirmation(
+        () => expected.every(([nameKey]) => seen.has(nameKey)),
+        budgetMs,
+        this._readbackOptions.pollIntervalMs !== undefined
+          ? this._readbackOptions.pollIntervalMs
+          : DEFAULT_READBACK.pollIntervalMs,
+      );
+    } finally {
+      // Close the window even if a chat() throws, so a late reply cannot be
+      // credited to the next reset.
+      //
+      // IDENTITY-GUARDED, for the same reason the _suppressOpponentEvents
+      // finally is epoch-guarded: reset is reconnect-and-retry, so a retry can
+      // run its whole gate sequence and arm ITS OWN window while this handler
+      // is still parked in the wait above. An unconditional null here would
+      // close the retry's window out from under it, its replies would land on a
+      // closed window, and it would log two false "NOT confirmed" lines — on
+      // the very line RUNBOOK Step 2c tells the operator to trust. Only the
+      // handler that opened this window may close it.
+      if (this._attributeReadback === seen) {
+        this._attributeReadback = null;
+      }
+    }
+
+    for (const [nameKey, attribute, wanted] of expected) {
+      if (!seen.has(nameKey)) {
+        console.error(
+          `[bridge] pad ${this.padIndex} ${attribute} override NOT confirmed by the server ` +
+            `(no "${ATTRIBUTE_GET_TRANSLATE_KEY}" reply within ${budgetMs} ms) — the opponent may ` +
+            'still be the stationary M2 dummy. Likely causes: the attribute id changed with the ' +
+            `Minecraft version, ${this.config.dummyUsername} is not opped, or sendCommandFeedback is off`,
+        );
+        continue;
+      }
+      const applied = seen.get(nameKey);
+      const drift = Number.isFinite(applied) ? Math.abs(applied - Number(wanted)) : Infinity;
+      if (drift > ATTRIBUTE_READBACK_EPSILON) {
+        console.error(
+          `[bridge] pad ${this.padIndex} ${attribute} override REJECTED: the server reports ` +
+            `${showValue(applied)}, not the ${wanted} that was set — ` +
+            'the opponent will not fight as configured',
+        );
+      }
+    }
+  }
+
+  /**
+   * Record one `/attribute ... base get` reply while the read-back window is
+   * open (T11c). Called only from `_onBotMessage` for the DUMMY's connection.
+   *
+   * Every field access is defensive: this runs on arbitrary inbound chat, and a
+   * message that does not match the shape verified in the OVERRIDE READ-BACK
+   * block is simply not ours.
+   *
+   * @param {*} jsonMsg A mineflayer ChatMessage.
+   */
+  _captureAttributeReadback(jsonMsg) {
+    if (typeof jsonMsg !== 'object' || jsonMsg === null) {
+      return;
+    }
+    if (jsonMsg.translate !== ATTRIBUTE_GET_TRANSLATE_KEY) {
+      return;
+    }
+    const args = Array.isArray(jsonMsg.with) ? jsonMsg.with : null;
+    if (args === null || args.length < 3) {
+      return;
+    }
+    const named = args[0];
+    const nameKey = typeof named === 'object' && named !== null ? named.translate : null;
+    if (nameKey !== KNOCKBACK_RESISTANCE_NAME_KEY && nameKey !== MOVEMENT_SPEED_NAME_KEY) {
+      return;
+    }
+    let value;
+    try {
+      // The value arrives as a JSON number wrapped in a ChatMessage, so it is
+      // read through String() and re-parsed rather than compared textually.
+      value = Number(String(args[2]));
+    } catch (err) {
+      // A malformed ChatMessage must never take the bridge down. Recording NaN
+      // (rather than nothing) reports the reply as arrived-but-unreadable,
+      // which is a mismatch, not a timeout — the more accurate diagnosis.
+      value = NaN;
+    }
+    this._attributeReadback.set(nameKey, value);
   }
 
   /**
@@ -2056,6 +2458,41 @@ class ArenaBots {
           'though both read-back gates matched — arena:reset_pad may have aborted at instantiation',
       );
     }
+
+    // PER-OPPONENT MOBILITY OVERRIDE (T11c). Gated on `confirmed`, not merely
+    // on the position/health read-back gates: `confirmed` requires the
+    // dummy's OWN beacon (spawn_dummy_pad.mcfunction's last line) to have
+    // arrived, which — because a datapack function executes synchronously,
+    // start to finish, in one server tick — is the one signal that proves the
+    // WHOLE function already ran, INCLUDING the two `base set` attribute lines
+    // three lines above the beacon. Overriding before that would race the
+    // datapack's own lines across the learner's and the dummy's separate
+    // connections. Sent via the dummy's OWN connection (never the learner's),
+    // so 'bot' mode with the default dummyKnockbackImmune=true stays exactly
+    // as byte-inert as before this toggle existed — this branch then sends
+    // the dummy nothing at all.
+    //
+    // BOTH attributes ride this one gate: the datapack pins knockback
+    // resistance to 1.0 AND movement speed to 0.0, and a scripted opponent
+    // needs both undone (see PER-OPPONENT MOBILITY OVERRIDE at the top of this
+    // file for why the movement half is required work and not a hypothetical).
+    if (confirmed && this._opponentIsBot() && !this.dummyKnockbackImmune) {
+      this._sendCommand(this.dummy, this._knockbackOverrideCommand());
+      this._sendCommand(this.dummy, this._movementSpeedOverrideCommand());
+      await this._confirmAttributeOverrides(
+        this._readbackOptions.attributeReadbackTimeoutMs !== undefined
+          ? this._readbackOptions.attributeReadbackTimeoutMs
+          : ATTRIBUTE_READBACK_TIMEOUT_MS,
+      );
+      // The read-back is a new await point, so re-check the epoch exactly as
+      // the two guards inside the try do: a retry may have superseded this
+      // handler while it waited, and acking here would desync the
+      // request/reply stream the newer handler now owns.
+      if (epoch !== this._resetEpoch) {
+        return;
+      }
+    }
+
     const ok = result.ok && dummyResult.ok && confirmed;
     const acked = this._trySend({
       type: 'reset_ack',
@@ -3361,6 +3798,15 @@ module.exports = {
   RL_DEATHS_OBJECTIVE,
   RL_DEATHS_DISPLAY_SLOT,
   PAD_INTERIOR_BOUNDS,
+  KNOCKBACK_RESISTANCE_ATTRIBUTE,
+  KNOCKBACK_RESISTANCE_IMMUNE_VALUE,
+  KNOCKBACK_RESISTANCE_NOT_IMMUNE_VALUE,
+  MOVEMENT_SPEED_ATTRIBUTE,
+  MOVEMENT_SPEED_STATIONARY_VALUE,
+  MOVEMENT_SPEED_MOBILE_VALUE,
+  ATTRIBUTE_GET_TRANSLATE_KEY,
+  KNOCKBACK_RESISTANCE_NAME_KEY,
+  MOVEMENT_SPEED_NAME_KEY,
   // Pure, unit-testable logic.
   assertMacroInt,
   assertMacroUsername,
@@ -3369,6 +3815,9 @@ module.exports = {
   formatSetupPadCommand,
   formatResetPadCommand,
   formatHumanResetCommands,
+  formatKnockbackResistanceCommand,
+  formatMovementSpeedCommand,
+  formatAttributeGetCommand,
   formatResetConfirmation,
   readbackMatchesTemplate,
   computeAttackCooldown,
