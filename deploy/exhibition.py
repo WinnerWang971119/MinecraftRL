@@ -123,6 +123,22 @@ Every side-effecting step (spawning a process, probing a port, sleeping) is
 behind an injectable seam so :mod:`tests.test_exhibition` can drive the real
 decision path — :func:`run`, not a re-implementation of it — without booting
 a real Paper server or Node bridge.
+
+REFLEX SHIELD (T7). The shipped checkpoint was trained against a stationary
+dummy that never left the frame, so it may never have learned to press
+``Macro.TURN_TO_LAST_SEEN`` when it goes blind. ``play_one_match`` tracks how
+many CONSECUTIVE decision steps the observation's ``visible`` flag (read via
+the frozen ``env.observation_spec.Obs.VISIBLE`` accessor) has been ``0``; once
+that streak reaches ``ExhibitionConfig.reflex_blind_steps``, this module
+overrides the policy's chosen macro with ``TURN_TO_LAST_SEEN`` instead of
+sending it — one ``env.step()`` call either way. The streak resets the instant
+the opponent is visible again. **This is a demo crutch, not a policy change**,
+and it is structurally confined to exhibitions: ``play_one_match`` defaults
+``reflex_blind_steps`` to ``0`` (the shield never even looks at ``obs`` in
+that case), only ``run()`` here passes the nonzero value from
+``ExhibitionConfig``, and no training entry point (``agent/train.py``,
+``distributed/``) imports this module at all — the enum, the observation
+layout and the training loops are all outside this file's reach.
 """
 
 from __future__ import annotations
@@ -134,10 +150,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from agent.actions import Macro
 from distributed.launcher import PadAnchor, pad_anchor, pad_usernames, write_ops_json
 from env.mc_pvp_env import ExhibitionConfig, MCPvPEnv, TcpBridgeClient
+from env.observation_spec import Obs
 
 __all__ = [
     "ExhibitionLaunchError",
@@ -1017,7 +1035,69 @@ def _paper_env(xms: Optional[str], xmx: Optional[str]) -> Optional[Dict[str, str
     return env
 
 
-def play_one_match(env: Any, policy: Any, *, log: Callable[[str], None] = _ascii_log) -> str:
+def _reflex_shield_action(
+    obs: Any,
+    action: int,
+    blind_streak: int,
+    *,
+    reflex_blind_steps: int,
+) -> Tuple[int, int, bool]:
+    """T7: decide the macro actually sent for one decision step.
+
+    Pure and stateless across calls — :func:`play_one_match` threads
+    ``blind_streak`` through the loop itself, so this function holds nothing
+    that could leak between matches, episodes, or callers.
+
+    ``reflex_blind_steps <= 0`` disables the shield outright and — this is the
+    point, not an optimization — the function does not even LOOK at ``obs`` in
+    that case. That is what lets :func:`play_one_match` default the shield off
+    for every caller that does not explicitly opt in (every training loop; the
+    unit tests that hand it a bare placeholder instead of a real observation
+    vector), with no dependency on ``obs`` being observation-shaped at all
+    unless the shield is actually armed.
+
+    When armed, ``visible`` is read through the FROZEN
+    ``env.observation_spec.Obs.VISIBLE`` accessor — never a hard-coded index —
+    so a future observation-layout change breaks loudly here instead of
+    silently reading the wrong float.
+
+    Args:
+        obs: This step's ``(OBS_DIM,)`` observation — the SAME one just handed
+            to the policy, so "blind" means exactly what the policy saw.
+        action: The macro the policy chose for ``obs``.
+        blind_streak: Consecutive PRIOR decision steps (not counting this one)
+            whose observation had ``visible == 0``.
+        reflex_blind_steps: ``ExhibitionConfig.reflex_blind_steps`` — the
+            number of consecutive blind steps that must elapse before the
+            override fires.
+
+    Returns:
+        ``(actual_action, new_blind_streak, fired)``. ``new_blind_streak`` is
+        always the correct ``blind_streak`` to pass on the NEXT call, whether
+        or not the shield fired this time. ``fired`` is True only when this
+        call itself substituted ``TURN_TO_LAST_SEEN`` for the policy's choice
+        — never merely because the policy happened to choose it on its own.
+    """
+    if reflex_blind_steps <= 0:
+        return action, 0, False
+    blind_this_step = float(obs[Obs.VISIBLE]) == 0.0
+    if not blind_this_step:
+        # The moment the opponent is visible again, the streak resets to zero
+        # — including on the very step visibility returns, per spec.
+        return action, 0, False
+    new_streak = blind_streak + 1
+    if new_streak >= reflex_blind_steps:
+        return int(Macro.TURN_TO_LAST_SEEN), new_streak, True
+    return action, new_streak, False
+
+
+def play_one_match(
+    env: Any,
+    policy: Any,
+    *,
+    reflex_blind_steps: int = 0,
+    log: Callable[[str], None] = _ascii_log,
+) -> str:
     """Play exactly one match to completion, greedily, with no learning.
 
     Resets once, then steps the greedy policy until the env reports ``done`` —
@@ -1029,6 +1109,25 @@ def play_one_match(env: Any, policy: Any, *, log: Callable[[str], None] = _ascii
     policy simply acts on that, same as it would on any other observation.
     There is nothing exhibition-specific to special-case here.
 
+    Args:
+        env: The env to play (real ``MCPvPEnv`` in production).
+        policy: The greedy policy (``reset()``/``act(obs)``).
+        reflex_blind_steps: T7's reflex shield (``ExhibitionConfig
+            .reflex_blind_steps``). After this many CONSECUTIVE decision steps
+            whose observation has ``visible == 0``, the policy's chosen macro
+            is overridden with ``Macro.TURN_TO_LAST_SEEN`` — still exactly one
+            ``env.step()`` call for the decision, just with a different macro
+            in it. The policy is asked for its action on every step regardless
+            (so any recurrent state it carries keeps advancing); only the
+            macro actually sent may change. The streak resets to zero the
+            instant the opponent is visible again. Defaults to ``0``, which
+            disables the shield: only :func:`run` (below) passes the nonzero
+            value from ``ExhibitionConfig``, so a caller must opt in
+            explicitly — see the module docstring's REFLEX SHIELD section for
+            why that makes it structurally impossible for training to enable
+            this by accident.
+        log: Where match/shield summary lines go.
+
     Returns a short human-readable outcome string.
     """
     if hasattr(policy, "reset"):
@@ -1037,10 +1136,22 @@ def play_one_match(env: Any, policy: Any, *, log: Callable[[str], None] = _ascii
     done = False
     info: Dict[str, Any] = {}
     steps = 0
+    blind_streak = 0
+    reflex_overrides = 0
     while not done:
         action = policy.act(obs)
+        action, blind_streak, fired = _reflex_shield_action(
+            obs, action, blind_streak, reflex_blind_steps=reflex_blind_steps
+        )
+        if fired:
+            reflex_overrides += 1
         obs, _reward, done, info = env.step(action)
         steps += 1
+    if reflex_overrides:
+        log(
+            f"reflex shield overrode the action on {reflex_overrides}/{steps} "
+            f"decision step(s) (reflex_blind_steps={reflex_blind_steps})."
+        )
     if info.get("lost"):
         result = "AGENT LOSS (agent died)"
     elif info.get("won"):
@@ -1403,7 +1514,9 @@ def run(
         match_number = 1
         while True:
             log(f"--- match {match_number} ---")
-            play_one_match(env, policy, log=log)
+            play_one_match(
+                env, policy, reflex_blind_steps=exhibition_cfg.reflex_blind_steps, log=log
+            )
             log(
                 "no auto-restart: a death ends the match and nothing starts "
                 f"another one by itself. To arm the next challenger, run `{hint}` "
