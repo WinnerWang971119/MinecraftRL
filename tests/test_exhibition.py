@@ -44,8 +44,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from agent.actions import Macro
 from bridge.messages import ResetAckMsg, StateMsg
 from deploy.exhibition import (
     DEFAULT_BRIDGE_HOST,
@@ -77,6 +79,7 @@ from deploy.exhibition import (
 )
 from distributed.launcher import pad_anchor, pad_usernames
 from env.mc_pvp_env import BridgeError, MCPvPEnv
+from env.observation_spec import OBS_DIM, Obs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OPS_JSON = REPO_ROOT / "server" / "ops.json"
@@ -1024,14 +1027,24 @@ def _reset_ack_msg():
     )
 
 
-def _state_msg(*, tick, opp_health=20.0, opponent_died=False):
-    """One valid ``state`` line: both fighters at full health, two blocks apart
-    and facing each other, no events unless a death is being scripted.
+def _state_msg(*, tick, opp_health=20.0, opponent_died=False, visible=True):
+    """One valid ``state`` line: both fighters at full health, no events unless
+    a death is being scripted.
 
     Only the OPPONENT's death is ever scripted here. Under
     ``ExhibitionConfig.no_timeout`` a death is the one and only thing that ends
     an exhibition match (AC4), so it is also the only thing worth scripting.
+
+    ``visible`` places the opponent two blocks in FRONT of the learner
+    (``visible=True``, the historical default -- inside the frozen 70-degree
+    FOV cone, see ``env/perception_filter.py``'s ``FOV_DEGREES``) or two blocks
+    directly BEHIND it (``visible=False``, outside the cone). At self yaw 0.0
+    the look vector is +Z, so +2 on z is dead ahead and -2 is dead behind --
+    genuinely gated out by the REAL ``PerceptionFilter`` the env runs, not a
+    hand-set ``visible`` bit. This is what a human "circling behind" the agent
+    (the T7 reflex shield's whole reason to exist) looks like on the wire.
     """
+    opp_z = 2.0 if visible else -2.0
     return StateMsg.from_dict(
         {
             "type": "state",
@@ -1046,7 +1059,7 @@ def _state_msg(*, tick, opp_health=20.0, opponent_died=False):
                 "attack_cooldown": 1.0,
             },
             "opponent": {
-                "pos": [0.0, 64.0, 2.0],
+                "pos": [0.0, 64.0, opp_z],
                 "yaw": 0.0,
                 "pitch": 0.0,
                 "velocity": [0.0, 0.0, 0.0],
@@ -1088,16 +1101,31 @@ class ScriptedBridgeTransport:
     test -- the same "green for the wrong reason" class as an escaping
     KeyboardInterrupt. Exceeding it raises, which unwinds into run()'s fatal
     handler and fails the assertions loudly.
+
+    ``opponent_visible`` (T7) is an optional ``obs_index -> bool`` schedule,
+    1-indexed to match DECISION numbering within the current match: index 1 is
+    what the post-reset ``state`` carries (the observation ``play_one_match``'s
+    first decision acts on), index 2 is what the FIRST ``step`` reply carries
+    (the observation the SECOND decision acts on), and so on. Defaults to
+    "always visible", i.e. byte-identical to every test that predates T7.
     """
 
     def __init__(
-        self, *, steps_to_win, record, interrupt_on_close=False, on_step=None, max_resets=8
+        self,
+        *,
+        steps_to_win,
+        record,
+        interrupt_on_close=False,
+        on_step=None,
+        max_resets=8,
+        opponent_visible=None,
     ):
         self._steps_to_win = steps_to_win
         self._record = record
         self._interrupt_on_close = interrupt_on_close
         self._on_step = on_step
         self._max_resets = max_resets
+        self._opponent_visible = opponent_visible or (lambda obs_index: True)
         self._inbound = []
         self._tick = 0
         self.steps_sent = 0
@@ -1105,6 +1133,10 @@ class ScriptedBridgeTransport:
         self.resets = 0
         self.connects = 0
         self.closes = 0
+        #: The `action` field of every "step" message sent, in order, across
+        #: every match this transport has played (T7: what the reflex shield
+        #: actually put on the wire, as opposed to what the policy chose).
+        self.actions_sent = []
 
     def connect(self):
         self.connects += 1
@@ -1124,8 +1156,11 @@ class ScriptedBridgeTransport:
                 )
             self.steps_sent = 0
             self._inbound.append(_reset_ack_msg())
-            self._inbound.append(_state_msg(tick=self._tick))
+            self._inbound.append(
+                _state_msg(tick=self._tick, visible=self._opponent_visible(1))
+            )
         elif kind == "step":
+            self.actions_sent.append(obj.get("action"))
             self.steps_sent += 1
             self.total_steps += 1
             if self._on_step is not None:
@@ -1135,11 +1170,14 @@ class ScriptedBridgeTransport:
                 # is not polling anything.
                 self._on_step(self)
             killed = self.steps_sent >= self._steps_to_win
+            # This reply feeds the NEXT decision, i.e. obs index `steps_sent + 1`
+            # (index 1 was the post-reset state, consumed by decision 1).
             self._inbound.append(
                 _state_msg(
                     tick=self._tick,
                     opp_health=0.0 if killed else 20.0,
                     opponent_died=killed,
+                    visible=self._opponent_visible(self.steps_sent + 1),
                 )
             )
         elif kind == "close" and self._interrupt_on_close:
@@ -1231,6 +1269,7 @@ def drive_exhibition(
     extra_argv=(),
     console_fails=False,
     on_step=None,
+    opponent_visible=None,
 ):
     """Drive the REAL ``run()`` through a complete exhibition and record it.
 
@@ -1253,6 +1292,12 @@ def drive_exhibition(
     first message containing that substring — an interrupt landing somewhere a
     teardown helper's own handler cannot absorb it, which is what the nested
     ``finally`` chain (rather than a flat one) exists to survive.
+
+    ``opponent_visible`` (T7) forwards straight to
+    :class:`ScriptedBridgeTransport`'s schedule of the same name, so a test can
+    script the REAL ``MCPvPEnv``/``PerceptionFilter`` into gating the opponent
+    out of view for specific decisions, exactly as a human circling behind the
+    agent would.
     """
     proc_classes = dict(proc_classes or {})
     result = ExhibitionRun()
@@ -1299,6 +1344,7 @@ def drive_exhibition(
             # One match at launch plus one per reset command is the MOST this
             # launcher may play. Anything beyond it is a runaway loop.
             max_resets=1 + resets,
+            opponent_visible=opponent_visible,
         )
         result.transports.append(transport)
         return transport
@@ -2128,3 +2174,373 @@ class TestNothingRestartsAMatchByItself:
 
         assert "--reset" in help_text
         assert "one reset command, one match, never automatic" in help_text
+
+
+# ===========================================================================
+# T7 — the exhibition-only reflex shield.
+#
+# After `reflex_blind_steps` CONSECUTIVE decision steps whose observation has
+# `visible == 0`, the policy's chosen macro is overridden with
+# `Macro.TURN_TO_LAST_SEEN`. Three layers, each driven through the REAL
+# function under test rather than a re-implementation of its logic:
+#
+#   1. `_reflex_shield_action` directly (TestReflexShieldPureDecision) --
+#      the exact boundary arithmetic `play_one_match` calls.
+#   2. `play_one_match()` itself (TestPlayOneMatchReflexShield) -- a fake env
+#      that hands back real, controllable observation vectors, so the shield
+#      logic runs unmodified inside the real decision loop.
+#   3. `run()` end to end (TestReflexShieldEndToEnd) -- the REAL MCPvPEnv and
+#      PerceptionFilter, with the opponent placed genuinely behind the
+#      learner on the wire, so even a bug in the Obs.VISIBLE accessor itself
+#      would surface here.
+#
+# Plus TestReflexShieldNeverReachesTraining, which pins the "impossible to
+# leak into training by accident" requirement rather than just asserting it in
+# a docstring.
+# ===========================================================================
+
+
+def _obs_vec(*, visible: bool) -> np.ndarray:
+    """A minimal, real ``(OBS_DIM,)`` observation with a controllable
+    ``visible`` bit at the frozen ``Obs.VISIBLE`` index. Every other field is
+    zero -- the reflex shield reads nothing else."""
+    vec = np.zeros(OBS_DIM, dtype=np.float32)
+    vec[Obs.VISIBLE] = 1.0 if visible else 0.0
+    return vec
+
+
+class TestReflexShieldPureDecision:
+    """Unit-level coverage of ``_reflex_shield_action`` -- the exact function
+    ``play_one_match`` calls every decision step, not a re-implementation of
+    its arithmetic."""
+
+    def _shield(self, *args, **kwargs):
+        from deploy.exhibition import _reflex_shield_action
+
+        return _reflex_shield_action(*args, **kwargs)
+
+    def test_disabled_never_even_looks_at_obs(self):
+        # A sentinel with no __getitem__/__float__ -- if the shield touched it
+        # at all with the threshold at 0, this raises before the assertion
+        # gets a chance to run.
+        sentinel = object()
+        assert self._shield(sentinel, 3, 5, reflex_blind_steps=0) == (3, 0, False)
+
+    def test_a_negative_threshold_is_also_disabled(self):
+        sentinel = object()
+        assert self._shield(sentinel, 3, 5, reflex_blind_steps=-1) == (3, 0, False)
+
+    def test_visible_resets_the_streak_and_never_overrides(self):
+        obs = _obs_vec(visible=True)
+        assert self._shield(obs, 4, 7, reflex_blind_steps=3) == (4, 0, False)
+
+    def test_below_threshold_leaves_the_chosen_action_untouched(self):
+        obs = _obs_vec(visible=False)
+        assert self._shield(obs, 4, 1, reflex_blind_steps=3) == (4, 2, False)
+
+    def test_reaching_the_threshold_overrides_to_turn_to_last_seen(self):
+        obs = _obs_vec(visible=False)
+        assert self._shield(obs, 4, 2, reflex_blind_steps=3) == (
+            int(Macro.TURN_TO_LAST_SEEN),
+            3,
+            True,
+        )
+
+    def test_stays_overridden_for_every_further_blind_step(self):
+        obs = _obs_vec(visible=False)
+        assert self._shield(obs, 4, 10, reflex_blind_steps=3) == (
+            int(Macro.TURN_TO_LAST_SEEN),
+            11,
+            True,
+        )
+
+    def test_fired_is_false_even_when_the_policy_already_chose_turn_to_last_seen(self):
+        # `fired` must mean "the shield substituted this", not merely "the
+        # action equals TURN_TO_LAST_SEEN" -- the policy is allowed to choose
+        # macro 7 on its own without that counting as an override.
+        obs = _obs_vec(visible=False)
+        action, streak, fired = self._shield(
+            obs, int(Macro.TURN_TO_LAST_SEEN), 0, reflex_blind_steps=3
+        )
+        assert (action, streak, fired) == (int(Macro.TURN_TO_LAST_SEEN), 1, False)
+
+    def test_reads_visibility_through_the_frozen_accessor(self):
+        # Pin against a magic-number regression: builds the vector by hand
+        # (not via _obs_vec) so this fails if Obs.VISIBLE's index ever drifts
+        # out of step with a literal index someone hard-codes here by mistake.
+        obs = np.zeros(OBS_DIM, dtype=np.float32)
+        obs[Obs.VISIBLE] = 0.0
+        _, streak, fired = self._shield(obs, 0, 2, reflex_blind_steps=3)
+        assert (streak, fired) == (3, True)
+
+
+class FakePolicyCountingActs(FakePolicy):
+    """FakePolicy that also counts ``act()`` calls, for the "policy is asked
+    every decision, even overridden ones" assertion."""
+
+    def __init__(self, actions):
+        super().__init__(actions)
+        self.act_calls = 0
+
+    def act(self, obs):
+        self.act_calls += 1
+        return super().act(obs)
+
+
+class VisibilityScriptedEnv:
+    """Minimal env stand-in whose observations carry a real, controllable
+    ``visible`` bit -- what lets ``play_one_match`` be driven directly, not
+    re-implemented, without a live ``MCPvPEnv``.
+
+    ``visible_schedule`` is a list of bools, one per decision (1-indexed in
+    spirit, 0-indexed in the list): entry 0 is what ``reset()`` returns and is
+    what decision 1 acts on; entry ``d`` (for ``d >= 1``) is what the ``d``-th
+    ``step()`` call returns and is what decision ``d + 1`` acts on. The match
+    ends exactly when ``len(visible_schedule)`` decisions have been taken.
+    """
+
+    def __init__(self, visible_schedule):
+        self._schedule = list(visible_schedule)
+        assert self._schedule, "need at least one decision to play"
+        self.reset_calls = 0
+        self.actions_sent = []
+
+    def reset(self, seed=None):
+        self.reset_calls += 1
+        self.actions_sent = []
+        return _obs_vec(visible=self._schedule[0])
+
+    def step(self, action):
+        self.actions_sent.append(action)
+        d = len(self.actions_sent)  # this call is decision `d`
+        done = d >= len(self._schedule)
+        # The obs is irrelevant once done -- the loop will not consult it.
+        next_visible = self._schedule[d] if not done else True
+        obs = _obs_vec(visible=next_visible)
+        info = {"won": True} if done else {}
+        return obs, 0.0, done, info
+
+
+class TestPlayOneMatchReflexShield:
+    """``play_one_match()`` itself, driven directly -- not a re-implementation
+    of the override decision -- with observations carrying a real,
+    controllable ``visible`` bit."""
+
+    def test_default_reflex_blind_steps_never_overrides(self):
+        # The DEFAULT every pre-T7 caller gets (including every OTHER test in
+        # this file that calls play_one_match without the keyword) must stay
+        # "off". Pinned explicitly here rather than left to be an accident of
+        # every other test never going blind for long enough.
+        env = VisibilityScriptedEnv([False] * 10)
+        policy = FakePolicy([1] * 10)
+
+        play_one_match(env, policy, log=lambda m: None)
+
+        assert env.actions_sent == [1] * 10
+
+    def test_overrides_after_the_configured_consecutive_blind_streak(self):
+        env = VisibilityScriptedEnv([False] * 10)
+        policy = FakePolicy([1] * 10)
+
+        play_one_match(env, policy, reflex_blind_steps=3, log=lambda m: None)
+
+        ttls = int(Macro.TURN_TO_LAST_SEEN)
+        assert env.actions_sent == [1, 1] + [ttls] * 8
+
+    def test_unchanged_for_the_whole_match_while_visible(self):
+        env = VisibilityScriptedEnv([True] * 10)
+        policy = FakePolicy([2] * 10)
+
+        play_one_match(env, policy, reflex_blind_steps=3, log=lambda m: None)
+
+        assert env.actions_sent == [2] * 10
+
+    def test_the_streak_resets_on_visibility_and_re_accumulates(self):
+        # blind, blind, blind(fires), blind(fires), VISIBLE, blind, blind, blind(fires)
+        schedule = [False, False, False, False, True, False, False, False]
+        env = VisibilityScriptedEnv(schedule)
+        policy = FakePolicy([1] * 8)
+
+        play_one_match(env, policy, reflex_blind_steps=3, log=lambda m: None)
+
+        ttls = int(Macro.TURN_TO_LAST_SEEN)
+        assert env.actions_sent == [1, 1, ttls, ttls, 1, 1, 1, ttls]
+
+    def test_the_policy_is_still_asked_every_decision_even_when_overridden(self):
+        env = VisibilityScriptedEnv([False] * 5)
+        policy = FakePolicyCountingActs([1] * 5)
+
+        play_one_match(env, policy, reflex_blind_steps=2, log=lambda m: None)
+
+        # One act() per decision, whether or not the shield substituted the
+        # macro afterward -- any recurrent state the policy carries must keep
+        # advancing even on overridden steps.
+        assert policy.act_calls == 5
+        assert len(env.actions_sent) == 5
+
+    def test_exactly_one_env_step_per_decision_even_with_the_shield_active(self):
+        env = VisibilityScriptedEnv([False] * 6)
+        policy = FakePolicy([0] * 6)
+
+        play_one_match(env, policy, reflex_blind_steps=2, log=lambda m: None)
+
+        # Not two -- the override must not cost a second env.step() call.
+        assert len(env.actions_sent) == 6
+
+    def test_the_summary_log_reports_the_override_count_and_threshold(self):
+        messages = []
+        env = VisibilityScriptedEnv([False] * 5)
+        policy = FakePolicy([1] * 5)
+
+        play_one_match(env, policy, reflex_blind_steps=2, log=messages.append)
+
+        text = "\n".join(messages)
+        assert "reflex shield overrode the action on 4/5 decision step(s)" in text
+        assert "reflex_blind_steps=2" in text
+
+    def test_no_summary_log_line_when_the_shield_never_fires(self):
+        messages = []
+        env = VisibilityScriptedEnv([True] * 3)
+        policy = FakePolicy([0] * 3)
+
+        play_one_match(env, policy, reflex_blind_steps=2, log=messages.append)
+
+        assert not any("reflex shield" in m for m in messages)
+
+    def test_the_override_count_ignores_the_policys_own_choice_of_the_same_macro(self):
+        # The policy independently choosing TURN_TO_LAST_SEEN while blind, but
+        # before the shield's own threshold, must not inflate the reported
+        # override count -- "fired" means the shield substituted the macro,
+        # not merely that the macro sent equals TURN_TO_LAST_SEEN.
+        messages = []
+        ttls = int(Macro.TURN_TO_LAST_SEEN)
+        env = VisibilityScriptedEnv([False] * 5)
+        policy = FakePolicy([ttls, ttls, 1, 1, 1])
+
+        play_one_match(env, policy, reflex_blind_steps=3, log=messages.append)
+
+        # Every action sent happens to be TTLS (2 by the policy's own choice,
+        # 3 by the shield once the streak reaches the threshold) -- only the
+        # LATTER 3 should be counted as overrides.
+        assert env.actions_sent == [ttls] * 5
+        text = "\n".join(messages)
+        assert "reflex shield overrode the action on 3/5 decision step(s)" in text
+
+    def test_no_summary_log_line_when_the_shield_is_disabled(self):
+        messages = []
+        env = VisibilityScriptedEnv([False] * 10)
+        policy = FakePolicy([1] * 10)
+
+        play_one_match(env, policy, log=messages.append)  # reflex_blind_steps=0
+
+        assert not any("reflex shield" in m for m in messages)
+
+
+class TestReflexShieldEndToEnd:
+    """T7 driven through the REAL ``run()`` -> real ``MCPvPEnv`` -> real
+    ``PerceptionFilter`` pipeline, with the opponent placed genuinely BEHIND
+    the learner on the wire (outside the frozen FOV cone -- see
+    ``_state_msg``'s ``visible`` parameter) rather than a hand-set observation
+    bit. ``ExhibitionConfig.reflex_blind_steps`` defaults to 8, and none of
+    these tests override it -- there is no CLI flag for it (T7 does not add
+    one), which is itself exactly what proves ``run()`` wires the config
+    value through rather than a hard-coded constant.
+    """
+
+    def test_overrides_to_turn_to_last_seen_after_the_default_blind_streak(
+        self, tmp_path, monkeypatch
+    ):
+        # Blind for all 10 decisions of a 10-decision match: the override
+        # should fire on decisions 8, 9, 10 (reflex_blind_steps defaults to 8)
+        # and leave the policy's own IDLE (macro 0) alone before that.
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=10, opponent_visible=lambda idx: False
+        )
+
+        (transport,) = result.transports
+        ttls = int(Macro.TURN_TO_LAST_SEEN)
+        assert transport.actions_sent == [0] * 7 + [ttls] * 3
+        text = result.text()
+        assert "reflex shield overrode the action on 3/10 decision step(s)" in text
+        assert "reflex_blind_steps=8" in text
+        # The policy is still asked for its action on every decision.
+        assert result.policy.act_calls == 10
+
+    def test_never_overrides_while_the_opponent_stays_in_view(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=10)
+
+        (transport,) = result.transports
+        assert transport.actions_sent == [0] * 10
+        assert "reflex shield" not in result.text()
+
+    def test_the_streak_resets_the_moment_the_opponent_is_visible_again(
+        self, tmp_path, monkeypatch
+    ):
+        # Blind for decisions 1-9 and 11-12, visible only on decision 10. If the
+        # streak survived that one visible decision, decision 12 would already
+        # be overridden (9 + 1 + 2 = 12 >= 8); it must not be -- the streak has
+        # only reached 2 by then.
+        result = drive_exhibition(
+            tmp_path,
+            monkeypatch,
+            steps_to_win=12,
+            opponent_visible=lambda idx: idx == 10,
+        )
+
+        (transport,) = result.transports
+        ttls = int(Macro.TURN_TO_LAST_SEEN)
+        assert transport.actions_sent == [0] * 7 + [ttls, ttls] + [0] * 3
+
+    def test_reflex_overrides_are_still_exactly_one_step_per_decision(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=10, opponent_visible=lambda idx: False
+        )
+
+        (transport,) = result.transports
+        # One "step" message per decision -- the override must not cost a
+        # second window on the wire.
+        assert transport.total_steps == 10
+        assert len(transport.actions_sent) == 10
+
+
+class TestReflexShieldNeverReachesTraining:
+    """T7 spec: "It must NEVER be active during training... Structure it so
+    that is impossible to do by accident, and pin it with a test."
+
+    Two independent guarantees are pinned, matching the module docstring's
+    REFLEX SHIELD section:
+
+      1. ``play_one_match``'s ``reflex_blind_steps`` defaults to 0 (off) --
+         pinned above by ``test_default_reflex_blind_steps_never_overrides``
+         and ``test_no_summary_log_line_when_the_shield_is_disabled``.
+      2. No training entry point even IMPORTS this module, so the shield is
+         not reachable from a training loop at all regardless of what
+         parameters anyone might one day pass -- pinned here, by reading the
+         committed source of every training entry point directly (a stronger
+         guarantee than importing them in-process, which cannot prove
+         anything: this very test file already imports deploy.exhibition at
+         module scope, so it would already be in sys.modules by the time any
+         in-process check ran).
+    """
+
+    TRAINING_ENTRY_POINTS = (
+        REPO_ROOT / "agent" / "train.py",
+        REPO_ROOT / "agent" / "train_config.py",
+        REPO_ROOT / "distributed" / "actor.py",
+        REPO_ROOT / "distributed" / "learner.py",
+        REPO_ROOT / "distributed" / "launcher.py",
+    )
+
+    def test_no_training_entry_point_references_this_module(self):
+        needles = ("deploy.exhibition", "deploy import exhibition", "play_one_match")
+        for path in self.TRAINING_ENTRY_POINTS:
+            assert path.is_file(), f"expected training entry point missing: {path}"
+            text = path.read_text(encoding="utf-8")
+            for needle in needles:
+                assert needle not in text, (
+                    f"{path} references {needle!r} -- the T7 reflex shield must "
+                    "stay reachable only from an exhibition launch, never from "
+                    "a training entry point."
+                )
