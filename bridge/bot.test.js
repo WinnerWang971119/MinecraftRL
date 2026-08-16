@@ -76,7 +76,10 @@ const {
 // the stand-in. IRON_SWORD_ATTACK_SPEED_TICKS is the one source of truth both
 // modules share (bot.js imports it too), so the expected ramp cannot drift.
 const { Macro, MacroExecutor, IRON_SWORD_ATTACK_SPEED_TICKS } = require('./actions');
-const { validateOutbound } = require('./transport');
+// BridgeServer is the REAL receive path for the TC12 protocol-error test: bytes
+// -> framer -> 'message' -> _handleMessage -> handleStep. A hand-rolled mock
+// transport would prove nothing about what a live client can send.
+const { validateOutbound, encodeMessage, BridgeServer } = require('./transport');
 // Recorder spies live in the shared testkit so a change to the EventAggregator
 // recorder surface cannot be applied here and silently missed in actions.test.js.
 const { spyRecorders } = require('./testkit');
@@ -2485,4 +2488,452 @@ test('with no reset and no executor the cooldown still reports 1.0 (the null anc
 
   arena.executor = new MacroExecutor(cooldownBot('learner_bot'));
   assert.equal(arena.attackCooldown(), 1.0, 'an executor that never swung is charged');
+});
+
+// ===========================================================================
+// T11b — THE OPPONENT'S ACTION (`opp_action`), AC9.
+//
+// A second MacroExecutor, bound to the opponent's OWN connection, driven in the
+// SAME decision window as the learner's, reporting whether its swing actually
+// fired via the optional `state.opp_action_executed`.
+//
+// THE TWO PROPERTIES THAT MATTER, and why each is tested the way it is:
+//
+//   1. THE M2 PATH IS BYTE-IDENTICAL. Absent (or null) `opp_action` means the
+//      opponent takes no action. That is asserted three ways at once — no
+//      executor is ever CREATED, the dummy records not one call, and the
+//      encoded state line contains no `opp_action_executed` — because any one
+//      of them alone would pass under a mutant that merely looks quiet.
+//
+//   2. ONE STEP == ONE WINDOW == ACTION_REPEAT GATE TICKS, for the opponent
+//      exactly as for the learner. Python cannot see the bridge's `_currentTick`
+//      (state.tick is the learner's coarse server world age, flat for several
+//      windows then +20), so it reconstructs the opponent's swing meter by
+//      COUNTING DECISION WINDOWS. If this side ever advances the opponent's gate
+//      by a different amount, or fires twice in one window, the meter desyncs
+//      and — per schema.md's swing-report note — the opponent locks into mashing
+//      ATTACK every window without ever strafing. The window-index test below is
+//      the pin: it asserts the exact window the second swing lands on, derived
+//      from the shared constants rather than hard-coded.
+// ===========================================================================
+
+/**
+ * A cooldownBot that RECORDS everything a macro can do to it, so "the opponent
+ * was not driven" is an assertion about calls that did not happen rather than
+ * about state that happens to look unchanged.
+ */
+function drivenBot(username, opts = {}) {
+  const bot = cooldownBot(username, opts);
+  bot.controlLog = [];
+  bot.attacked = [];
+  bot.lookedAt = [];
+  bot.clearAllCalls = 0;
+  bot.setControlState = (state, value) => bot.controlLog.push([state, value]);
+  bot.clearControlStates = () => {
+    bot.clearAllCalls += 1;
+  };
+  bot.attack = (entity) => bot.attacked.push(entity);
+  bot.lookAt = (point, force) => {
+    bot.lookedAt.push({ point, force });
+    // Mineflayer's lookAt is async; returning a promise keeps the executor's
+    // mandatory .catch on a real code path (an unhandled rejection is
+    // process-fatal here and has killed the live bridge before).
+    return Promise.resolve();
+  };
+  return bot;
+}
+
+/**
+ * A reset-then-step arena whose BOTH bots record what was done to them. Same
+ * gate/beacon fixture as cooldownArena — this one just watches the dummy.
+ */
+function oppArena(sent, errors = []) {
+  const arena = new ArenaBots(
+    {},
+    {
+      transport: {
+        send: (msg) => sent.push(msg),
+        emit: (event, err) => {
+          if (event === 'error') errors.push(err);
+        },
+      },
+      readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
+    },
+  );
+  arena.learner = drivenBot('learner_bot');
+  arena.dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+  arena.wireDamageEvents();
+  answerResetLikeTheServer(arena);
+  return arena;
+}
+
+test('TC11: a step with no opp_action drives nothing and leaves the M2 line byte-identical', async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+
+  await arena.handleStep({ type: 'step', action: Macro.ATTACK });
+  await arena.handleStep({ type: 'step', action: Macro.APPROACH });
+  // Explicit null is the same statement as an omitted key (schema.md): "the
+  // opponent takes no action". It must not be read as macro 0.
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: null });
+
+  // (a) No second executor was ever constructed, so no code added for the
+  //     opponent-acts path can reach the dummy on a dummy-path run at all.
+  assert.equal(arena.opponentExecutor, null, 'no opponent executor is created');
+  // (b) Nothing was done to the dummy.
+  assert.deepEqual(arena.dummy.controlLog, [], 'no control state was pressed on the dummy');
+  assert.deepEqual(arena.dummy.attacked, [], 'the dummy swung at nothing');
+  assert.deepEqual(arena.dummy.lookedAt, [], 'the dummy turned nowhere');
+  assert.equal(arena.dummy.clearAllCalls, 0, 'and its control states were never cleared');
+  // (c) The wire is unchanged — asserted on the encoded bytes, not the object.
+  assert.equal(sent.length, 3);
+  for (const msg of sent) {
+    assert.doesNotThrow(() => validateOutbound(msg));
+    assert.equal(Object.prototype.hasOwnProperty.call(msg, 'opp_action_executed'), false);
+    assert.equal(encodeMessage(msg).includes('opp_action_executed'), false);
+  }
+  // ...while the LEARNER did act, so this is quiet-because-correct rather than
+  // quiet-because-the-step-did-nothing.
+  assert.equal(arena.learner.attacked.length, 1, 'the learner still swings');
+  assert.equal(arena.learner.attacked[0], arena.dummy.entity);
+  assert.deepEqual(arena.learner.controlLog, [
+    ['forward', true],
+    ['forward', false],
+  ]);
+});
+
+test('opp_action runs the opponent through the same macro mapping, held for exactly one window', async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.APPROACH });
+
+  assert.deepEqual(
+    arena.dummy.controlLog,
+    [
+      ['forward', true],
+      ['forward', false],
+    ],
+    'pressed at the window start and released at its end',
+  );
+  assert.equal(sent[0].opp_action_executed, false, 'a movement macro is not a swing');
+  assert.doesNotThrow(() => validateOutbound(sent[0]));
+  // The learner's IDLE holds nothing, and the opponent's macro never leaks onto
+  // the learner's connection.
+  assert.deepEqual(arena.learner.controlLog, []);
+  assert.deepEqual(arena.learner.attacked, []);
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.STRAFE_L });
+
+  assert.deepEqual(arena.dummy.controlLog, [
+    ['forward', true],
+    ['forward', false],
+    ['left', true],
+    ['left', false],
+  ]);
+});
+
+test('opp_action ATTACK swings at the learner and reports opp_action_executed:true', async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+
+  assert.equal(arena.dummy.attacked.length, 1, 'the opponent swung');
+  assert.equal(arena.dummy.attacked[0], arena.learner.entity, 'at the LEARNER');
+  assert.equal(sent[0].opp_action_executed, true, 'and the report says the swing went out');
+  assert.equal(arena.opponentExecutor.lastSwingTick, 0, 'stamped on the window it began');
+  assert.doesNotThrow(() => validateOutbound(sent[0]));
+});
+
+test('opp_action TURN_TO_LAST_SEEN faces the learner from a snapshot, not the live vector', async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+  arena.learner.entity.position = livePosition(1.5, 64, 2.5);
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.TURN_TO_LAST_SEEN });
+
+  assert.equal(arena.dummy.lookedAt.length, 1, 'macro 7 must not be a silent no-op for the opponent');
+  assert.deepEqual(coordsOf(arena.dummy.lookedAt[0].point), { x: 1.5, y: 64, z: 2.5 });
+  assert.equal(arena.dummy.lookedAt[0].force, true, 'force=true bypasses interpolation');
+  // A clone, not an alias: the live position keeps moving, the turn target must
+  // not. (It is also why lookAt gets a real Vec3 rather than a plain object.)
+  arena.learner.entity.position.x = 99;
+  assert.equal(arena.dummy.lookedAt[0].point.x, 1.5, 'the turn target was snapshot');
+  assert.equal(sent[0].opp_action_executed, false, 'a turn is not a swing');
+});
+
+test("the opponent's swing gate advances exactly ACTION_REPEAT per window, in step with the learner's", async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+
+  // Drive BOTH sides with ATTACK every window. The two gates must agree window
+  // for window: Python reconstructs the opponent's meter from the same
+  // one-step-one-window count the learner's gate already obeys.
+  for (let window = 0; window < 6; window += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await arena.handleStep({ type: 'step', action: Macro.ATTACK, opp_action: Macro.ATTACK });
+  }
+
+  // Derived from the shared constants, never hard-coded: 12.5 cooldown ticks at
+  // ACTION_REPEAT=4 ticks per window means the next swing is allowed at window
+  // 4 (elapsed 16 >= 12.5) and NOT at window 3 (12 < 12.5) — the same arithmetic
+  // env/mc_pvp_env.py's shadow meter performs as (windows * ACTION_REPEAT) /
+  // OPPONENT_ATTACK_SPEED_TICKS.
+  const windowsToReady = Math.ceil(IRON_SWORD_ATTACK_SPEED_TICKS / ACTION_REPEAT);
+  assert.equal(windowsToReady, 4, 'sanity: the constants still describe a 4-window recharge');
+
+  const reports = sent.map((msg) => msg.opp_action_executed);
+  assert.deepEqual(reports, [true, false, false, false, true, false]);
+  assert.equal(reports[0], true, 'the first window may swing');
+  assert.ok(
+    reports.slice(1, windowsToReady).every((r) => r === false),
+    'every window inside the cooldown reports a swing that did NOT fire',
+  );
+  assert.equal(reports[windowsToReady], true, 'and the swing returns on exactly that window');
+
+  assert.equal(arena.dummy.attacked.length, 2, 'two real swings in six windows');
+  assert.equal(
+    arena.opponentExecutor.lastSwingTick,
+    windowsToReady * ACTION_REPEAT,
+    'the second swing was stamped with the window-start tick, not the advanced one',
+  );
+  // The clock invariant itself: the opponent's gate moved exactly as far as the
+  // learner's over the same six windows.
+  assert.equal(arena.learner.attacked.length, arena.dummy.attacked.length);
+  assert.equal(arena.executor.lastSwingTick, arena.opponentExecutor.lastSwingTick);
+});
+
+test('the opponent executor is built with the DEFAULT weapon period Python mirrors', async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+  // A learner weapon period that is NOT the default. The opponent's must not
+  // follow it: Python hard-codes OPPONENT_ATTACK_SPEED_TICKS = SERVER_TPS / 1.6
+  // (env/mc_pvp_env.py) to mirror the DEFAULT, and nothing would catch a drift —
+  // the opponent would just quietly stop attacking, or flail.
+  arena._weaponAttackSpeedTicks = 99;
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+
+  assert.equal(arena.opponentExecutor.weaponAttackSpeedTicks, IRON_SWORD_ATTACK_SPEED_TICKS);
+  assert.equal(
+    arena.opponentExecutor.weaponAttackSpeedTicks,
+    20 / 1.6,
+    'SERVER_TPS / 1.6 — the value env/mc_pvp_env.py hard-codes to match',
+  );
+});
+
+test('an injected opponent executor is used as-is and never rebound mid-run', async () => {
+  const sent = [];
+  // deps.opponentExecutor mirrors deps.executor: whatever is already bound wins,
+  // so a rebind on some later window cannot silently drop the swing gate's
+  // accumulated state (and with it, the agreement with Python's shadow meter).
+  const dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  const standIn = new MacroExecutor(dummy);
+  const arena = new ArenaBots(
+    {},
+    { transport: { send: (msg) => sent.push(msg) }, opponentExecutor: standIn },
+  );
+  arena.learner = drivenBot('learner_bot');
+  arena.dummy = dummy;
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+
+  assert.equal(arena.opponentExecutor, standIn, 'the bound executor is kept');
+  assert.equal(standIn.lastSwingTick, 0, 'and it owns the gate across windows');
+  assert.deepEqual(
+    sent.map((msg) => msg.opp_action_executed),
+    [true, false],
+  );
+});
+
+test('TC23: opp_action with no opponent bot is silently ignored and reported as not executed', async () => {
+  // (a) Exhibition: the opponent is a person on their own client and cannot be
+  //     puppeted at all.
+  const sent = [];
+  const challenger = playerEntity('classmate_1', 5.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: challenger });
+  arena._claimChallenger();
+
+  await assert.doesNotReject(() =>
+    arena.handleStep({ type: 'step', action: Macro.ATTACK, opp_action: Macro.ATTACK }),
+  );
+
+  assert.equal(sent.length, 1, 'the step still answers with exactly one state');
+  assert.doesNotThrow(() => validateOutbound(sent[0]));
+  assert.equal(sent[0].opp_action_executed, false, 'nothing executed, and it says so');
+  assert.equal(arena.opponentExecutor, null, 'a human is never bound to an executor');
+  // The LEARNER's own action is unaffected — AC2 still holds with opp_action set.
+  assert.equal(arena.learner.attacked.length, 1);
+  assert.equal(arena.learner.attacked[0], challenger);
+
+  // (b) Bot mode with the dummy not connected (pre-spawn, or a failed spawn).
+  const botSent = [];
+  const botArena = oppArena(botSent);
+  botArena.dummy = null;
+
+  await assert.doesNotReject(() =>
+    botArena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.APPROACH }),
+  );
+
+  assert.equal(botSent.length, 1);
+  assert.equal(botSent[0].opp_action_executed, false);
+  assert.equal(botArena.opponentExecutor, null);
+});
+
+test("every reset re-arms the opponent's swing gate, exactly as it does the learner's", async () => {
+  const sent = [];
+  const arena = oppArena(sent);
+  await arena.handleReset({ type: 'reset', episode: 0, seed: 0 });
+
+  // Swing LATE in episode 0, so the stamp sits far past the next episode's
+  // tick 0 and an un-re-armed gate would block the whole opening of episode 1.
+  for (let window = 0; window < 6; window += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.IDLE });
+  }
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+  assert.equal(arena.opponentExecutor.lastSwingTick, 6 * ACTION_REPEAT, 'a late swing is stamped');
+  const clearsBeforeReset = arena.dummy.clearAllCalls;
+
+  await arena.handleReset({ type: 'reset', episode: 1, seed: 1 });
+
+  assert.equal(arena.opponentExecutor.lastSwingTick, null, 'the gate is re-armed');
+  assert.ok(
+    arena.dummy.clearAllCalls > clearsBeforeReset,
+    'and no control state leaks across the episode boundary',
+  );
+
+  // Python clears its shadow meter on reset (mc_pvp_env.py sets
+  // _opp_last_swing_window = None and reads 1.0), so a bridge that did NOT
+  // re-arm here would report false for ~27 windows against a shadow that says
+  // ready — the lock-in schema.md warns about.
+  await arena.handleStep({ type: 'step', action: Macro.IDLE, opp_action: Macro.ATTACK });
+  assert.equal(
+    sent[sent.length - 1].opp_action_executed,
+    true,
+    'the first window of the new episode may swing',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// TC12 — inbound validation ON THE RECEIVE PATH.
+//
+// `transport.validateInbound` was exported and unit-tested from the start, but
+// deliberately never wired into BridgeServer._onData, and handleStep re-checked
+// only `action` inline — so an out-of-range `opp_action` was rejected by
+// nothing that actually runs. These tests drive the REAL path: raw bytes into a
+// socket, through the framer and the 'message' event, into _handleMessage.
+//
+// The 'error' listener is attached BEFORE the bad frame on purpose: an
+// unlistened 'error' on an EventEmitter throws, which is precisely the "bridge
+// does not crash" claim under test — without the listener the crash would take
+// the assertion with it.
+// ---------------------------------------------------------------------------
+
+/** Just enough net.Socket surface for BridgeServer, recording what it writes. */
+class RecordingSocket extends EventEmitter {
+  constructor() {
+    super();
+    this.destroyed = false;
+    this.written = [];
+  }
+
+  setNoDelay() {}
+
+  write(line) {
+    this.written.push(line);
+    return true;
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.emit('close');
+  }
+}
+
+/** Let the fire-and-forget async handler chain settle. */
+function flushAsync() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** An arena served by a REAL BridgeServer over a mock socket. */
+function receivePathArena() {
+  const server = new BridgeServer();
+  const errors = [];
+  server.on('error', (err) => errors.push(err));
+  const arena = new ArenaBots({}, { transport: server });
+  arena.learner = drivenBot('learner_bot');
+  arena.dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.executor = new MacroExecutor(arena.learner);
+  arena._waitTicksImpl = async () => {};
+  arena.wireTransport();
+  const socket = new RecordingSocket();
+  server._onConnection(socket);
+  return { arena, server, socket, errors };
+}
+
+test('TC12: an out-of-range opp_action arriving on the wire is a protocol error, not a crash', async () => {
+  const { socket, errors } = receivePathArena();
+
+  socket.emit('data', Buffer.from('{"type":"step","action":0,"opp_action":99}\n'));
+  await flushAsync();
+
+  assert.equal(errors.length, 1, 'the violation was surfaced exactly once');
+  assert.match(errors[0].message, /opp_action/, 'and it names the offending field');
+  assert.equal(socket.written.length, 0, 'a rejected step gets no state reply');
+
+  // THE OTHER HALF OF TC12: the bridge is still alive and still serving. A
+  // rejected command must not poison the connection or the step path.
+  socket.emit('data', Buffer.from('{"type":"step","action":0,"opp_action":3}\n'));
+  await flushAsync();
+
+  assert.equal(errors.length, 1, 'the valid step raised nothing');
+  assert.equal(socket.written.length, 1, 'and was answered');
+  const reply = JSON.parse(socket.written[0]);
+  assert.equal(reply.type, 'state');
+  assert.equal(reply.opp_action_executed, false, 'STRAFE_L executed, but it is not a swing');
+});
+
+test('TC12: every shape the opp_action rule rejects is rejected on the receive path', async () => {
+  // Exactly the cases transport.validateStep enumerates — non-integer, boolean
+  // (which JS would coerce), string, and both ends of the frozen 0..7 range.
+  const bad = ['99', '-1', '1.5', 'true', '"3"'];
+  for (const value of bad) {
+    const { socket, errors } = receivePathArena();
+    socket.emit('data', Buffer.from(`{"type":"step","action":0,"opp_action":${value}}\n`));
+    // eslint-disable-next-line no-await-in-loop
+    await flushAsync();
+    assert.equal(errors.length, 1, `opp_action ${value} must be rejected`);
+    assert.match(errors[0].message, /opp_action/);
+    assert.equal(socket.written.length, 0, `opp_action ${value} must not be executed`);
+  }
+
+  // ...and the M2 line still flows through the same guard untouched.
+  const { socket, errors } = receivePathArena();
+  socket.emit('data', Buffer.from('{"type":"step","action":5}\n'));
+  await flushAsync();
+  assert.deepEqual(errors, []);
+  assert.equal(socket.written.length, 1);
+  assert.equal(
+    socket.written[0].includes('opp_action_executed'),
+    false,
+    'no opp_action in, no swing report out',
+  );
+});
+
+test('the inline action guard it replaced still behaves the same: bad action, one error, no state', async () => {
+  const { socket, errors } = receivePathArena();
+
+  socket.emit('data', Buffer.from('{"type":"step","action":99}\n'));
+  await flushAsync();
+
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /action/);
+  assert.equal(socket.written.length, 0);
 });

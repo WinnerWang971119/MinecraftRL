@@ -48,6 +48,9 @@
 //   ticks. Damage/death events are aggregated over the ACTION_REPEAT
 //   window by the pure EventAggregator (bridge/actions.js), counting each event
 //   EXACTLY ONCE at the window boundary, and emitted in one `state` message.
+//   A `step` may also carry an OPPONENT action (T11b): a second MacroExecutor,
+//   bound to the opponent's own connection, runs it in the SAME window and on
+//   the same window-start tick, and the state reports whether its swing fired.
 //
 // ============================================================================
 // VERIFIED HERE (node --test, NO live server — see transport.test.js / actions.test.js):
@@ -78,13 +81,13 @@
 
 'use strict';
 
-const { BridgeServer } = require('./transport');
+// validateInbound is the ONE implementation of the Python -> Node command
+// contract; handleStep calls it instead of re-checking `action` inline (T11b).
+const { BridgeServer, validateInbound } = require('./transport');
 const {
   EventAggregator,
   MacroExecutor,
   Macro,
-  ACTION_MIN,
-  ACTION_MAX,
   IRON_SWORD_ATTACK_SPEED_TICKS,
 } = require('./actions');
 
@@ -775,13 +778,18 @@ function buildEventsBlock(agg) {
  * @param {number[]} parts.wallDistances Arena wall-distance probe (fixed order).
  * @param {number} parts.tick End-of-window server tick (>= 0 integer).
  * @param {string} parts.codeVersion The code_version stamp.
+ * @param {boolean|null} [parts.oppActionExecuted] THE SWING REPORT (T11b): did
+ *   this window's `opp_action` take effect? A boolean puts the optional
+ *   `opp_action_executed` key on the wire; anything else (absent, null) OMITS
+ *   the key entirely, which is what keeps a step carrying no `opp_action` —
+ *   every M1/M2 stationary-dummy step — byte-identical to the pre-T11b line.
  * @returns {object} A schema-valid `state` message (validateOutbound accepts it).
  */
 function assembleStateMsg(parts) {
   const self = parts.self || {};
   const opponent = parts.opponent || {};
   const wall = Array.isArray(parts.wallDistances) ? parts.wallDistances : [];
-  return {
+  const msg = {
     type: 'state',
     self: {
       pos: toVec3(self.pos),
@@ -806,6 +814,14 @@ function assembleStateMsg(parts) {
     tick: Number.isInteger(parts.tick) && parts.tick >= 0 ? parts.tick : 0,
     code_version: typeof parts.codeVersion === 'string' ? parts.codeVersion : 'unknown',
   };
+  // THE SWING REPORT (T11b, schema.md "the swing report"). Appended LAST and
+  // only for a real boolean: the schema declares it optional, Python reads an
+  // absent field as "no opp_action was sent, assume any swing fired", and a key
+  // emitted unconditionally would change every dummy-path line on the wire.
+  if (parts.oppActionExecuted === true || parts.oppActionExecuted === false) {
+    msg.opp_action_executed = parts.oppActionExecuted;
+  }
+  return msg;
 }
 
 /** Lazily resolve code_version() from agent/contract_config (LIVE/runtime stamp). */
@@ -1101,6 +1117,18 @@ class ArenaBots {
     // the control-state press/release. Bound to the learner once connected; in
     // tests a mock bot can be injected via deps.executor.
     this.executor = deps.executor || null;
+
+    // THE OPPONENT'S EXECUTOR (T11b) — the second macro executor, bound to the
+    // opponent's OWN bot connection so a Python opponent policy can drive it
+    // through the same 8 frozen macros as the learner.
+    //
+    // CREATED LAZILY, on the first `step` that actually carries an `opp_action`
+    // (see _bindOpponentExecutor). That laziness is the M2 guarantee, not an
+    // optimization: the stationary-dummy path never sends the field, so this
+    // stays null for a whole training run and NOTHING — not a control-state
+    // write, not the reset's re-arm below — ever touches the dummy. Byte-
+    // identical M2 behavior by construction rather than by inspection.
+    this.opponentExecutor = deps.opponentExecutor || null;
 
     // Bound handler references retained so wireDamageEvents() can remove them
     // before re-adding on a reconnect/re-wire (W1a idempotency). Each property
@@ -1838,6 +1866,21 @@ class ArenaBots {
       this.executor.resetCooldown();
       this.executor.clearAll();
     }
+    // THE OPPONENT'S GATE IS RE-ARMED ON THE SAME BOUNDARY (T11b). _currentTick
+    // goes back to 0 below while a swing from the previous episode is still
+    // stamped at (say) tick 96, so an un-re-armed gate would compute
+    // `0 - 96 >= 12.5` as false and block the opponent's swing for ~27 windows
+    // of the NEW episode. Python's shadow meter has no way to see that: it
+    // clears _opp_last_swing_window on reset (mc_pvp_env.py, "the bridge calls
+    // executor.resetCooldown() on every reset") and would read 1.0 throughout,
+    // so ScriptedBot would return ATTACK every window, every window would report
+    // swung=false, no stamp would ever land, and the opponent would mash ATTACK
+    // for the rest of the episode instead of strafing. Null until an opp_action
+    // has actually been driven, so a dummy-path reset still touches nothing.
+    if (this.opponentExecutor !== null) {
+      this.opponentExecutor.resetCooldown();
+      this.opponentExecutor.clearAll();
+    }
     this._currentTick = 0;
     this._lastSeenOpponentPos = null;
     // A new match may be a new challenger, so the death-ATTRIBUTION memory is
@@ -2255,22 +2298,40 @@ class ArenaBots {
    * Flow (LIVE — the tick loop needs the real server clock; the macro mapping,
    * cooldown gate, event aggregation, and state assembly are each unit-tested in
    * isolation, see actions.test.js):
-   *   1. validate the action index (0..7);
-   *   2. executor.begin(macro): press control states / single gated swing / look;
+   *   1. validate the whole message against the frozen inbound contract;
+   *   2. executor.begin(macro): press control states / single gated swing / look,
+   *      and the OPPONENT's executor likewise for an `opp_action` (T11b);
    *   3. wait ACTION_REPEAT ticks while the wired handlers feed the aggregator;
-   *   4. executor.end(): release the transient control states;
+   *   4. executor.end() on both: release the transient control states;
    *   5. drain the aggregator (exactly-once at this boundary) and snapshot both
-   *      bots, then send the assembled `state`.
+   *      bots, then send the assembled `state` (+ the swing report).
    *
-   * @param {{type:'step', action:number}} msg
+   * @param {{type:'step', action:number, opp_action?:number|null}} msg
    */
   async handleStep(msg) {
-    const action = msg.action;
-    if (!Number.isInteger(action) || action < ACTION_MIN || action > ACTION_MAX) {
-      // The Python side validates outbound, so this is a defensive guard only.
-      this.transport.emit('error', new Error(`step.action out of range: ${action}`));
+    // 1. INBOUND VALIDATION (T11b). ONE implementation of the command contract:
+    // transport.validateInbound is the Node binding of schema.json's step branch
+    // and already checks `action` AND the optional `opp_action` by exactly the
+    // same rule. An inline guard here used to duplicate the `action` half, which
+    // left `opp_action` — the wire's newest field — checked by nothing that ever
+    // runs on the receive path. Do not reintroduce a second copy: extend
+    // validateStep in transport.js instead.
+    //
+    // The failure MODE is deliberately unchanged: report on the transport's
+    // error channel and drop the step (no `state` reply), rather than throwing
+    // out of the handler. _handleMessage's .catch would turn a throw into the
+    // same emit, but only when handleStep is reached through wireTransport.
+    try {
+      validateInbound(msg);
+    } catch (err) {
+      this.transport.emit('error', err);
       return;
     }
+    const action = msg.action;
+    // Absent and explicit null are the SAME thing on this field: "the opponent
+    // takes no action this window" (schema.md). Never a zeroth macro.
+    const oppAction =
+      msg.opp_action === undefined || msg.opp_action === null ? null : msg.opp_action;
 
     const windowStartTick = this._currentTick;
 
@@ -2321,15 +2382,47 @@ class ArenaBots {
       });
     }
 
+    // 2b. THE OPPONENT'S MACRO (T11b), in this SAME decision window and on this
+    // SAME windowStartTick. The two executors therefore share one clock: one
+    // `step` == one decision window == ACTION_REPEAT gate ticks for BOTH sides,
+    // which is the invariant Python's shadow swing meter reconstructs by
+    // counting decision windows (schema.md "the swing report"). Anything that
+    // advanced the opponent's gate by a different amount — stamping the swing
+    // with the post-advance tick, or beginning twice in one window — desyncs
+    // that meter and degenerates the opponent into mashing ATTACK.
+    //
+    // Resolved ONCE into a local so begin/end are guaranteed to act on the same
+    // executor even if the opponent connection changes mid-window.
+    const opponentExecutor = oppAction === null ? null : this._bindOpponentExecutor();
+    // The swing report: null == "no opp_action this window" == the key is left
+    // off the wire. A REQUESTED action that could not be driven at all (no
+    // opponent bot — a human cannot be puppeted) reports false rather than
+    // nothing: it is silently ignored in the sense of never throwing, but the
+    // honest answer to "did it execute?" is no, and an omitted key would tell
+    // Python to assume the swing fired and drain a meter that never charged.
+    let oppActionExecuted = null;
+    if (oppAction !== null) {
+      oppActionExecuted =
+        opponentExecutor === null
+          ? false
+          : opponentExecutor.begin(oppAction, this._opponentMacroContext(windowStartTick)).swung;
+    }
+
     // 3. Hold for ACTION_REPEAT ticks. The wired per-bot health handlers fold
     //    every hit into this.events during the wait; we update the last-seen
     //    memory from perception as the opponent is observed.
     await this._waitTicks(ACTION_REPEAT);
     this._updateLastSeen(opponentHandle);
 
-    // 4. Release the transient control states held for the window.
+    // 4. Release the transient control states held for the window — the
+    //    opponent's on the same boundary as the learner's, so a movement macro
+    //    is held for exactly the window that pressed it and never leaks into
+    //    the next one.
     if (this.executor !== null) {
       this.executor.end();
+    }
+    if (opponentExecutor !== null) {
+      opponentExecutor.end();
     }
 
     // 5. Advance the tick to the window boundary, drain the window's events
@@ -2343,8 +2436,78 @@ class ArenaBots {
       wallDistances: this._probeWallDistances(),
       tick: this._serverTick(),
       codeVersion: resolveCodeVersion(),
+      oppActionExecuted,
     });
     this._trySend(stateMsg);
+  }
+
+  /**
+   * The opponent's macro executor, or null when the opponent cannot be driven.
+   *
+   * Bound to the opponent's OWN Mineflayer connection, because that is what a
+   * macro acts on: control states, bot.attack and bot.lookAt all need a
+   * connection, and _opponentHandle()'s `entity` is a view, not a puppet. In
+   * 'human' mode there is no such connection — the challenger is a person on
+   * their own client — so this returns null and the caller silently ignores the
+   * `opp_action` (plan Error Handling: "opp_action for an absent opponent —
+   * silently ignored, never throws").
+   *
+   * CREATED ON FIRST USE, and only from the step path (see the constructor):
+   * a run that never sends `opp_action` never creates one, so the M2 dummy path
+   * cannot be perturbed by code that exists for the opponent-acts path.
+   *
+   * @returns {object|null} A MacroExecutor bound to the opponent bot, or null.
+   */
+  _bindOpponentExecutor() {
+    if (this.opponentExecutor !== null) {
+      return this.opponentExecutor;
+    }
+    const bot = this._opponentBot();
+    if (bot === null) {
+      return null;
+    }
+    // THE DEFAULT WEAPON PERIOD, DELIBERATELY. No options object: the default
+    // IS the contract. Python's shadow tracker hard-codes
+    // OPPONENT_ATTACK_SPEED_TICKS = SERVER_TPS / 1.6 (env/mc_pvp_env.py) to
+    // mirror MacroExecutor's own IRON_SWORD_ATTACK_SPEED_TICKS default, and
+    // nothing on either side would catch the two drifting apart — the opponent
+    // would simply stop attacking, or flail. Note the dummy is BARE-HANDED
+    // (spawn_dummy_pad.mcfunction runs $clear with no $give): do NOT "correct"
+    // this to a bare-hand speed. The two sides must agree, and the agreed value
+    // is the default. The learner's this._weaponAttackSpeedTicks is
+    // deliberately NOT reused here — that is the LEARNER's weapon, and passing
+    // it would silently re-point this at whatever a future task sets it to.
+    this.opponentExecutor = new MacroExecutor(bot);
+    return this.opponentExecutor;
+  }
+
+  /**
+   * The macro context for the OPPONENT's executor — the mirror image of the
+   * learner's: whom the opponent swings at, and where it turns.
+   *
+   * Both point at the LEARNER, read live off its entity. The turn target
+   * mirrors _updateLastSeen's frozen unconditional write (perfect tracking) so
+   * TURN_TO_LAST_SEEN is not a silent no-op for the opponent the way a null
+   * memory would make it; the omniscient ScriptedBot never needs stale memory
+   * anyway (`can_see_target` is always true for it). The position is SNAPSHOT
+   * via clone() for the same reason the learner's memory is: bot.lookAt needs a
+   * real Vec3 (a plain object made it throw, and the unhandled rejection killed
+   * the bridge mid-episode) and a live vector would keep moving under it.
+   *
+   * @param {number} currentTick The tick this window begins on — the SAME
+   *   windowStartTick the learner's executor gets, so both gates ride one clock.
+   * @returns {{currentTick:number, opponentEntity:object|null,
+   *            lastSeenPosition:object|null}}
+   */
+  _opponentMacroContext(currentTick) {
+    const learnerEntity = this.learner && this.learner.entity ? this.learner.entity : null;
+    const pos = learnerEntity ? learnerEntity.position : null;
+    let lastSeenPosition = null;
+    if (pos && typeof pos.x === 'number' && typeof pos.y === 'number' && typeof pos.z === 'number') {
+      lastSeenPosition =
+        typeof pos.clone === 'function' ? pos.clone() : { x: pos.x, y: pos.y, z: pos.z };
+    }
+    return { currentTick, opponentEntity: learnerEntity, lastSeenPosition };
   }
 
   // -------------------------------------------------------------------------
