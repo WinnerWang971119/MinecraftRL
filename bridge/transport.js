@@ -161,8 +161,10 @@ function describeJsonType(value) {
 // bridge/schema.json and the validator in bridge/messages.py. Inbound messages
 // are validated by the Python side (messages.validate) before they are sent;
 // `validateInbound` below mirrors the Python->Node branches so the Node side can
-// check a received command against the same rules (see its own comment for why
-// it is NOT wired into the server's receive path).
+// check a received command against the same rules. `ArenaBots.handleStep`
+// (bridge/bot.js, T11b) calls it directly on every step; `BridgeServer._onData`
+// below still does not (see its own comment for why the raw receive path
+// forwards every framed message untouched regardless).
 // ---------------------------------------------------------------------------
 
 class WireError extends Error {
@@ -344,12 +346,18 @@ const OUTBOUND_VALIDATORS = Object.freeze({
 // and `_validate_reset` / `_validate_step` / `_validate_close` in
 // bridge/messages.py.
 //
-// DELIBERATELY NOT wired into BridgeServer._onData. The receive path currently
-// forwards every framed message untouched and the command handlers do their own
-// defensive checks; making a schema violation destroy the connection would
-// change live M2 behavior, which this layer has no mandate to do. This is a pure
-// exported function so a handler can opt in (and so a unit test can assert the
-// contract without a socket).
+// NOT wired into BridgeServer._onData below: the raw receive path still frames
+// bytes and forwards every message untouched, and making a schema violation
+// destroy the connection there would change live M2 behavior, which this layer
+// has no mandate to do. It IS wired one level up, into `ArenaBots.handleStep`
+// (bridge/bot.js, T11b) — the step handler calls this directly instead of
+// duplicating the action-range check inline, so there is exactly one
+// implementation of the rule, not two. `handleReset` does not call it, and
+// `close` has no separate handler to call it from at all — `_handleMessage`'s
+// switch (bridge/bot.js) inlines the `close` case straight to
+// `transport.dropConnection()`. This remains a pure exported function so any
+// other receive path can opt in (and so a unit test can assert the contract
+// without a socket).
 // ---------------------------------------------------------------------------
 
 function validateReset(msg) {
