@@ -601,6 +601,21 @@ def test_exhibition_config_accepts_real_usernames(good):
     assert ExhibitionConfig(challenger_username=good).challenger_username == good
 
 
+@pytest.mark.parametrize("bad", ["abc\n", "abc\r", "a\nop b", "abc\n\n"])
+def test_exhibition_config_rejects_a_name_carrying_a_line_break(bad):
+    """A trailing newline must be refused, not just an embedded one.
+
+    This name is written to Paper's stdin console for T6's between-match heal,
+    and that console runs at op level 4. Python's ``$`` also matches immediately
+    BEFORE a trailing newline, so ``"abc\\n"`` satisfied the original pattern and
+    split one ``tp`` into two console lines. Never an injection primitive — the
+    anchors always forbade content after the break, so ``"a\\nop b"`` was already
+    rejected — but a malformed command all the same. The pattern uses ``\\Z``.
+    """
+    with pytest.raises(ValueError, match="challenger_username must be"):
+        ExhibitionConfig(challenger_username=bad)
+
+
 @pytest.mark.parametrize("bad", [-1, 2.5, True, "8"])
 def test_exhibition_config_rejects_a_bad_reflex_window(bad):
     with pytest.raises(ValueError, match="reflex_blind_steps must be"):
