@@ -59,8 +59,9 @@ from agent.replay import DEFAULT_ALPHA, DEFAULT_BETA0, DEFAULT_PRIORITY_EPS
 __all__ = [
     "TrainConfig",
     "MEASURED_PER_ARENA_TRANSITIONS_PER_S",
+    "MEASURED_MEAN_EPISODE_STEPS",
     "ASSUMED_RUN_HOURS",
-    "ASSUMED_MEAN_EPISODE_STEPS",
+    "ASSUMED_MEAN_EPISODE_STEPS",  # deprecated alias; see its definition below
     "EPS_DECAY_FRACTION_OF_RUN",
     "DEFAULT_EPS_DECAY_ARENAS",
     "projected_episodes",
@@ -72,9 +73,11 @@ __all__ = [
 # Sizing the ε schedule from throughput (T16(a) / AC15 / AC17).
 #
 # The four inputs below are the ONLY quantities the default ε-decay window is
-# built from. Exactly one of them is measured; the other three are assumptions,
-# and each says so on its own line. Anything derived from them is therefore a
-# PROJECTION, never a measurement — which is why ``--eps-decay-episodes`` exists.
+# built from. TWO of them are measured (the per-arena rate and the mean episode
+# length) and two are assumptions, and each says which on its own line. Anything
+# derived from them is still a PROJECTION, never a measurement — the run length
+# is a plan for the night, not an observation of one — which is why
+# ``--eps-decay-episodes`` exists.
 # ---------------------------------------------------------------------------
 
 #: MEASURED (AC16, 2026-08-16). Per-arena collection rate in transitions/second,
@@ -90,28 +93,45 @@ MEASURED_PER_ARENA_TRANSITIONS_PER_S: float = 4.8782
 #: the decay window) proportionally smaller.
 ASSUMED_RUN_HOURS: float = 12.0
 
-#: ASSUMPTION — NOT MEASURED. Mean decisions per TRAINING episode against the
-#: scripted opponent. **Override the result with ``--eps-decay-episodes N`` once
-#: the smoke run reports a real mean episode length**; do not edit this constant
-#: under schedule pressure.
+#: MEASURED (smoke run, 2026-08-16). Mean decisions per TRAINING episode: 25
+#: pads against the SCRIPTED opponent, warm-started from ``runs/m2_multi.pt``,
+#: eval off, clean exit at 400 grad steps with ``episodes=519`` over 1212 s.
+#: That is 285 steps/episode against a cap of ``MAX_EPISODE_STEPS`` = 400 — most
+#: episodes run most of the way to the timeout.
 #:
-#: It is deliberately NOT ``MAX_EPISODE_STEPS`` (400): 400 is the TIMEOUT, the
-#: length of an episode in which nobody won, not a typical one. The only measured
-#: figure in this repo is ``mean_episode_length: 17.0``
-#: (``runs/m2_multi/summary.json``) — but that is a GREEDY eval against a
-#: STATIONARY dummy, i.e. the easiest episode this env can produce, so it is a
-#: LOWER bound on a training episode against an opponent that moves, strafes and
-#: (on HARD) flees. 30 is that lower bound doubled.
+#: CROSS-CHECK, because a mean episode length is easy to mis-derive: 519 x 285 /
+#: 1212 s = 122.0 transitions/s, which closes to within 0.1% of the 121.955/s
+#: aggregate measured independently by the AC16 pad sweep
+#: (``MEASURED_PER_ARENA_TRANSITIONS_PER_S`` x 25). Two separate measurements of
+#: the same stream agree, so the derivation is sound.
 #:
-#: Erring low here is intentional, because the error is asymmetric. This value
-#: is the DIVISOR of the projected episode count, so assuming too LOW a length
-#: over-estimates the episode count and the decay window comes out long — ε then
-#: sits above its floor for more of the night. Assuming too HIGH a length
-#: re-creates exactly the bug this constant exists to fix: ε on the floor a few
-#: percent into the run. Under a warm start ε only spans 0.25 -> 0.05, so a decay
-#: window that runs long costs very little, while one that runs short costs the
-#: night.
-ASSUMED_MEAN_EPISODE_STEPS: float = 30.0
+#: WHICH OPPONENT THIS IS MEASURED AGAINST, because the number is not universal:
+#: the scripted HARD tier, which flees at 6 HP and drags fights toward the
+#: timeout. A human or the stationary dummy would produce a different (shorter)
+#: figure. That makes 285 the right basis for sizing a TRAINING run specifically
+#: — which is the only thing this constant feeds — and the wrong basis for
+#: reasoning about eval episodes.
+#:
+#: WHY THE OLD VALUE WAS WRONG, so nobody restores it. This shipped as
+#: ``ASSUMED_MEAN_EPISODE_STEPS = 30.0``, obtained by doubling
+#: ``mean_episode_length: 17.0`` from ``runs/m2_multi/summary.json``. That 17.0
+#: is a GREEDY eval against a STATIONARY dummy — the single easiest episode this
+#: environment can produce — so it was never a lower bound worth doubling; it was
+#: 9.5x low. This value is the DIVISOR of the projected episode count, so too LOW
+#: a length over-estimates the episodes and the decay window comes out far too
+#: long: at 25 pads the derived default was 26,342 episodes == 142% of an entire
+#: 12 h run, i.e. ε would never finish decaying and would sit near its start value
+#: all night. Both directions are real failures — too high floors ε a few percent
+#: into the run (the bug T16 exists to fix), too low never anneals it at all — so
+#: there is no safe direction to err in. RE-MEASURE instead of padding, and set
+#: ``--eps-decay-episodes N`` for a run whose regime differs from the one above.
+MEASURED_MEAN_EPISODE_STEPS: float = 285.0
+
+#: DEPRECATED ALIAS, kept only because :mod:`agent.train` still imports this
+#: name. It is the same measured value; the "ASSUMED" spelling is now false.
+#: Delete it (and the import in ``agent/train.py``, whose startup line still says
+#: "assuming N steps/episode") the next time that module is edited.
+ASSUMED_MEAN_EPISODE_STEPS: float = MEASURED_MEAN_EPISODE_STEPS
 
 #: ASSUMPTION (field convention, and the number AC15 is written against) —
 #: fraction of a run's projected episodes the ε decay should span. ~15% is the
@@ -135,7 +155,7 @@ def projected_episodes(
     *,
     hours: float = ASSUMED_RUN_HOURS,
     per_arena_transitions_per_s: float = MEASURED_PER_ARENA_TRANSITIONS_PER_S,
-    mean_episode_steps: float = ASSUMED_MEAN_EPISODE_STEPS,
+    mean_episode_steps: float = MEASURED_MEAN_EPISODE_STEPS,
 ) -> float:
     """Project how many EPISODES a run of ``arenas`` pads collects.
 
@@ -153,8 +173,8 @@ def projected_episodes(
         per_arena_transitions_per_s: Collection rate for ONE pad (see
             :data:`MEASURED_PER_ARENA_TRANSITIONS_PER_S`).
         mean_episode_steps: Mean decisions per episode (see
-            :data:`ASSUMED_MEAN_EPISODE_STEPS` — an ASSUMPTION, not a
-            measurement).
+            :data:`MEASURED_MEAN_EPISODE_STEPS` — measured against the SCRIPTED
+            opponent; a different opponent is a different number).
 
     Returns:
         Projected episode count as a float (a projection; it is not rounded here
@@ -186,7 +206,7 @@ def eps_decay_episodes_for(
     fraction: float = EPS_DECAY_FRACTION_OF_RUN,
     hours: float = ASSUMED_RUN_HOURS,
     per_arena_transitions_per_s: float = MEASURED_PER_ARENA_TRANSITIONS_PER_S,
-    mean_episode_steps: float = ASSUMED_MEAN_EPISODE_STEPS,
+    mean_episode_steps: float = MEASURED_MEAN_EPISODE_STEPS,
 ) -> int:
     """Return the ε-decay window (in GLOBAL episodes) for a run of ``arenas`` pads.
 
@@ -333,9 +353,9 @@ class TrainConfig:
     #: :data:`DEFAULT_EPS_DECAY_ARENAS` pad(s) is projected to collect. The
     #: multi-arena CLI re-derives it from the real ``--arenas`` (all arenas share
     #: ONE episode counter, so N pads consume this budget N times faster), and
-    #: ``--eps-decay-episodes N`` overrides both — THAT is the flag to set from
-    #: the smoke run's measured mean episode length, rather than editing any
-    #: constant in this file.
+    #: ``--eps-decay-episodes N`` overrides both — THAT is the flag to set when a
+    #: run's regime differs from the one :data:`MEASURED_MEAN_EPISODE_STEPS` was
+    #: measured under, rather than editing any constant in this file.
     eps_decay_episodes: int = eps_decay_episodes_for(DEFAULT_EPS_DECAY_ARENAS)
 
     # -- replay buffer sizing --------------------------------------------
@@ -360,9 +380,10 @@ class TrainConfig:
 
     #: TUNE — transitions that must be stored before the FIRST gradient step
     #: (warm-up). 25k for the multi-arena path: the old 1000 is ~8 seconds of
-    #: fleet output (121.95/s) and about 33 episodes, so the first gradients came
-    #: from a handful of correlated openings. 25k spreads the warm-up over ~800
-    #: episodes drawn from all N pads, which is what makes them decorrelated.
+    #: fleet output (121.95/s) and — at the MEASURED 285 steps/episode — about 3
+    #: and a half episodes, so the first gradients came from one or two correlated
+    #: openings. 25k spreads the warm-up over ~88 episodes drawn from all N pads,
+    #: which is what makes them decorrelated.
     #: Gating is on ``len(replay) >= min_replay``. TUNE: keep >= a few full
     #: windows; raise for more diverse warm-up.
     min_replay: int = 25_000

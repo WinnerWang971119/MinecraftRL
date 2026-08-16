@@ -10,12 +10,19 @@ were wrong, not merely to re-state the shipped default:
   ``distributed.actor.GlobalEpisodeCounter`` (``distributed/actor.py:672-674``;
   the counter is built at ``agent/train.py`` in ``train_multi_arena`` and re-read
   for the epsilon log), so at 25 pads that value floors epsilon after ~8 episodes
-  PER ARENA — ~0.1% of a night, against the field's ~15% guidance. Pinned below
+  PER ARENA — ~1% of a night, against the field's ~15% guidance. Pinned below
   as a PROPERTY of the schedule evaluated at the chosen pad count, and pinned
   again by asserting the OLD value still violates it.
 * **The projection is a formula, not a magic number.** Pinned with hand-computed
   arithmetic on explicit inputs, so a changed coefficient or a swapped
   numerator/denominator fails even if the module constants move.
+* **Both measured inputs are pinned to their measurement.** The per-arena rate
+  (AC16 pad sweep) and the mean episode length (the 25-pad smoke run) are each
+  pinned to a literal against the arithmetic that produced it. The episode length
+  in particular shipped once as an unmeasured 30.0 that was 9.5x low, which sized
+  the 25-pad decay window at 142% of a whole 12 h run — epsilon would never have
+  finished decaying. Every other assertion here is dynamic and would survive that
+  regression, so the literals are the guard.
 * **Ape-X per-actor epsilon (issue #15).** Pinned: arena 0 is the MOST
   exploratory (the convention the whole scheme rests on), the ordering is strict,
   the exact exponent is ``i/(N-1)`` and not ``i/N``, N==1 does not divide by zero,
@@ -35,10 +42,10 @@ from typing import Any, List, Tuple
 import pytest
 
 from agent.train_config import (
-    ASSUMED_MEAN_EPISODE_STEPS,
     ASSUMED_RUN_HOURS,
     DEFAULT_EPS_DECAY_ARENAS,
     EPS_DECAY_FRACTION_OF_RUN,
+    MEASURED_MEAN_EPISODE_STEPS,
     MEASURED_PER_ARENA_TRANSITIONS_PER_S,
     TrainConfig,
     eps_decay_episodes_for,
@@ -50,6 +57,16 @@ CHOSEN_PADS = 25
 
 #: What ``eps_decay_episodes`` used to be — single-arena sizing.
 OLD_SINGLE_ARENA_DEFAULT = 200
+
+#: The 25-pad smoke run behind ``MEASURED_MEAN_EPISODE_STEPS``: 519 episodes and
+#: 400 grad steps in 1212 s, warm-started, against the scripted opponent.
+SMOKE_EPISODES = 519
+SMOKE_SECONDS = 1212.0
+
+#: The decay window that run's measured episode length implies at 25 pads. The
+#: number the operator is told to pass; wrong by 9.5x (26,342) before it was
+#: measured.
+DERIVED_WINDOW_AT_CHOSEN_PADS = 2773
 
 
 def _cfg(**overrides: Any) -> TrainConfig:
@@ -96,12 +113,13 @@ class TestProjectedEpisodesFormula:
         assert projected_episodes(CHOSEN_PADS) == pytest.approx(CHOSEN_PADS * one)
 
     def test_a_longer_episode_means_fewer_episodes(self):
-        # The mean episode length is a DIVISOR. Getting this backwards is how the
-        # 400-step timeout would sneak in and shrink the decay window 13x.
+        # The mean episode length is a DIVISOR, and it is the term this projection
+        # is most sensitive to: the shipped value was once 30.0 against a measured
+        # 285, and that alone inflated the derived decay window 9.5x.
         short = projected_episodes(CHOSEN_PADS, mean_episode_steps=30.0)
-        long = projected_episodes(CHOSEN_PADS, mean_episode_steps=400.0)
+        long = projected_episodes(CHOSEN_PADS, mean_episode_steps=285.0)
         assert long < short
-        assert short / long == pytest.approx(400.0 / 30.0)
+        assert short / long == pytest.approx(285.0 / 30.0)
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -135,14 +153,38 @@ class TestProjectedEpisodesFormula:
     def test_the_run_length_assumption_is_one_unattended_night(self):
         assert 8.0 <= ASSUMED_RUN_HOURS <= 16.0
 
-    def test_the_assumed_episode_length_is_not_the_timeout(self):
+    def test_the_measured_episode_length_is_not_the_timeout(self):
         from agent.contract_config import MAX_EPISODE_STEPS
 
-        # The plan says this explicitly: 400 is a TIMEOUT, not a typical episode.
-        # It also must stay above the one measured figure (17.0, a greedy eval vs
-        # a stationary dummy) which is a lower bound on a real training episode.
-        assert ASSUMED_MEAN_EPISODE_STEPS != MAX_EPISODE_STEPS
-        assert 17.0 <= ASSUMED_MEAN_EPISODE_STEPS < MAX_EPISODE_STEPS
+        # 400 is the TIMEOUT — the length of an episode nobody won. Fights against
+        # the HARD tier drag most of the way toward it, but a mean AT the cap would
+        # mean every episode timed out, which is a broken env, not a measurement.
+        # It must also stay above the 17.0 from the greedy-vs-stationary-dummy
+        # eval, which is the easiest episode this env produces.
+        assert MEASURED_MEAN_EPISODE_STEPS != MAX_EPISODE_STEPS
+        assert 17.0 < MEASURED_MEAN_EPISODE_STEPS < MAX_EPISODE_STEPS
+
+    def test_the_measured_episode_length_matches_the_smoke_run(self):
+        # The literal pin, and the arithmetic that earned it. Every other epsilon
+        # assertion in this file is dynamic in this constant, so without this line
+        # a revert to the old unmeasured 30.0 would pass the whole suite.
+        #
+        # 25 pads, scripted opponent, warm start from runs/m2_multi.pt, eval off:
+        # 519 episodes and 400 grad steps in 1212 s.
+        assert MEASURED_MEAN_EPISODE_STEPS == 285.0
+
+        # It closes against a SEPARATE measurement of the same stream: the smoke
+        # run's own transition rate must reproduce AC16's pad-sweep aggregate.
+        # A mis-derived mean (e.g. counting decisions per arena instead of per
+        # episode) would break this closure even though 285 is otherwise
+        # unfalsifiable from inside the test suite.
+        smoke_rate = SMOKE_EPISODES * MEASURED_MEAN_EPISODE_STEPS / SMOKE_SECONDS
+        sweep_rate = MEASURED_PER_ARENA_TRANSITIONS_PER_S * CHOSEN_PADS
+        assert smoke_rate == pytest.approx(sweep_rate, rel=0.01)
+
+        # And it is emphatically NOT the value it replaced: that one was doubled
+        # from a greedy eval against a stationary dummy and came out 9.5x low.
+        assert MEASURED_MEAN_EPISODE_STEPS / 30.0 == pytest.approx(9.5, abs=0.05)
 
 
 class TestEpsDecayEpisodesFor:
@@ -192,6 +234,16 @@ class TestEpsDecayEpisodesFor:
     def test_the_default_is_no_longer_the_single_arena_literal(self):
         assert TrainConfig().eps_decay_episodes != OLD_SINGLE_ARENA_DEFAULT
 
+    def test_the_window_the_operator_is_told_to_pass_is_the_measured_one(self):
+        # The headline number, pinned as a literal for the same reason the
+        # constants are: everything else here is dynamic and would happily
+        # re-derive 26,342 (142% of a 12 h run — epsilon never anneals) from a
+        # reverted episode length without a single failure.
+        assert eps_decay_episodes_for(CHOSEN_PADS) == DERIVED_WINDOW_AT_CHOSEN_PADS
+        # And a 12 h run must actually CONTAIN the window it is given, with room
+        # to exploit afterwards. This is the check the old value failed at 1.42x.
+        assert eps_decay_episodes_for(CHOSEN_PADS) < projected_episodes(CHOSEN_PADS)
+
 
 class TestAC15EpsilonStillExploresAtTheChosenPadCount:
     """TC26: at 25 pads epsilon must still be above its floor at ~15% of the run."""
@@ -231,14 +283,22 @@ class TestAC15EpsilonStillExploresAtTheChosenPadCount:
     def test_the_old_default_would_still_violate_ac15_at_this_pad_count(self):
         # The mutation guard. If someone re-pins eps_decay_episodes to a
         # single-arena literal, THIS is the assertion that says so out loud.
+        from agent.train import epsilon_schedule_report
+
         cfg = _cfg(arenas=CHOSEN_PADS, eps_decay_episodes=OLD_SINGLE_ARENA_DEFAULT)
         fraction = self._floor_fraction(cfg)
-        assert fraction < 0.01, (
+        # Hand-computed and pinned on BOTH sides: 200 / 18,486 projected episodes
+        # == 1.08%. Two-sided because a one-sided bound is also satisfied by a
+        # projection that collapsed to nonsense.
+        assert fraction == pytest.approx(200.0 / 18_485.8, rel=0.02), (
             "the old default was supposed to floor epsilon ~1% into a 25-pad run; "
             f"got {fraction:.4%} - the projection changed and this test's premise "
             "with it"
         )
         assert fraction < EPS_DECAY_FRACTION_OF_RUN
+        # A genuinely wrong window must still be LOUD at startup, not merely
+        # detectable by arithmetic in a test.
+        assert len(epsilon_schedule_report(cfg)) == 2
 
     def test_a_run_at_one_pad_is_unaffected_by_the_multi_arena_sizing(self):
         cfg = _cfg(arenas=1)
@@ -814,12 +874,22 @@ class TestReplaySizing:
 
     def test_min_replay_covers_many_episodes_worth_of_warm_up(self):
         cfg = TrainConfig()
-        episodes = cfg.min_replay / ASSUMED_MEAN_EPISODE_STEPS
+        episodes = cfg.min_replay / MEASURED_MEAN_EPISODE_STEPS
 
-        assert episodes > 100, (
+        # Pinned two-sided at the MEASURED episode length: 25,000 / 285 == 87.7
+        # episodes. This assertion read `> 100` while the divisor was the
+        # unmeasured 30.0 (which claimed 833 episodes, 9.5x too many) — the
+        # threshold was never a property of the warm-up, it was an artifact of a
+        # wrong constant. The exact value is the stronger statement, and it still
+        # fails the moment min_replay or the episode length moves.
+        assert episodes == pytest.approx(87.7, abs=0.5)
+        assert episodes > 80, (
             "the warm-up must span enough episodes that the first gradients are "
             f"not a handful of correlated openings; got {episodes:.0f}"
         )
+        # It is emphatically not the handful the old 1000 bought: 1000 / 285 is
+        # three and a half episodes.
+        assert episodes > 20.0 * (1_000 / MEASURED_MEAN_EPISODE_STEPS)
         # And it must leave room for at least one sampleable window.
         assert cfg.min_replay > cfg.burn_in + cfg.seq_len
 
@@ -895,8 +965,9 @@ class TestExplorationFlags:
         assert _cfg_from_argv([]).eps_decay_episodes == TrainConfig().eps_decay_episodes
 
     def test_an_explicit_window_beats_the_derivation(self):
-        # THE flag the operator sets from the smoke run's measured mean episode
-        # length, instead of editing ASSUMED_MEAN_EPISODE_STEPS.
+        # THE flag the operator sets for a run whose regime differs from the one
+        # MEASURED_MEAN_EPISODE_STEPS was measured under (a different opponent
+        # tier, a shorter night), instead of editing the constant.
         cfg = _cfg_from_argv(
             ["--arenas", str(CHOSEN_PADS), "--eps-decay-episodes", "12345"]
         )
