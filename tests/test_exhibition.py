@@ -23,8 +23,8 @@ Required by the plan (docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md
     ``run()`` entirely leaves every other test in this file green.
 
   * T6 (AC5) — the SEPARATE reset command. ``--reset`` files a request and
-    starts nothing; the running launcher consumes it, heals and repositions
-    BOTH sides and plays exactly one more match. The AC4 half is tested as
+    starts nothing; the running launcher consumes it, heals, repositions and
+    re-arms BOTH sides and plays exactly one more match. The AC4 half is tested as
     hard as the AC5 half: a match never restarts itself, a request left over
     from an earlier launch is discarded, and a request filed while a match is
     still running is discarded too (honoring it would make the death the
@@ -85,6 +85,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OPS_JSON = REPO_ROOT / "server" / "ops.json"
 DUMMY_PAD_MCFUNCTION = (
     REPO_ROOT / "server" / "arena" / "data" / "arena" / "function" / "spawn_dummy_pad.mcfunction"
+)
+LEARNER_PAD_MCFUNCTION = (
+    REPO_ROOT / "server" / "arena" / "data" / "arena" / "function" / "spawn_learner_pad.mcfunction"
 )
 
 
@@ -1861,7 +1864,31 @@ class TestHumanResetCommands:
             "effect clear Steve",
             "effect give Steve minecraft:instant_health 1 9 true",
             "effect give Steve minecraft:saturation 1 19 true",
+            "clear Steve minecraft:iron_sword",
+            "give Steve minecraft:iron_sword 1",
         ]
+
+    def test_the_challenger_is_armed_with_a_sword(self):
+        # The bug this pair exists to kill: the datapack re-arms the LEARNER on
+        # every reset (spawn_learner_pad.mcfunction) and nothing ever armed the
+        # human, so a demo-day classmate punched for 1 damage into an iron
+        # sword's 6. A reset that heals but does not arm is the old bug back.
+        commands = human_reset_commands(pad_anchor(0), "Steve")
+        assert "give Steve minecraft:iron_sword 1" in commands
+
+    def test_the_gear_clear_is_scoped_to_the_sword_and_comes_before_the_give(self):
+        commands = human_reset_commands(pad_anchor(0), "Steve")
+        clear_idx = commands.index("clear Steve minecraft:iron_sword")
+        give_idx = commands.index("give Steve minecraft:iron_sword 1")
+        # ORDER: clear THEN give, or the clear eats the sword it was supposed to
+        # make room for and the challenger fights bare-fisted anyway.
+        assert clear_idx < give_idx
+        # SCOPED, both ways. Widening it to a blanket `clear Steve` would empty
+        # a person's inventory, which is not "heal and reposition"; dropping it
+        # for a lone `give` would pile a sword per reset into their hotbar. The
+        # narrow clear is the whole reason the give is idempotent.
+        assert "clear Steve" not in commands
+        assert not any(c.startswith("clear ") and "iron_sword" not in c for c in commands)
 
     def test_no_command_carries_a_leading_slash(self):
         # Console commands are slash-free; formatHumanResetCommands' output is
@@ -1930,6 +1957,32 @@ class TestHumanResetCommands:
         for line in datapack:
             if line.startswith("$effect "):
                 assert line[1:].replace("$(dummy)", "Steve") in ours
+
+        # Gear is the ONE place the dummy is the wrong model: it is given a
+        # blanket `$clear` and no weapon at all, which is right for a passive
+        # training target and wrong for a person facing an armed agent.
+        assert "$clear $(dummy)" in datapack
+        assert not any(line.startswith("$give ") for line in datapack)
+        assert "clear Steve" not in ours
+
+    def test_the_gear_matches_what_the_committed_datapack_hands_the_learner(self):
+        """Drift pin for the symmetry claim. The challenger's sword exists only
+        because the learner gets one on every reset; if that line is re-geared
+        (a diamond sword, armor, nothing at all) the fight silently stops being
+        symmetric, so it fails here instead of in front of a room."""
+        datapack = LEARNER_PAD_MCFUNCTION.read_text(encoding="utf-8").splitlines()
+
+        give_lines = [line for line in datapack if line.startswith("$give ")]
+        assert give_lines == ["$give $(learner) minecraft:iron_sword 1"]
+
+        ours = human_reset_commands(pad_anchor(0), "Steve")
+        assert give_lines[0][1:].replace("$(learner)", "Steve") in ours
+        # And no armor on either side: the checkpoint never trained against an
+        # armored opponent, so armor is out of scope by decision, not oversight.
+        # Command lines only (`$...`); a comment may discuss armor freely.
+        commands_in_datapack = [line for line in datapack if line.startswith("$")]
+        assert not any("armor" in line for line in commands_in_datapack)
+        assert not any("armor" in command for command in ours)
 
 
 # ---------------------------------------------------------------------------
