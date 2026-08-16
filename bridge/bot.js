@@ -18,14 +18,21 @@
 //   Defaults (anchor 0,0 / learner_bot / dummy_bot) reproduce the single-arena
 //   path exactly.
 //
-// THE BRIDGE IS THE SOLE COMMAND CHANNEL AND THE SOLE RESET AUTHORITY:
-//   RCON is disabled and the launcher has no console, so `/function arena:*`
-//   calls ride an opped bot's chat. It is also the sole reset authority in the
-//   other direction — it issues NO reset commands of its own, because two
-//   overlapping reset implementations can double-apply (a bridge-side `/effect
-//   clear` landing in the same tick after the datapack's instant heal and
-//   saturation would strip both, silently). The datapack APPLIES the reset
-//   template; the bridge VERIFIES it with the read-back gate.
+// THE BRIDGE IS THE SOLE COMMAND CHANNEL FOR ARENA MACROS, AND THE SOLE RESET
+// AUTHORITY:
+//   RCON is disabled and bot.js itself has no console access, so `/function
+//   arena:*` calls ride an opped bot's chat. (As of T6, deploy/exhibition.py
+//   DOES hold a console pipe to Paper's stdin by default — start.sh `exec`s
+//   the JVM, so that pipe IS the server console — unless launched with
+//   `--no-paper-console`. Even when open, it is used only to heal/reposition
+//   a human challenger between exhibition matches, never for arena macros; it
+//   is a separate process from the bridge and does not change anything here.)
+//   The bridge is also the sole reset authority in the other direction — it
+//   issues NO reset commands of its own, because two overlapping reset
+//   implementations can double-apply (a bridge-side `/effect clear` landing
+//   in the same tick after the datapack's instant heal and saturation would
+//   strip both, silently). The datapack APPLIES the reset template; the
+//   bridge VERIFIES it with the read-back gate.
 //
 // THE READ-BACK GATE (why it is required):
 //   Minecraft chat commands (`/function`, and the /tp, /effect clear and regear
@@ -437,9 +444,11 @@ const DEFAULT_BOT_CONFIG = Object.freeze({
 // ---------------------------------------------------------------------------
 // DATAPACK MACRO BOUNDARY (T9) — pure, exported, unit-testable.
 //
-// The bridge is the sole command channel to the server (RCON is disabled and
-// the launcher has no console), so every `/function arena:*` call is composed
-// here and chatted by an opped bot. Macro arguments are validated BEFORE they
+// The bridge is the sole command channel to the server for arena macros (RCON
+// is disabled and bot.js itself has no console access — see the T6 note in
+// the file banner above for the console channel that does exist and why it
+// doesn't help here), so every `/function arena:*` call is composed here and
+// chatted by an opped bot. Macro arguments are validated BEFORE they
 // are formatted because macro substitution is TEXTUAL and its failure modes are
 // silent:
 //   - a value with an NBT type suffix (`512L`, `0b`, `512.0`, `"512"`) makes
@@ -1514,9 +1523,14 @@ class ArenaBots {
     // wipe the live episode's first-window damage.
     this._resetEpoch = 0;
 
-    // The last-seen opponent world position the bridge remembers for
-    // TURN_TO_LAST_SEEN. Updated from perception when the opponent is visible;
-    // null until the opponent has been seen at least once this episode.
+    // The opponent position the bridge remembers for TURN_TO_LAST_SEEN. NOT
+    // gated on visibility despite the name: _updateLastSeen() (~1800 lines
+    // below) writes the opponent's LIVE position unconditionally every window
+    // (TODO(T12), frozen through 2026-08-20 — see the Contracts table in
+    // docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md and TC14 in
+    // bot.test.js). Still null until the opponent has been seen at least once
+    // this episode, because the write only happens once a window resolves an
+    // opponent handle — but "seen" here means "resolved", not "in FOV".
     this._lastSeenOpponentPos = null;
 
     /** End-of-window server tick (advances by ACTION_REPEAT each step). */
@@ -2250,8 +2264,10 @@ class ArenaBots {
     // sweep, teleport to the anchor, /clear + regear, effect clear, instant
     // health, food/saturation, the dummy's knockback/movement attributes, and
     // a per-bot /spawnpoint. It is issued through the opped learner's chat
-    // because the bridge is the sole command channel (RCON is disabled and the
-    // launcher has no console).
+    // because the bridge itself has no other channel to the server (RCON is
+    // disabled and bot.js holds no console pipe — see the T6 note in the file
+    // banner above for the console channel that does exist and why it doesn't
+    // help here).
     //
     // The bridge deliberately issues NO reset commands of its own any more.
     // Two overlapping reset implementations was the real hazard: the bridge's

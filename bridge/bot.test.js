@@ -1491,6 +1491,75 @@ test('_updateLastSeen stores a Vec3-style clone, not an alias of the live positi
   );
 });
 
+// ===========================================================================
+// TC14 (AC11) — GUARD TEST, NOT A SPEC. Read this before touching either the
+// test or _updateLastSeen.
+//
+// _updateLastSeen() writes the opponent's LIVE position UNCONDITIONALLY, every
+// window, with no field-of-view or line-of-sight check at all — see its own
+// TODO(T12) comment in bridge/bot.js. That is a KNOWN CONTRACT VIOLATION: the
+// macro it feeds, TURN_TO_LAST_SEEN, is meant to face a position the agent
+// genuinely SAW, and today it is an omniscient aim-snap instead. The Contracts
+// table in docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md FREEZES
+// this exact unconditional write through 2026-08-20: gating it removes the
+// agent's only way to re-acquire an opponent it cannot see, with no
+// replacement shipped yet, which would make the demo worse, not more honest.
+//
+// This test therefore asserts the OPPOSITE of correct behavior on purpose. If
+// it starts failing, the two live possibilities are:
+//   1. Someone gated _updateLastSeen() before 2026-08-20 — revert that change,
+//      it breaks the frozen contract and the demo with it.
+//   2. It is after 2026-08-20 and TODO(T12) has been resolved with real
+//      PerceptionFilter-backed gating — in which case DELETE this test, do not
+//      "fix" it to match the new behavior. Its entire premise expires with the
+//      placeholder it documents.
+// ===========================================================================
+test('TC14 (AC11): _updateLastSeen still writes memory when the opponent is behind the learner — KNOWN CONTRACT VIOLATION frozen through 2026-08-20 (TODO(T12))', () => {
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+
+  // The learner stands at the origin facing +z (yaw 0 is the "looks toward
+  // +z" convention documented in env/perception_filter.py). _updateLastSeen()
+  // never actually reads this learner entity — that is exactly the bug — so
+  // it is set up here only to make "behind the learner" a concrete geometry
+  // for a human reader, not because the code under test consults it.
+  bots.learner = { entity: { position: { x: 0.5, y: 64, z: 0.5 }, yaw: 0, pitch: 0 } };
+
+  // The opponent is 20 blocks directly BEHIND the learner: 180 degrees off
+  // its facing, nowhere near env/perception_filter.py's 70-degree FOV cone by
+  // any measure. A genuinely visibility-gated implementation would refuse to
+  // update memory from this position.
+  const behindPos = {
+    x: 0.5,
+    y: 64,
+    z: -19.5,
+    clone() {
+      return { x: this.x, y: this.y, z: this.z };
+    },
+  };
+  bots.dummy = { entity: { position: behindPos } };
+
+  bots._updateLastSeen();
+
+  // Asserted in two steps on purpose: a visibility gate leaves
+  // _lastSeenOpponentPos null, and reading .x/.y/.z off null throws a generic
+  // TypeError that would bury the explanatory message below. Check non-null
+  // FIRST so a future gater sees this message, not a stack trace that reads
+  // like a flaky test.
+  assert.ok(
+    bots._lastSeenOpponentPos !== null,
+    '_updateLastSeen must still record the live position even when the ' +
+      'opponent is behind the learner and outside any FOV cone — this is the ' +
+      'frozen placeholder (TODO(T12), AC11), not a bug to fix here. If it is ' +
+      'after 2026-08-20 and TODO(T12) has been resolved with real ' +
+      'PerceptionFilter-backed gating, DELETE this test instead of updating it.',
+  );
+  assert.deepEqual(
+    { x: bots._lastSeenOpponentPos.x, y: bots._lastSeenOpponentPos.y, z: bots._lastSeenOpponentPos.z },
+    { x: 0.5, y: 64, z: -19.5 },
+    '_updateLastSeen must snapshot the opponent\'s LIVE position, not some other value',
+  );
+});
+
 test('a close message drops only the client; bots stay in-game (per-episode close)', async () => {
   const drops = [];
   const transport = {

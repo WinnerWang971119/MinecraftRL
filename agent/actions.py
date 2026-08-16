@@ -49,8 +49,12 @@ N_ACTIONS: int = len(Macro)  # == 8
 #   - ATTACK calls bot.attack(entity) for a single swing and is manually
 #     cooldown-gated by the bridge (NOT bot.pvp.attack).
 #   - JUMP sets the "jump" control state for one tick.
-#   - TURN_TO_LAST_SEEN calls bot.lookAt(last_seen_position, force=true)
-#     using the stored memory position of the opponent (memory-driven look).
+#   - TURN_TO_LAST_SEEN calls bot.lookAt(last_seen_position, force=true), but
+#     as of TODO(T12) in bridge/bot.js:_updateLastSeen(), that stored position
+#     is the opponent's LIVE position, written unconditionally every window
+#     regardless of visibility — so this is an omniscient aim-snap, not a
+#     memory-gated recall.  Frozen through 2026-08-20 (see docs/plans/
+#     2026-08-16-demo-scripted-opponent-exhibition.md).
 #   - IDLE clears all control states and does not call bot.attack.
 
 MACRO_SEMANTICS: dict[Macro, str] = {
@@ -88,10 +92,16 @@ MACRO_SEMANTICS: dict[Macro, str] = {
         " clears it.  Used for traversal and to break predictable movement."
     ),
     Macro.TURN_TO_LAST_SEEN: (
-        "Rotate to face the last-known opponent position stored in bridge memory."
-        "  Calls bot.lookAt(last_seen_position, true) (force=true bypasses"
-        " interpolation).  Executes even when the opponent is not currently"
-        " visible so the agent can re-acquire line-of-sight."
+        "Rotate to face the opponent's position.  Calls"
+        " bot.lookAt(last_seen_position, true) (force=true bypasses"
+        " interpolation).  KNOWN CONTRACT VIOLATION, frozen through 2026-08-20:"
+        " bridge/bot.js:_updateLastSeen() writes that position from the"
+        " opponent's LIVE world position unconditionally every window, not"
+        " from a memory gated on visibility (TODO(T12)) — so despite the"
+        " macro's name this is an omniscient aim-snap, not a recall of a"
+        " genuinely last-*seen* position.  The agent's own observation stays"
+        " honestly FOV/LoS-gated (env/perception_filter.py); only this turn is"
+        " assisted, and only until TODO(T12) resolves."
     ),
 }
 
