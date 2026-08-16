@@ -413,7 +413,18 @@ def _world_to_local_yaw(vx: float, vy: float, vz: float, yaw: float) -> Tuple[fl
 
 #: Minecraft usernames as this project uses them (offline mode, ops.json).
 #: Mirrors ``MACRO_USERNAME_RE`` in ``bridge/bot.js``.
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+#:
+#: ``\Z``, NOT ``$``: Python's ``$`` also matches immediately *before* a trailing
+#: newline, so ``"abc\n"`` satisfied the old pattern. That name is fed to Paper's
+#: stdin console (T6's between-match heal), where the console runs at op level 4 --
+#: the embedded newline split one ``tp`` into two console lines. The anchors always
+#: forbade content *after* the newline, so ``"a\nop b"`` was rejected and this was
+#: never an injection primitive; it was a malformed command. ``\Z`` closes it.
+#:
+#: The JS mirror is unaffected -- JavaScript's ``$`` without the ``m`` flag matches
+#: only at the true end of input. So the two patterns look identical and are not:
+#: this divergence exists in Python alone. Do not "resync" them by reverting to ``$``.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}\Z")
 
 
 @dataclass(frozen=True)
