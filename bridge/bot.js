@@ -2031,9 +2031,13 @@ class ArenaBots {
    * can mean anything.
    *
    * @param {number} budgetMs Bounded wait for both replies.
+   * @param {number} epoch This invocation's reset epoch (`handleReset`'s local
+   *   `epoch`, taken at claim time). Compared against `this._resetEpoch` AFTER
+   *   the wait below returns, so that a handler superseded while it waited
+   *   logs nothing — see the STALE-EPOCH GUARD below for why.
    * @returns {Promise<void>} Resolves once both replies arrived or the budget expired.
    */
-  async _confirmAttributeOverrides(budgetMs) {
+  async _confirmAttributeOverrides(budgetMs, epoch) {
     const dummy = this.dummy;
     if (!dummy || typeof dummy.on !== 'function') {
       return;
@@ -2077,6 +2081,27 @@ class ArenaBots {
       if (this._attributeReadback === seen) {
         this._attributeReadback = null;
       }
+    }
+
+    // STALE-EPOCH GUARD. The wait above is a new await point, so a retry may
+    // have superseded this handler while it was parked in it — exactly the
+    // scenario the identity-guarded finally above already accounts for. That
+    // guard only protects the WINDOW; it does nothing about this handler's own
+    // `seen`, which stays empty for a superseded handler because its replies
+    // now land on the retry's window instead. Left unchecked, this handler
+    // would then walk `expected` below, find nothing in its own `seen`, and
+    // log two false "NOT confirmed" lines — on the very line RUNBOOK Step 2c
+    // tells the operator to trust as the confirmation. `handleReset` re-checks
+    // the epoch again after this call returns (its own await point), but that
+    // is too late to stop logging that already happened on the way out of
+    // this function. Compared against the SAME field that guard reads, so
+    // there is only one notion of staleness in play.
+    //
+    // Suppression only: `confirmed`/`ok` never depend on this function's
+    // return value, so a stale handler bailing here changes nothing about
+    // reset causality — only whether it prints.
+    if (epoch !== this._resetEpoch) {
+      return;
     }
 
     for (const [nameKey, attribute, wanted] of expected) {
@@ -2483,6 +2508,7 @@ class ArenaBots {
         this._readbackOptions.attributeReadbackTimeoutMs !== undefined
           ? this._readbackOptions.attributeReadbackTimeoutMs
           : ATTRIBUTE_READBACK_TIMEOUT_MS,
+        epoch,
       );
       // The read-back is a new await point, so re-check the epoch exactly as
       // the two guards inside the try do: a retry may have superseded this

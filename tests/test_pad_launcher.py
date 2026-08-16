@@ -280,6 +280,23 @@ class TestPlan:
         for entry in plan(4):
             assert "--dummy-knockback-immune" not in entry["bridge_command"]
 
+    def test_constructor_default_carries_no_knockback_flag(self):
+        """T11c follow-up: pin the CONSTRUCTOR's default, not just plan()'s.
+
+        The module-level ``plan()`` helper declares its own
+        ``dummy_knockback_immune=True`` default (see its signature above) and
+        forwards it to the constructor explicitly, so every test that calls
+        the bare ``plan(...)`` function -- including the one right above --
+        binds THAT default, never ``SubprocessArenaLauncher.__init__``'s own.
+        Production (``agent/train.py``) constructs ``SubprocessArenaLauncher``
+        directly with no ``dummy_knockback_immune`` argument, so only a test
+        that goes through the bare constructor actually pins what ships.
+        """
+        launcher = SubprocessArenaLauncher(repo_root="/repo")
+        entries = launcher.plan(2)
+        for entry in entries:
+            assert "--dummy-knockback-immune" not in entry["bridge_command"]
+
     def test_a_non_immune_fleet_appends_the_flag_to_every_pad(self):
         """T11c/AC18: the ONLY way a scripted opponent can take knockback.
 
