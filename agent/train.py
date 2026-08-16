@@ -2565,9 +2565,19 @@ def _eval_against_opponent(
     path scores a moving target — episode 1 and episode 100 can run on different
     weights, and the returned clone is "the weights the eval started from", not a
     net frozen for its duration. Evaluating a snapshot net instead is the real
-    fix and is deliberately OUT OF SCOPE here; what this clone removes is the
-    much larger gap between the eval and the save, plus the torn read of live
-    tensors while the learner is mid-``optimizer.step()``.
+    fix and is deliberately OUT OF SCOPE here.
+
+    What the clone removes is the multi-thousand-grad-step gap between the eval
+    that produced a win rate and the save that recorded it — without it the
+    save-best path serializes whatever the learner had reached by save time.
+    What it does NOT remove is a torn read:
+    :func:`~distributed.weights.clone_state_dict` walks the net's ~12 tensors with
+    the learner thread UNPAUSED, and torch releases the GIL inside a large
+    ``clone()``, so the optimizer can step between two keys or partway through one
+    and the snapshot can mix parameters from ADJACENT gradient steps. That residual is accepted rather than paused around
+    because it is bounded to roughly one optimizer step, and every tensor is
+    present at its right shape and dtype either way — so the file this writes is
+    always structurally valid and loadable.
     """
     from env.mc_pvp_env import MCPvPEnv
 
@@ -2688,10 +2698,11 @@ class MultiArenaResult:
             scripted opponent (``cfg.opponent == "scripted"``), else ``None``. Kept
             on the result so a caller can read the final mixture / gate state
             without reaching into the pool.
-        best_win_rate: Highest eval win rate seen, i.e. the score of the
-            SAVE-BEST checkpoint. ``-1.0`` when no eval ran.
-        best_grad_step: Learner grad step at which ``best_win_rate`` was measured
-            (``-1`` when nothing was ever saved as best) — the number that says
+        best_win_rate: Win rate of the best checkpoint that was actually
+            WRITTEN — the score of the file on disk, not of the best eval seen.
+            ``-1.0`` when no best checkpoint was ever persisted.
+        best_grad_step: Learner grad step the PERSISTED best checkpoint holds
+            (``-1`` when nothing was ever written as best) — the number that says
             WHICH checkpoint the best file holds.
         eval_opponent: Who the periodic eval fought (``"dummy"`` or e.g.
             ``"scripted_mixed"``). Recorded because ``best_win_rate`` cannot be
@@ -2699,6 +2710,28 @@ class MultiArenaResult:
         checkpoints_saved: How many times the periodic/final checkpoint hook
             fired. Reported so a run that saved NOTHING is visible in the result
             rather than only discoverable on disk at 8am.
+        best_selected_win_rate: The selector's high-water win rate — the highest
+            eval seen, whether or not it cleared the selector's "must beat zero"
+            bar and whether or not the save that should have recorded it
+            succeeded. ``-1.0`` when no eval ran.
+        best_selected_grad_step: Grad step of the last SELECTED eval, i.e. the
+            checkpoint the run MEANT to ship (``-1`` when nothing was ever
+            selectable — no eval ran, or none won an episode). Diverges from
+            ``best_grad_step`` exactly when a save failed, which is the only way
+            to tell "never won" apart from "won, but the disk did not
+            cooperate".
+        best_save_failures: How many best-checkpoint saves raised. Non-zero means
+            the selected peak is NOT the file on disk; see the
+            ``[multi] BEST checkpoint save FAILED`` lines in the run log.
+
+    SELECTED vs PERSISTED, and why they are two fields: the save hook can raise
+    (disk full at 4am, a permission error, a serialization fault) and that
+    failure is deliberately swallowed so it cannot end the night. If the result
+    reported the selector's high-water mark, the end-of-run "which file to ship"
+    line would name a checkpoint that was never written, with a single FAILED
+    line in a 12-hour log as the only counter-evidence. So ``best_win_rate`` /
+    ``best_grad_step`` describe the FILE, and the ``best_selected_*`` pair
+    describes the DECISION.
     """
 
     trainer: "Trainer"
@@ -2714,6 +2747,9 @@ class MultiArenaResult:
     best_grad_step: int = -1
     eval_opponent: str = "dummy"
     checkpoints_saved: int = 0
+    best_selected_win_rate: float = -1.0
+    best_selected_grad_step: int = -1
+    best_save_failures: int = 0
 
     def __post_init__(self) -> None:
         if self.reports is None:
@@ -3222,8 +3258,22 @@ def train_multi_arena(
     next_checkpoint_at = checkpoint_every
     checkpoints_saved = 0
 
-    def _save_latest(grad_step: int, why: str) -> None:
+    # --- what actually reached the disk, as distinct from what was chosen ----
+    # The selector above says which eval DESERVES to be the shipped checkpoint;
+    # these three say what the save hook managed to write. They diverge whenever
+    # a save raises — which is swallowed on purpose so a bad path cannot end the
+    # night — and the end-of-run "which file to ship" line reports THESE, so it
+    # can never name a checkpoint that does not exist.
+    best_saved_win_rate = -1.0
+    best_saved_grad_step = -1
+    best_save_failures = 0
+
+    def _save_latest(grad_step: int, why: str) -> bool:
         """Fire the LATEST-net hook, never letting a save failure kill the run.
+
+        Returns ``True`` iff the hook ran to completion (so a caller can record
+        that something genuinely reached the disk); ``False`` when there was no
+        hook to call or the call raised.
 
         KNOWN, ACCEPTED: a "periodic" save reads ``trainer.online.state_dict()``
         (tensor VIEWS) inside the hook while the learner thread may be mid
@@ -3238,14 +3288,15 @@ def train_multi_arena(
         """
         nonlocal checkpoints_saved
         if checkpoint_hook is None:
-            return
+            return False
         try:
             checkpoint_hook(trainer, int(grad_step))
         except Exception as exc:  # noqa: BLE001 - a bad path must not end the night
             _emit(f"[multi] checkpoint save FAILED at grad_step {grad_step}: {exc}")
-            return
+            return False
         checkpoints_saved += 1
         _emit(f"[multi] checkpoint saved ({why}) at grad_step {grad_step}")
+        return True
 
     def _maybe_log_mean_epsilon(grad_step: int) -> None:
         # The row is built by the module-level epsilon_log_row so what gets logged
@@ -3440,11 +3491,19 @@ def train_multi_arena(
                                     outcome.weights,
                                 )
                             except Exception as exc:  # noqa: BLE001
+                                # Swallowed on purpose: one unwritable path must
+                                # not end a 12-hour run. But the high-water mark
+                                # the summary reports is recorded in the `else`
+                                # below, so nothing that failed here can be
+                                # printed at the end as a file to ship.
+                                best_save_failures += 1
                                 _emit(
                                     "[multi] BEST checkpoint save FAILED at "
                                     f"grad_step {eval_grad_step}: {exc}"
                                 )
                             else:
+                                best_saved_win_rate = float(report.win_rate)
+                                best_saved_grad_step = eval_grad_step
                                 _emit(
                                     f"[multi] best checkpoint saved: win_rate="
                                     f"{report.win_rate:.3f} vs {eval_opponent_name} "
@@ -3461,7 +3520,14 @@ def train_multi_arena(
                             # best_checkpoint_hook when a best path is configured
                             # (see _best_checkpoint_path), so tonight's run never
                             # takes this branch.
-                            _save_latest(eval_grad_step, "best")
+                            if _save_latest(eval_grad_step, "best"):
+                                best_saved_win_rate = float(report.win_rate)
+                                best_saved_grad_step = eval_grad_step
+                            elif checkpoint_hook is not None:
+                                # A hook existed and raised — same accounting as
+                                # the 4-arg path above. No hook at all is not a
+                                # failure, just a run with nowhere to save.
+                                best_save_failures += 1
                     _emit(
                         f"[multi grad_step {eval_grad_step}] "
                         f"win_rate={report.win_rate:.3f} "
@@ -3533,10 +3599,16 @@ def train_multi_arena(
         stop_reason=stop_reason,
         is_live=bool(is_live),
         curriculum=curriculum,
-        best_win_rate=selector.best_win_rate,
-        best_grad_step=selector.best_grad_step,
+        # PERSISTED, not selected: these two name the file that exists. The
+        # selector's own high-water mark rides along in best_selected_* so a run
+        # whose saves all failed is distinguishable from one that never won.
+        best_win_rate=best_saved_win_rate,
+        best_grad_step=best_saved_grad_step,
         eval_opponent=eval_opponent_name,
         checkpoints_saved=checkpoints_saved,
+        best_selected_win_rate=selector.best_win_rate,
+        best_selected_grad_step=selector.best_grad_step,
+        best_save_failures=best_save_failures,
     )
 
 
@@ -3892,6 +3964,80 @@ def _best_checkpoint_path(
     return f"{root}.best{ext or '.pt'}"
 
 
+def _atomic_torch_save(payload: Mapping[str, Any], path: str) -> None:
+    """``torch.save`` that can never truncate the file it is replacing.
+
+    Saving straight onto the destination writes the deliverable IN PLACE: a
+    crash, a Ctrl-C, an OOM kill, or a full disk partway through leaves a
+    half-written checkpoint where the previous good one used to be, and there is
+    no prior generation to fall back on. ``runs/m3.best.pt`` is the single file
+    the demo depends on, so that window has to close.
+
+    So: serialize into a fresh temp file in the SAME DIRECTORY, fsync it, then
+    ``os.replace`` it onto ``path``. Same directory is load-bearing — ``os.replace``
+    is atomic only within one filesystem, and a temp in ``/tmp`` would make the
+    rename a cross-device copy, i.e. exactly the in-place truncation this avoids.
+    Until the replace lands, the destination is byte-for-byte the previous save;
+    after it, it is wholly the new one. Readers never see a partial file.
+
+    Failure handling: any exception unlinks the temp and propagates unchanged, so
+    callers keep whatever error handling they already had (both call sites are
+    fired through hooks whose failures the run loop logs and swallows). Temp
+    names come from :func:`tempfile.mkstemp`, so they are unique per attempt —
+    a stale temp left behind by a hard kill cannot collide with, block, or be
+    mistaken for a later run's write; it only costs disk.
+
+    Directories are NOT created: a missing parent must fail exactly as the plain
+    ``torch.save`` it replaces did, rather than quietly inventing a run
+    directory.
+
+    Args:
+        payload: The object to serialize (the checkpoint dict).
+        path: Destination path, replaced atomically on success.
+    """
+    import os
+    import tempfile
+
+    # dirname(abspath(...)) so a bare filename ("best.pt") still resolves to a
+    # real directory — dirname() alone returns "" there and mkstemp would reject it.
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
+
+    def _discard_temp() -> None:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            # Best effort: the temp is already gone, or the directory is
+            # unwritable — neither is worth masking the original failure.
+            pass
+
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        # fdopen did not take ownership of the descriptor, so close it here or
+        # it leaks for the life of the process.
+        os.close(fd)
+        _discard_temp()
+        raise
+
+    try:
+        with handle:
+            torch.save(payload, handle)
+            handle.flush()
+            # Durability: without the fsync the bytes may still be in the page
+            # cache when the rename commits, so a power loss could publish an
+            # empty file over a good one.
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        # BaseException, not Exception: a KeyboardInterrupt at 4am must not be
+        # the one path that leaves a temp behind.
+        _discard_temp()
+        raise
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point for the LIVE training run (T20 single-arena / T8 multi-arena).
 
@@ -3997,7 +4143,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     def _save_checkpoint(trainer: "Trainer", grad_step: int) -> None:
         if checkpoint_path is None:
             return
-        torch.save(
+        # Atomic: a kill mid-write must not truncate the previous checkpoint,
+        # which is the fallback when no best net was ever selected.
+        _atomic_torch_save(
             {
                 "model": trainer.online.state_dict(),
                 "grad_step": grad_step,
@@ -4018,10 +4166,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         throughout the eval and this save, so the live net here is a different,
         later network than the one the win rate in ``meta`` describes. Writing it
         would mean shipping a checkpoint selected by a score it did not earn.
+
+        Written atomically: this is THE deliverable, it is rewritten every time a
+        better eval lands, and a kill partway through would destroy the previous
+        (good) generation in place with nothing to fall back on.
         """
         if best_checkpoint_path is None:
             return
-        torch.save(
+        _atomic_torch_save(
             {
                 "model": weights,
                 "grad_step": grad_step,
@@ -4271,11 +4423,50 @@ def _main_multi_arena(
             f"aim_invisible={report.aim_while_invisible:.3f}"
         )
     # WHICH FILE TO SHIP. Printed at the end of the run because freeze day picks a
-    # checkpoint from this line, not from file mtimes.
+    # checkpoint from this line, not from file mtimes. It therefore reports what was
+    # PERSISTED, never what was merely selected: a save that raised is swallowed so
+    # it cannot end the night, and a line naming a file that was never written is
+    # worse than no line at all. Every branch below keeps the "best checkpoint:"
+    # prefix so grepping for it on freeze day finds the bad news too.
     if result.best_grad_step >= 0:
         _log(
             f"  best checkpoint: win_rate={result.best_win_rate:.3f} vs "
             f"{result.eval_opponent} at grad_step {result.best_grad_step}"
+        )
+        if (
+            result.best_save_failures
+            and result.best_selected_grad_step != result.best_grad_step
+        ):
+            # The file above is the best that EXISTS, not the best this run
+            # reached. Gated on DIVERGENCE, not on the failure count: a save can
+            # fail and a LATER one succeed, and claiming the peak is missing when
+            # it is on disk is the same false-summary defect, inverted.
+            _log(
+                f"  best checkpoint: WARNING - {result.best_save_failures} "
+                "best-checkpoint save(s) FAILED; the run's best eval "
+                f"(win_rate={result.best_selected_win_rate:.3f} at grad_step "
+                f"{result.best_selected_grad_step}) is NOT on disk"
+            )
+    elif result.best_selected_grad_step >= 0 and result.best_save_failures:
+        _log(
+            f"  best checkpoint: NONE WRITTEN - all {result.best_save_failures} "
+            "save(s) FAILED. The run selected "
+            f"win_rate={result.best_selected_win_rate:.3f} vs "
+            f"{result.eval_opponent} at grad_step "
+            f"{result.best_selected_grad_step}, but NO best checkpoint file "
+            "exists - do not ship from this line; see the '[multi] BEST "
+            "checkpoint save FAILED' lines above"
+        )
+    elif result.best_selected_grad_step >= 0:
+        # Selected something, never even tried to save it: this run was given no
+        # checkpoint path at all. Saying "no best checkpoint" without saying why
+        # would read as "the agent never won".
+        _log(
+            "  best checkpoint: NONE WRITTEN - no checkpoint path was configured, "
+            "so nothing was saved. The run selected "
+            f"win_rate={result.best_selected_win_rate:.3f} vs "
+            f"{result.eval_opponent} at grad_step "
+            f"{result.best_selected_grad_step}"
         )
     elif result.reports:
         _log(
