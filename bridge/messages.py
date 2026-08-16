@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 __all__ = [
     "SchemaError",
@@ -133,14 +133,30 @@ class StepMsg:
     Attributes:
         action: Discrete action index in ``[ACTION_MIN, ACTION_MAX]`` (0..7),
             matching the 8 frozen action macros in ``agent/actions.py``.
+        opp_action: OPTIONAL action index for the *opponent*, same range and
+            same validation as ``action``. ``None`` (the default) means the
+            opponent takes no action of its own — the M1/M2 stationary-dummy
+            path — and is serialized by **omitting the key entirely**, so the
+            bytes on the wire for a dummy-path step are unchanged from before
+            this field existed. A present value asks the bridge to drive the
+            opponent handle through a second ``MacroExecutor`` (T11b); an
+            explicit ``null`` on the wire is accepted and means the same as
+            absent.
     """
 
     TYPE = "step"
 
     action: int
+    opp_action: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"type": self.TYPE, "action": self.action}
+        d: Dict[str, Any] = {"type": self.TYPE, "action": self.action}
+        # Omitted, never emitted as an explicit null: the dummy path's step line
+        # must stay byte-for-byte what it was before `opp_action` existed, so a
+        # bridge that predates the field can never see a key it does not know.
+        if self.opp_action is not None:
+            d["opp_action"] = self.opp_action
+        return d
 
     def to_json_line(self) -> str:
         """Serialize to a single newline-terminated JSON line."""
@@ -336,6 +352,34 @@ class StateMsg:
         tick: Server game tick at end of the interval.
         code_version: Env+filter code-version stamp. Kickoff LOGS a mismatch;
             the distributed future REJECTS it.
+        opp_action_executed: OPTIONAL report of whether the ``opp_action`` sent
+            with this window's ``step`` actually took effect. See
+            :ref:`the swing report <opp-action-executed>` below — it is the
+            only source the Python-side shadow cooldown tracker has.
+
+    .. _opp-action-executed:
+
+    The swing report (``opp_action_executed``) — contract for T11b
+    -------------------------------------------------------------
+    The opponent has **no** ``attack_cooldown`` channel on the wire:
+    ``state.self.attack_cooldown`` is the *learner's*, and ``state.opponent``
+    carries only pos/yaw/pitch/velocity/health. ``MCPvPEnv.raw_opponent_view()``
+    therefore SHADOW-TRACKS the opponent's swing meter in Python, from the ticks
+    elapsed since the last ``opp_action == ATTACK`` that actually fired. This
+    field is how the bridge says whether it fired:
+
+    * ``True``  — the opponent's macro produced its side effect this window; for
+      ``ATTACK`` that means the second ``MacroExecutor``'s swing really went out
+      (``MacroExecutor.begin(...)`` already returns ``{swung}``; T11b threads
+      that value here rather than inventing a new signal).
+    * ``False`` — the opponent's swing did NOT fire: gate-blocked, or there was
+      no entity to swing at. The tracker must then NOT stamp a swing, mirroring
+      the executor's own "a swing at nothing does not start the cooldown" rule.
+    * absent / ``null`` — the bridge does not report (no ``opp_action`` was
+      sent, or a pre-T11b bridge). The tracker assumes the swing fired, because
+      the opposite assumption pins the shadow meter at a permanent 1.0 and
+      reintroduces exactly the flailing the tight readiness epsilon exists to
+      prevent.
 
     Note:
         The wire field is named ``self``; it is exposed as ``self_state`` here
@@ -350,9 +394,11 @@ class StateMsg:
     arena: Arena
     tick: int
     code_version: str
+    opp_action_executed: Optional[bool] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "StateMsg":
+        executed = d.get("opp_action_executed")
         return cls(
             self_state=SelfState.from_dict(d["self"]),
             opponent=OpponentState.from_dict(d["opponent"]),
@@ -360,10 +406,14 @@ class StateMsg:
             arena=Arena.from_dict(d["arena"]),
             tick=int(d["tick"]),
             code_version=str(d["code_version"]),
+            # Tri-state: None ("not reported") must survive the parse distinct
+            # from False ("reported: did not fire") — bool(None) would collapse
+            # them and silently freeze the shadow cooldown.
+            opp_action_executed=None if executed is None else bool(executed),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "type": self.TYPE,
             "self": self.self_state.to_dict(),
             "opponent": self.opponent.to_dict(),
@@ -372,6 +422,11 @@ class StateMsg:
             "tick": self.tick,
             "code_version": self.code_version,
         }
+        # Omitted when unreported, so a state that carries no report round-trips
+        # to exactly the dict it was parsed from.
+        if self.opp_action_executed is not None:
+            d["opp_action_executed"] = self.opp_action_executed
+        return d
 
     def to_json_line(self) -> str:
         """Serialize to a single newline-terminated JSON line."""
@@ -447,17 +502,25 @@ def _require(cond: bool, message: str) -> None:
         raise SchemaError(message)
 
 
-def _check_keys(d: Mapping[str, Any], required: Tuple[str, ...], where: str) -> None:
-    """Require exactly ``required`` keys in ``d`` (no missing, no extras).
+def _check_keys(
+    d: Mapping[str, Any],
+    required: Tuple[str, ...],
+    where: str,
+    optional: Tuple[str, ...] = (),
+) -> None:
+    """Require every ``required`` key in ``d``; allow ``optional`` ones; reject the rest.
 
-    Mirrors ``required`` + ``additionalProperties: false`` from schema.json.
+    Mirrors ``required`` + ``additionalProperties: false`` from schema.json:
+    ``required`` is the schema's ``required`` list and ``optional`` is the set of
+    declared ``properties`` that are NOT required. Anything outside both unions
+    is an extra field and a contract violation.
     """
     _require(isinstance(d, Mapping), f"{where} must be an object, got {type(d).__name__}")
     keys = set(d.keys())
     req = set(required)
     missing = req - keys
     _require(not missing, f"{where} missing required field(s): {sorted(missing)}")
-    extra = keys - req
+    extra = keys - req - set(optional)
     _require(not extra, f"{where} has unexpected field(s): {sorted(extra)}")
 
 
@@ -479,13 +542,26 @@ def _validate_reset(d: Mapping[str, Any]) -> None:
 
 
 def _validate_step(d: Mapping[str, Any]) -> None:
-    _check_keys(d, ("type", "action"), "step")
+    _check_keys(d, ("type", "action"), "step", optional=("opp_action",))
     action = d["action"]
     _require(_is_int(action), "step.action must be an integer")
     _require(
         ACTION_MIN <= action <= ACTION_MAX,
         f"step.action must be in [{ACTION_MIN}, {ACTION_MAX}], got {action}",
     )
+    # opp_action is OPTIONAL and nullable: absent and null both mean "the
+    # opponent takes no action". When it carries a value it gets exactly the
+    # same treatment as `action` — same integer test (which excludes bool), same
+    # frozen 0..7 range.
+    if "opp_action" in d:
+        opp_action = d["opp_action"]
+        if opp_action is not None:
+            _require(_is_int(opp_action), "step.opp_action must be an integer or null")
+            _require(
+                ACTION_MIN <= opp_action <= ACTION_MAX,
+                f"step.opp_action must be in [{ACTION_MIN}, {ACTION_MAX}], "
+                f"got {opp_action}",
+            )
 
 
 def _validate_close(d: Mapping[str, Any]) -> None:
@@ -547,6 +623,7 @@ def _validate_state(d: Mapping[str, Any]) -> None:
         d,
         ("type", "self", "opponent", "events", "arena", "tick", "code_version"),
         "state",
+        optional=("opp_action_executed",),
     )
     _validate_self(d["self"])
     _validate_opponent(d["opponent"])
@@ -555,6 +632,16 @@ def _validate_state(d: Mapping[str, Any]) -> None:
     _require(_is_int(d["tick"]), "state.tick must be an integer")
     _require(d["tick"] >= 0, "state.tick must be >= 0")
     _require(isinstance(d["code_version"], str), "state.code_version must be a string")
+    # OPTIONAL swing report (see StateMsg): boolean when the bridge reports,
+    # null/absent when it does not. A number or string here would be read as a
+    # truthy report and silently mistimed the shadow cooldown, so reject it.
+    if "opp_action_executed" in d:
+        executed = d["opp_action_executed"]
+        if executed is not None:
+            _require(
+                isinstance(executed, bool),
+                "state.opp_action_executed must be a boolean or null",
+            )
 
 
 def _validate_reset_ack(d: Mapping[str, Any]) -> None:

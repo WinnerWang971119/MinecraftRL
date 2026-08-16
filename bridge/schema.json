@@ -34,6 +34,12 @@
           "minimum": 0,
           "maximum": 7,
           "description": "Discrete action index in [0, 7], matching the 8 frozen action macros in agent/actions.py."
+        },
+        "opp_action": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 7,
+          "description": "OPTIONAL action index for the OPPONENT, same frozen [0, 7] range as action. Absent or null means the opponent takes no action of its own (the M1/M2 stationary-dummy path, whose step line is byte-identical to what it was before this field existed). A value asks the bridge to drive the opponent handle through a second MacroExecutor. minimum/maximum bind only the integer branch; draft-07 ignores them for null."
         }
       },
       "required": ["type", "action"],
@@ -117,6 +123,10 @@
         "code_version": {
           "type": "string",
           "description": "Env+filter code-version stamp (git SHA + config hash). Kickoff only LOGS a mismatch; the distributed future REJECTS mismatched batches."
+        },
+        "opp_action_executed": {
+          "type": ["boolean", "null"],
+          "description": "OPTIONAL report of whether the opp_action sent with this window's step actually took effect (for ATTACK: whether the opponent's swing really fired). The opponent has NO attack_cooldown channel on the wire, so Python shadow-tracks its swing meter and this is the only signal it has. true = fired; false = did not fire (gate-blocked, or nothing to swing at) and the tracker must not stamp a swing; absent/null = not reported, and the tracker assumes it fired (assuming otherwise pins the shadow meter at 1.0 forever and reintroduces flailing)."
         }
       },
       "required": ["type", "self", "opponent", "events", "arena", "tick", "code_version"],

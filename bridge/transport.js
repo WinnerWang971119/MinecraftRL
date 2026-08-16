@@ -9,9 +9,13 @@
 //
 // The wire contract is FROZEN in bridge/schema.json / bridge/schema.md /
 // bridge/messages.py. This file matches it exactly:
-//   Python -> Node : reset{episode,seed}, step{action 0..7}, close
-//   Node   -> Python: state{self,opponent,events,arena,tick,code_version},
+//   Python -> Node : reset{episode,seed}, step{action 0..7, opp_action?}, close
+//   Node   -> Python: state{self,opponent,events,arena,tick,code_version,
+//                           opp_action_executed?},
 //                     reset_ack{ok,readback}
+// `?` marks the two OPTIONAL fields. Both are nullable, and absent means the
+// same as null: no opponent action was requested / no swing report is being
+// made. Everything else is required.
 // The Python client (env/mc_pvp_env.py: TcpBridgeClient) connects to
 // 127.0.0.1:5555 by default, sends compact JSON lines, tolerates blank
 // keep-alive lines, and buffers partial reads on its side too.
@@ -155,8 +159,10 @@ function describeJsonType(value) {
 // surface errors loudly (a malformed outbound message is a bridge bug, not a
 // recoverable condition). This mirrors the relevant Node->Python branches of
 // bridge/schema.json and the validator in bridge/messages.py. Inbound messages
-// are validated by the Python side (messages.validate); the Node side only
-// needs to produce conformant outbound frames.
+// are validated by the Python side (messages.validate) before they are sent;
+// `validateInbound` below mirrors the Python->Node branches so the Node side can
+// check a received command against the same rules (see its own comment for why
+// it is NOT wired into the server's receive path).
 // ---------------------------------------------------------------------------
 
 class WireError extends Error {
@@ -198,17 +204,49 @@ function validateVec3(value, where) {
   }
 }
 
-/** Require exactly `keys` on `obj` (no missing, no extras) — mirrors additionalProperties:false. */
-function requireExactKeys(obj, keys, where) {
+/**
+ * Require every key in `keys` on `obj`, tolerate every key in `optionalKeys`,
+ * and reject anything else — mirrors `required` + `additionalProperties:false`
+ * from schema.json, where `optionalKeys` are the declared properties that are
+ * not listed in `required`.
+ *
+ * @param {object} obj The object to check.
+ * @param {string[]} keys Required property names.
+ * @param {string} where Field path used in error messages.
+ * @param {string[]} [optionalKeys=[]] Declared-but-not-required property names.
+ */
+function requireExactKeys(obj, keys, where, optionalKeys = []) {
   requireField(isPlainObject(obj), `${where} must be an object`);
   const present = Object.keys(obj);
-  const allowed = new Set(keys);
+  const allowed = new Set([...keys, ...optionalKeys]);
   for (const k of keys) {
     requireField(Object.prototype.hasOwnProperty.call(obj, k), `${where} missing required field "${k}"`);
   }
   for (const k of present) {
     requireField(allowed.has(k), `${where} has unexpected field "${k}"`);
   }
+}
+
+/**
+ * Validate an OPTIONAL, nullable discrete action index (`step.opp_action`).
+ * Absent and null both mean "no opponent action"; anything present and non-null
+ * gets exactly the same treatment as `action` — integer, and inside the frozen
+ * [ACTION_MIN, ACTION_MAX] range. `Number.isInteger` also rejects booleans,
+ * which JS would otherwise coerce.
+ */
+function validateOptionalActionIndex(obj, key, where) {
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+    return;
+  }
+  const value = obj[key];
+  if (value === null) {
+    return;
+  }
+  requireField(Number.isInteger(value), `${where}.${key} must be an integer or null`);
+  requireField(
+    value >= ACTION_MIN && value <= ACTION_MAX,
+    `${where}.${key} must be in [${ACTION_MIN}, ${ACTION_MAX}], got ${value}`,
+  );
 }
 
 function validateSelf(self) {
@@ -263,6 +301,11 @@ function validateState(msg) {
     msg,
     ['type', 'self', 'opponent', 'events', 'arena', 'tick', 'code_version'],
     'state',
+    // OPTIONAL swing report. Without it declared here, `encodeMessage` would
+    // reject the field as an unexpected property and the opponent-acts path
+    // could never report a swing at all — the shadow cooldown in
+    // MCPvPEnv.raw_opponent_view() has no other source.
+    ['opp_action_executed'],
   );
   validateSelf(msg.self);
   validateOpponent(msg.opponent);
@@ -271,6 +314,17 @@ function validateState(msg) {
   requireField(Number.isInteger(msg.tick), 'state.tick must be an integer');
   requireField(msg.tick >= 0, 'state.tick must be >= 0');
   requireField(isString(msg.code_version), 'state.code_version must be a string');
+  // true = the opponent's swing fired; false = it did not (gate-blocked, or
+  // nothing to swing at); null/absent = not reported. A number or string here
+  // would read as a truthy report downstream and silently mistime the shadow
+  // cooldown, so only a real boolean (or null) is accepted.
+  if (Object.prototype.hasOwnProperty.call(msg, 'opp_action_executed')) {
+    const executed = msg.opp_action_executed;
+    requireField(
+      executed === null || isBoolean(executed),
+      'state.opp_action_executed must be a boolean or null',
+    );
+  }
 }
 
 function validateResetAck(msg) {
@@ -283,6 +337,70 @@ const OUTBOUND_VALIDATORS = Object.freeze({
   state: validateState,
   reset_ack: validateResetAck,
 });
+
+// ---------------------------------------------------------------------------
+// Inbound validation (Python -> Node) — the Node binding of the command half of
+// the contract, mirroring the reset/step/close branches of bridge/schema.json
+// and `_validate_reset` / `_validate_step` / `_validate_close` in
+// bridge/messages.py.
+//
+// DELIBERATELY NOT wired into BridgeServer._onData. The receive path currently
+// forwards every framed message untouched and the command handlers do their own
+// defensive checks; making a schema violation destroy the connection would
+// change live M2 behavior, which this layer has no mandate to do. This is a pure
+// exported function so a handler can opt in (and so a unit test can assert the
+// contract without a socket).
+// ---------------------------------------------------------------------------
+
+function validateReset(msg) {
+  requireExactKeys(msg, ['type', 'episode', 'seed'], 'reset');
+  requireField(Number.isInteger(msg.episode), 'reset.episode must be an integer');
+  requireField(msg.episode >= 0, 'reset.episode must be >= 0');
+  requireField(Number.isInteger(msg.seed), 'reset.seed must be an integer');
+}
+
+function validateStep(msg) {
+  requireExactKeys(msg, ['type', 'action'], 'step', ['opp_action']);
+  requireField(Number.isInteger(msg.action), 'step.action must be an integer');
+  requireField(
+    msg.action >= ACTION_MIN && msg.action <= ACTION_MAX,
+    `step.action must be in [${ACTION_MIN}, ${ACTION_MAX}], got ${msg.action}`,
+  );
+  // Optional and nullable; when present and non-null it is validated exactly
+  // like `action` (N_ACTIONS is frozen at 8 — this field widens WHO acts, never
+  // the action space).
+  validateOptionalActionIndex(msg, 'opp_action', 'step');
+}
+
+function validateClose(msg) {
+  requireExactKeys(msg, ['type'], 'close');
+}
+
+const INBOUND_VALIDATORS = Object.freeze({
+  reset: validateReset,
+  step: validateStep,
+  close: validateClose,
+});
+
+/**
+ * Validate an inbound (Python -> Node) command against the frozen schema.
+ * Throws a WireError on any violation. Returns the message unchanged on success.
+ *
+ * @param {object} msg An inbound message object (must carry a `type`).
+ * @returns {object} The same `msg`.
+ * @throws {WireError} If `msg` is not a valid inbound message.
+ */
+function validateInbound(msg) {
+  requireField(isPlainObject(msg), 'inbound message must be an object');
+  requireField(isString(msg.type), "inbound message missing string 'type' discriminator");
+  const validator = INBOUND_VALIDATORS[msg.type];
+  requireField(
+    validator !== undefined,
+    `unknown inbound message type "${msg.type}"; expected one of ${INBOUND_TYPES.join(', ')}`,
+  );
+  validator(msg);
+  return msg;
+}
 
 /**
  * Validate an outbound (Node -> Python) message against the frozen schema.
@@ -528,6 +646,7 @@ module.exports = {
   LineFramer,
   encodeMessage,
   validateOutbound,
+  validateInbound,
   WireError,
   // TCP server (one connection per arena).
   BridgeServer,
