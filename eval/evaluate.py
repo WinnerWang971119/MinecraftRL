@@ -179,6 +179,17 @@ class DRQNGreedyPolicy:
         import torch  # lazy: keep eval.evaluate importable without torch
 
         self._torch = torch
+        # BY REFERENCE, and knowingly so. On the multi-arena path the learner
+        # thread keeps stepping the optimizer throughout an eval (only the
+        # designated arena's COLLECTOR is paused), so a long eval scores a moving
+        # target: episode 1 and episode 100 can run on different weights. The fix
+        # for that is to evaluate a frozen snapshot net, which is a bigger change
+        # than the freeze-day scope allowed. What IS handled:
+        # ``agent.train._eval_against_opponent`` clones the weights this eval
+        # starts from and hands them to the save-best path, so the shipped
+        # checkpoint is at least the net the eval began on rather than one
+        # thousands of gradient steps later. This comment marks a deliberate
+        # boundary, not an oversight.
         self._net = net
         self._net.eval()  # inference mode for greedy action selection
         if device is None:

@@ -62,6 +62,7 @@ from typing import (
     Dict,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Protocol,
     Tuple,
@@ -164,10 +165,18 @@ EvalHook = Callable[["Trainer", int], None]
 #: Called every ``cfg.checkpoint_interval`` gradient steps. T20 owns the body.
 CheckpointHook = Callable[["Trainer", int], None]
 #: Called when an eval produces a NEW BEST win rate (T13's save-best path). Takes
-#: the same ``(trainer, grad_step)`` plus the eval metadata that justified the
+#: ``(trainer, grad_step, meta, weights)``: the eval metadata that justified the
 #: save, so the shipped file can record WHAT it scored and against WHOM — this
-#: repo's documented weak spot is exactly that kind of missing run provenance.
-BestCheckpointHook = Callable[["Trainer", int, Mapping[str, Any]], None]
+#: repo's documented weak spot is exactly that kind of missing run provenance —
+#: plus the WEIGHTS to write. The hook MUST serialize ``weights`` and must NOT
+#: reach for ``trainer.online.state_dict()``: on the multi-arena path the learner
+#: thread keeps stepping the optimizer throughout the eval and the save, so the
+#: live net at hook time is thousands of gradient steps past the one that earned
+#: the win rate (and reading it mid-``optimizer.step()`` can tear). ``trainer`` is
+#: still passed for run-level context (device, grad_step, config), never weights.
+BestCheckpointHook = Callable[
+    ["Trainer", int, Mapping[str, Any], Mapping[str, Any]], None
+]
 #: Called every ``cfg.log_interval`` gradient steps with the latest learn stats.
 LogHook = Callable[["Trainer", int, "LearnStats"], None]
 
@@ -2405,6 +2414,9 @@ def train_vs_dummy(
                 # opening a second connection — the bridge serves exactly one
                 # connection, so a fresh eval socket would steal the stream out from
                 # under training and abort the run. See _eval_against_opponent.
+                # The single-arena loop is single-threaded: nothing mutates the
+                # net between the eval and this hook, so it reads the report and
+                # ignores the outcome's weight snapshot.
                 report = _eval_against_opponent(
                     trainer=trainer,
                     evaluate=evaluate,
@@ -2418,7 +2430,7 @@ def train_vs_dummy(
                     is_live=is_live,
                     base_seed=cfg.seed,
                     log=log,
-                )
+                ).report
                 reports.append(report)
                 last_report = report
 
@@ -2475,6 +2487,31 @@ def train_vs_dummy(
 run_m2 = train_vs_dummy
 
 
+class _EvalOutcome(NamedTuple):
+    """One eval's report plus the weights that produced it.
+
+    ``report`` alone is not enough to select a checkpoint. On the multi-arena
+    path only the DESIGNATED arena's collector is paused for an eval; the learner
+    thread keeps stepping the optimizer on the other N-1 arenas the whole time,
+    so by the moment the save-best hook fires ``trainer.online`` can be thousands
+    of gradient steps past the net the win rate was measured on. Carrying the
+    weights (and the grad step they were taken at) alongside the report is what
+    makes "ship the best checkpoint" mean the net that actually earned the score.
+
+    Attributes:
+        report: The :class:`~eval.evaluate.EvalReport`.
+        weights: A detached CPU clone of ``trainer.online.state_dict()`` taken
+            immediately BEFORE the eval ran. Safe to serialize from any thread.
+        grad_step: ``trainer.grad_step`` as of that clone — the number that says
+            which net the file holds. Read after the eval it would name a net
+            that never sat the exam.
+    """
+
+    report: Any
+    weights: Mapping[str, Any]
+    grad_step: int
+
+
 def _eval_against_opponent(
     *,
     trainer: "Trainer",
@@ -2518,10 +2555,28 @@ def _eval_against_opponent(
     the boundary — it just shares the one idle connection.)
 
     Wraps the online net in a greedy :class:`~eval.evaluate.DRQNGreedyPolicy`, runs
-    :func:`~eval.evaluate.evaluate`, and returns its
-    :class:`~eval.evaluate.EvalReport`.
+    :func:`~eval.evaluate.evaluate`, and returns an :class:`_EvalOutcome` — the
+    :class:`~eval.evaluate.EvalReport` PLUS a detached CPU clone of the weights
+    the eval started from, so the save-best path serializes the net that earned
+    the score instead of whatever the learner thread has since produced.
+
+    SCOPE, deliberately: the eval still runs against the LIVE net (the policy
+    holds ``trainer.online`` by reference), so a long eval on the multi-arena
+    path scores a moving target — episode 1 and episode 100 can run on different
+    weights, and the returned clone is "the weights the eval started from", not a
+    net frozen for its duration. Evaluating a snapshot net instead is the real
+    fix and is deliberately OUT OF SCOPE here; what this clone removes is the
+    much larger gap between the eval and the save, plus the torn read of live
+    tensors while the learner is mid-``optimizer.step()``.
     """
     from env.mc_pvp_env import MCPvPEnv
+
+    from distributed.weights import clone_state_dict
+
+    # BEFORE evaluate(): from here on the learner thread keeps mutating the live
+    # net, so anything read afterwards is a different (later) network.
+    eval_grad_step = int(trainer.grad_step)
+    weights = clone_state_dict(trainer.online.state_dict())
 
     policy = policy_cls(trainer.online, device=trainer.device)
     # auto_connect=False: the shared transport is already connected by the training
@@ -2553,7 +2608,7 @@ def _eval_against_opponent(
         # closes that socket exactly once in train_vs_dummy's finally.
         if was_training:
             trainer.online.train()
-    return report
+    return _EvalOutcome(report=report, weights=weights, grad_step=eval_grad_step)
 
 
 #: Historical name for :func:`_eval_against_opponent`, from when the eval could
@@ -2731,7 +2786,7 @@ def _eval_via_designated_arena(
     log: Optional[Callable[[str], None]],
     pause_timeout: float,
     opponent: Optional[Any] = None,
-) -> Optional[Any]:
+) -> Optional[_EvalOutcome]:
     """Run ONE greedy eval on the designated arena via the pause/handoff protocol.
 
     Pauses the designated arena's collector at its next EPISODE BOUNDARY, waits for
@@ -2749,9 +2804,14 @@ def _eval_via_designated_arena(
     the collector's curriculum-driven one, so the eval neither perturbs training's
     opponent RNG nor inherits its drifting mixture.
 
-    Returns the eval report, or ``None`` if the designated collector could not be
-    brought to an idle boundary within ``pause_timeout`` (e.g. it is mid-relaunch),
-    in which case eval is SKIPPED this cycle rather than risking a second connection.
+    Returns the eval :class:`_EvalOutcome` (report + the weight snapshot the eval
+    started from), or ``None`` if the designated collector could not be brought to
+    an idle boundary within ``pause_timeout`` (e.g. it is mid-relaunch), in which
+    case eval is SKIPPED this cycle rather than risking a second connection.
+
+    NOTE: pausing the designated collector does NOT pause the learner — it keeps
+    stepping the optimizer off the other N-1 arenas for the whole eval. That is
+    why the outcome carries its own weight snapshot; see :func:`_eval_against_opponent`.
     """
     collector = pool.collector_for(designated_arena)
     if collector is None:
@@ -2912,11 +2972,15 @@ def train_multi_arena(
             this function can produce. Also fired on an eval improvement when no
             ``best_checkpoint_hook`` is given (the historical single-file
             behavior).
-        best_checkpoint_hook: Optional ``(trainer, grad_step, meta) -> None`` for
-            the SAVE-BEST net, fired only when an eval strictly improves the win
-            rate (see :class:`_BestCheckpointSelector`); ``meta`` carries the
-            win rate, the eval opponent and the episode count that justified the
-            save. Keep it pointed at a DIFFERENT
+        best_checkpoint_hook: Optional ``(trainer, grad_step, meta, weights) ->
+            None`` for the SAVE-BEST net, fired only when an eval strictly
+            improves the win rate (see :class:`_BestCheckpointSelector`);
+            ``meta`` carries the win rate, the eval opponent and the episode
+            count that justified the save, and ``weights`` is the detached CPU
+            snapshot of the net that EARNED that win rate (taken before the eval
+            ran — the learner never stops, so ``trainer.online`` here is a later
+            net). The hook must serialize ``weights``. Keep it pointed at a
+            DIFFERENT
             path from ``checkpoint_hook``: sharing one path means the next
             periodic save overwrites the best net with a more recent, worse one —
             selection by recency wearing selection-by-win-rate's clothes.
@@ -3159,7 +3223,19 @@ def train_multi_arena(
     checkpoints_saved = 0
 
     def _save_latest(grad_step: int, why: str) -> None:
-        """Fire the LATEST-net hook, never letting a save failure kill the run."""
+        """Fire the LATEST-net hook, never letting a save failure kill the run.
+
+        KNOWN, ACCEPTED: a "periodic" save reads ``trainer.online.state_dict()``
+        (tensor VIEWS) inside the hook while the learner thread may be mid
+        ``optimizer.step()``, so the written file can mix pre- and post-step
+        parameters. Closing that would mean threading a weight snapshot through
+        the 2-arg :data:`CheckpointHook`, which every caller in the repo
+        implements — out of scope here. The exposure is bounded: this file is the
+        recency fallback, never the selection criterion (that is the save-best
+        path, which now writes an explicit clone), and the "final" save below
+        runs AFTER the learner thread is joined, so the last file of the run is
+        always a clean read.
+        """
         nonlocal checkpoints_saved
         if checkpoint_hook is None:
             return
@@ -3221,6 +3297,22 @@ def train_multi_arena(
             "[multi] WARNING: no checkpoint hook configured - this run will train "
             "and save NOTHING. Pass --checkpoint (and optionally "
             "--best-checkpoint) before starting an overnight run."
+        )
+    elif checkpoint_hook is None:
+        # --best-checkpoint ALONE is the same blocker wearing a disguise: only
+        # checkpoint_hook drives _save_latest, which is BOTH the periodic and the
+        # final save, so with it unset the sole write left on this path sits
+        # behind a strictly-improving eval win rate above zero. An agent that
+        # never wins an eval episode - the likeliest outcome of a hard retrain -
+        # leaves an empty runs/ in the morning and a clean log. The config is NOT
+        # silently repaired: an operator who meant --checkpoint must see it.
+        _emit(
+            "[multi] WARNING: --best-checkpoint was given WITHOUT --checkpoint. "
+            "The periodic save is DISABLED and the final save is a NO-OP; this "
+            "run writes a file ONLY if some eval strictly improves the win rate "
+            "above zero. If the agent never wins an eval episode, the whole run "
+            "is LOST. Stop now and add --checkpoint <path> unless that is "
+            "genuinely what you want."
         )
     if cfg.warm_start is not None:
         _emit(
@@ -3291,7 +3383,7 @@ def train_multi_arena(
             # --- periodic designated-arena eval via pause/handoff ---------------
             if do_eval and grad_step >= next_eval_at:
                 _maybe_log_mean_epsilon(grad_step)
-                report = _eval_via_designated_arena(
+                outcome = _eval_via_designated_arena(
                     trainer=trainer,
                     pool=pool,
                     designated_arena=designated_arena,
@@ -3319,10 +3411,14 @@ def train_multi_arena(
                 # learner kept stepping during the borrow) does not immediately re-fire.
                 next_eval_at = int(trainer.grad_step) + eval_every_grad_steps
 
-                if report is not None:
+                if outcome is not None:
+                    report = outcome.report
                     reports.append(report)
                     last_report = report
-                    eval_grad_step = int(trainer.grad_step)
+                    # The grad step the EVALUATED weights were taken at, not
+                    # trainer.grad_step now: the learner never stopped, so "now"
+                    # names a net this win rate says nothing about.
+                    eval_grad_step = int(outcome.grad_step)
                     # Selection is by WIN RATE, not recency (see the selector).
                     if selector.consider(report.win_rate, eval_grad_step):
                         if best_checkpoint_hook is not None:
@@ -3339,6 +3435,9 @@ def train_multi_arena(
                                         ),
                                         "passed_m2": bool(report.passed_m2),
                                     },
+                                    # The weights that EARNED this win rate. The
+                                    # hook must write these, not the live net.
+                                    outcome.weights,
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 _emit(
@@ -3354,6 +3453,14 @@ def train_multi_arena(
                         else:
                             # Legacy single-hook callers keep the old save-best
                             # behavior; the periodic/final saves are additional.
+                            # This path still writes the LIVE net (the 2-arg
+                            # CheckpointHook has nowhere to put a snapshot), so it
+                            # keeps the stale-weights exposure the 4-arg
+                            # best_checkpoint_hook above fixes. Left as-is
+                            # deliberately: the live CLI always passes a
+                            # best_checkpoint_hook when a best path is configured
+                            # (see _best_checkpoint_path), so tonight's run never
+                            # takes this branch.
                             _save_latest(eval_grad_step, "best")
                     _emit(
                         f"[multi grad_step {eval_grad_step}] "
@@ -3363,10 +3470,19 @@ def train_multi_arena(
                         f"passed_m2={report.passed_m2} "
                         f"opponent={eval_opponent_name}"
                     )
-                    if report.passed_m2 and stop_on_pass:
+                    if report.passed_m2:
+                        # Two INDEPENDENT concerns, kept independent on purpose.
+                        # `passed` is the verdict the CLI turns into an exit code
+                        # (_main_multi_arena returns `0 if passed_m2 else 1`);
+                        # `stop_on_pass` only decides whether the loop breaks.
+                        # Folding the verdict into the break made a scripted run
+                        # (which defaults stop_on_pass False, see T13) train all
+                        # night, clear the gate, ship a good checkpoint — and
+                        # still exit 1.
                         passed = True
-                        stop_reason = "passed_m2"
-                        break
+                        if stop_on_pass:
+                            stop_reason = "passed_m2"
+                            break
 
             # Park briefly; the learner and collectors run on their own threads.
             time.sleep(poll_interval)
@@ -3891,14 +4007,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     def _save_best_checkpoint(
-        trainer: "Trainer", grad_step: int, meta: Mapping[str, Any]
+        trainer: "Trainer",
+        grad_step: int,
+        meta: Mapping[str, Any],
+        weights: Mapping[str, Any],
     ) -> None:
-        """Write the SAVE-BEST net, stamped with the eval that justified it."""
+        """Write the SAVE-BEST net, stamped with the eval that justified it.
+
+        ``weights`` — NOT ``trainer.online.state_dict()``. The learner thread runs
+        throughout the eval and this save, so the live net here is a different,
+        later network than the one the win rate in ``meta`` describes. Writing it
+        would mean shipping a checkpoint selected by a score it did not earn.
+        """
         if best_checkpoint_path is None:
             return
         torch.save(
             {
-                "model": trainer.online.state_dict(),
+                "model": weights,
                 "grad_step": grad_step,
                 "code_version": code_version(),
                 # Freeze day has to know WHAT this file scored and against WHOM;
