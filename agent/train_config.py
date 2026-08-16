@@ -46,6 +46,14 @@ from agent.replay import DEFAULT_ALPHA, DEFAULT_BETA0, DEFAULT_PRIORITY_EPS
 __all__ = ["TrainConfig"]
 
 
+#: The opponent sources ``TrainConfig.opponent`` accepts. ``"dummy"`` is the
+#: bridge-served stationary dummy (no ``opp_action`` on the wire at all);
+#: ``"scripted"`` is the Python-stepped ``ScriptedBot`` curriculum (T12). A typo
+#: here would otherwise select the dummy silently and quietly invalidate a whole
+#: overnight retrain, so the set is validated in ``__post_init__``.
+_OPPONENT_CHOICES = frozenset({"dummy", "scripted"})
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     """Frozen bundle of training hyperparameters for the n-step Double-DQN loop.
@@ -217,6 +225,51 @@ class TrainConfig:
     #: million-episode independent band. Only read when ``arenas > 1``.
     seed_stride: int = 1_000_000
 
+    # -- opponent + curriculum (T12; demo-day scripted-opponent track) --------
+    #: Which opponent the collectors fight. ``"dummy"`` (the default) is the
+    #: M1/M2 path: the stationary dummy is served entirely by the bridge / Paper
+    #: server and no ``opp_action`` is ever put on the wire, so the wire line is
+    #: byte-identical to what it was before the field existed. ``"scripted"``
+    #: engages the :class:`~opponents.scripted_bot.ScriptedBot` curriculum —
+    #: Python steps an opponent policy per decision and threads its macro through
+    #: ``env.step(action, opp_action=...)``. Only the MULTI-ARENA path
+    #: (``arenas >= 2``) steps an opponent policy; the single-arena loop refuses
+    #: ``"scripted"`` loudly rather than silently ignoring it.
+    opponent: str = "dummy"
+
+    #: Probability an episode draws the EASY preset BEFORE the win-rate gate
+    #: fires. 0.8 == the plan's 80/20 EASY/HARD starting mixture: mostly a
+    #: beatable opponent early, with enough HARD episodes that the agent is never
+    #: purely on-distribution for one tier. Only read when
+    #: ``opponent == "scripted"``.
+    opponent_mix_easy: float = 0.8
+
+    #: Probability an episode draws EASY AFTER the gate fires — the shifted
+    #: mixture, 0.2 == 20/80 EASY/HARD. Deliberately NOT 0.0: the curriculum is a
+    #: gated MIXTURE, not a one-way promotion, so EASY episodes keep arriving
+    #: (they are what keeps the gate's own window fed, and they stop the agent
+    #: from overfitting to a single opponent tier).
+    opponent_mix_easy_after: float = 0.2
+
+    #: Rolling win rate vs the EASY preset that must be reached before the
+    #: mixture shifts to ``opponent_mix_easy_after``. 0.6 == "beats EASY more
+    #: often than not, with margin". Raise to demand a stronger agent before
+    #: HARD dominates; lower to shift sooner.
+    opponent_gate_winrate: float = 0.6
+
+    #: Number of EASY episodes in the rolling gate window. The window must be
+    #: FULL before the gate is even evaluated, so this is also the minimum EASY
+    #: sample size behind the decision: 50 episodes make a 0.6 win rate mean
+    #: something, where a partial window would fire the gate on the first EASY
+    #: win (1/1 == 100%).
+    opponent_gate_window: int = 50
+
+    #: Optional path to a checkpoint whose weights initialize the run (T13 owns
+    #: the loading itself and the ε restart that keeps a warm start from being
+    #: thrown away). Declared here so the field exists on the config every task
+    #: downstream reads. ``None`` == train from a fresh initialization.
+    warm_start: str | None = None
+
     def __post_init__(self) -> None:
         """Validate the hyperparameters so a misconfigured run fails loudly.
 
@@ -298,3 +351,37 @@ class TrainConfig:
             )
         if self.seed_stride < 1:
             raise ValueError(f"seed_stride must be >= 1, got {self.seed_stride}")
+        if self.opponent not in _OPPONENT_CHOICES:
+            raise ValueError(
+                f"opponent must be one of {sorted(_OPPONENT_CHOICES)}, got "
+                f"{self.opponent!r}"
+            )
+        # Written as `not 0 <= x <= 1` rather than two or-ed comparisons so NaN —
+        # which fails every ordered comparison — is rejected instead of slipping
+        # through as an always-false predicate.
+        if not 0.0 <= self.opponent_mix_easy <= 1.0:
+            raise ValueError(
+                f"opponent_mix_easy must be in [0, 1], got {self.opponent_mix_easy!r}"
+            )
+        if not 0.0 <= self.opponent_mix_easy_after <= 1.0:
+            raise ValueError(
+                "opponent_mix_easy_after must be in [0, 1], got "
+                f"{self.opponent_mix_easy_after!r}"
+            )
+        if not 0.0 <= self.opponent_gate_winrate <= 1.0:
+            raise ValueError(
+                "opponent_gate_winrate must be in [0, 1], got "
+                f"{self.opponent_gate_winrate!r}"
+            )
+        if self.opponent_gate_window < 1:
+            raise ValueError(
+                f"opponent_gate_window must be >= 1, got {self.opponent_gate_window}"
+            )
+        if self.warm_start is not None and not str(self.warm_start).strip():
+            # An empty string is the shape a shell `--warm-start ""` produces; it
+            # would read as "warm start requested" everywhere downstream while
+            # naming no checkpoint at all. `None` is how "no warm start" is spelled.
+            raise ValueError(
+                "warm_start must be a non-empty path or None, got "
+                f"{self.warm_start!r}"
+            )
