@@ -77,7 +77,14 @@ from agent.dqn import DuelingDRQN
 from agent.progress import ProgressReporter, progress_metrics
 from agent.replay import PrioritizedSequenceReplay, SequenceBatch
 from agent.seeding import seed_everything
-from agent.train_config import TrainConfig
+from agent.train_config import (
+    ASSUMED_MEAN_EPISODE_STEPS,
+    ASSUMED_RUN_HOURS,
+    EPS_DECAY_FRACTION_OF_RUN,
+    TrainConfig,
+    eps_decay_episodes_for,
+    projected_episodes,
+)
 from distributed.serialization import Episode
 from opponents.scripted_bot import OpponentView, ScriptedBot, ScriptedPreset
 
@@ -88,6 +95,15 @@ __all__ = [
     "train",
     "epsilon_for_episode",
     "effective_eps_start",
+    "eps_floor_fraction_of_run",
+    "epsilon_log_row",
+    "epsilon_schedule_report",
+    "per_actor_eps_enabled",
+    "per_actor_epsilon",
+    "mean_per_actor_epsilon",
+    "PerActorEpsilonPolicy",
+    "maybe_wrap_per_actor_epsilon",
+    "build_arena_policy",
     "load_checkpoint_state_dict",
     "arena_episode_seed",
     "opponent_seed",
@@ -239,6 +255,379 @@ def epsilon_for_episode(episode: int, cfg: TrainConfig) -> float:
     # frac goes 0 -> 1 over the first eps_decay_episodes, then saturates at 1.
     frac = min(ep / float(cfg.eps_decay_episodes), 1.0)
     return start + (cfg.eps_end - start) * frac
+
+
+#: Warn at startup when ε reaches its floor before this fraction of a run's
+#: PROJECTED episodes. AC15 asks for ~15% (``EPS_DECAY_FRACTION_OF_RUN``); this
+#: is a third of that, i.e. the threshold for "this is not a tuning choice, this
+#: is the single-arena default on a 25-pad fleet". It only ever LOGS — a config
+#: this function dislikes still runs, because a legitimately short run is a thing
+#: an operator may want and a refusal at 3am is not.
+EPS_FLOOR_WARN_FRACTION: float = 0.05
+
+
+def eps_floor_fraction_of_run(cfg: TrainConfig) -> float:
+    """Return where ε hits its floor, as a fraction of the run's projected episodes.
+
+    ``cfg.eps_decay_episodes / projected_episodes(cfg.arenas)``. The number AC15
+    is written against: it should be ~0.15, and it was ~0.001 at 25 pads under
+    the old single-arena default of 200.
+
+    Args:
+        cfg: The run config (``eps_decay_episodes`` and ``arenas``).
+
+    Returns:
+        The fraction (may exceed 1.0 when the decay outlasts the projected run,
+        which means ε never reaches ``eps_end`` — the opposite failure and a much
+        cheaper one under a warm start).
+    """
+    return float(cfg.eps_decay_episodes) / projected_episodes(int(cfg.arenas))
+
+
+def epsilon_log_row(global_episode_count: int, cfg: TrainConfig) -> Dict[str, float]:
+    """Return the metrics row describing the fleet's exploration right now.
+
+    All arenas share one episode counter, so they all sit at the SAME schedule
+    point — but under the Ape-X spread they do not all ACT at it: arena ``i``
+    acts at ``ε ** (1 + i/(N-1)*α)``, and at 25 pads the fleet's mean is roughly
+    an order of magnitude below the schedule. Reporting the schedule value under
+    the name ``epsilon_mean`` was true before issue #15 and would be false after,
+    so the two are separate rows:
+
+      * ``train/epsilon_mean``     — the arenas' true mean effective ε;
+      * ``train/epsilon_schedule`` — the shared schedule value they derive from.
+
+    With the spread off the two are equal.
+
+    Args:
+        global_episode_count: Episodes claimed so far (``counter.value``); the
+            schedule is sampled at the LAST claimed index.
+        cfg: The run config.
+
+    Returns:
+        A ``{metric_name: value}`` mapping ready for ``MetricsLogger.log``.
+    """
+    schedule = epsilon_for_episode(max(0, int(global_episode_count) - 1), cfg)
+    return {
+        "train/epsilon_mean": mean_per_actor_epsilon(schedule, cfg),
+        "train/epsilon_schedule": float(schedule),
+    }
+
+
+def epsilon_schedule_report(cfg: TrainConfig) -> List[str]:
+    """Return the startup log line(s) describing this run's exploration schedule.
+
+    One descriptive line always, plus a WARNING line when ε reaches its floor
+    before :data:`EPS_FLOOR_WARN_FRACTION` of the projected episodes — the shape
+    of the bug T16 exists to fix, which a hand-built ``TrainConfig(arenas=25)``
+    can still walk into because a dataclass default cannot depend on another
+    field.
+
+    It returns lines rather than logging them so the content is unit-testable
+    without driving a whole multi-arena run.
+
+    Args:
+        cfg: The run config.
+
+    Returns:
+        One or two ASCII-only lines, ready for the run's log sink.
+    """
+    projected = projected_episodes(int(cfg.arenas))
+    fraction = eps_floor_fraction_of_run(cfg)
+    if per_actor_eps_enabled(cfg):
+        spread = (
+            f"ON (alpha={cfg.per_actor_eps_alpha:g}, arena 0 most exploratory, "
+            f"arena {int(cfg.arenas) - 1} at eps**{1.0 + cfg.per_actor_eps_alpha:g})"
+        )
+    else:
+        spread = "OFF (every arena shares one epsilon)"
+    lines = [
+        f"[multi] epsilon {effective_eps_start(cfg):.3f} -> {cfg.eps_end:.3f} over "
+        f"{cfg.eps_decay_episodes} GLOBAL episodes shared by {cfg.arenas} pads "
+        f"({fraction * 100:.1f}% of the ~{projected:,.0f} episodes projected for a "
+        f"{ASSUMED_RUN_HOURS:g}h run, assuming {ASSUMED_MEAN_EPISODE_STEPS:g} "
+        "steps/episode - set --eps-decay-episodes from the smoke run's MEASURED "
+        f"mean); per-actor eps {spread}"
+    ]
+    if fraction < EPS_FLOOR_WARN_FRACTION:
+        lines.append(
+            f"[multi] WARNING: epsilon reaches its floor after only "
+            f"{fraction * 100:.2f}% of this run's projected episodes (target "
+            f"~{EPS_DECAY_FRACTION_OF_RUN * 100:.0f}%, AC15). "
+            f"eps_decay_episodes={cfg.eps_decay_episodes} looks sized for far fewer "
+            f"than {cfg.arenas} pads - every pad claims from the SAME episode "
+            f"counter. Pass --eps-decay-episodes "
+            f"{eps_decay_episodes_for(int(cfg.arenas))} (or let the CLI derive it) "
+            "unless this is deliberate."
+        )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Ape-X per-actor ε (issue #15, T16(f)).
+#
+# WHY IT IS NEEDED HERE SPECIFICALLY. Every collector claims its episode index
+# from ONE shared ``distributed.actor.GlobalEpisodeCounter`` and derives ε from
+# it (``distributed/actor.py:672-674``), so all N pads sit at the SAME schedule
+# point at all times: at 25 pads the fleet is 25 copies of one explorer. Ape-X
+# (Horgan et al. 2018) spreads them instead — arena ``i`` of ``N`` acts at
+# ``ε ** (1 + i/(N-1) * α)`` — so the fleet covers a wide exploration band and a
+# near-greedy exploit arm at every moment of the run.
+#
+# WHERE IT IS APPLIED. ``epsilon_for_episode`` stays the ONE global schedule
+# (the Collector's call site is unchanged); the per-arena transform is applied by
+# :class:`PerActorEpsilonPolicy`, which wraps each arena's ``SnapshotPolicy`` in
+# :func:`build_arena_policy`. That keeps the schedule and the spread in separate
+# functions, and keeps the whole feature inside this module.
+#
+# WHAT IT DOES NOT TOUCH: the per-arena episode SEEDS (``arena_episode_seed``)
+# and the collected ``Episode`` stamp. An Episode records ``arena_id`` but no ε
+# at all (``distributed/serialization.py`` has no epsilon field), so there is no
+# stamped-ε provenance to drift — read the effective ε back from ``arena_id``
+# plus this run's ``per_actor_eps_alpha``.
+# ---------------------------------------------------------------------------
+
+
+def per_actor_eps_enabled(cfg: TrainConfig) -> bool:
+    """True iff this run gives each arena its own Ape-X ε.
+
+    The single ``and`` that expresses "configured on AND actually multi-arena".
+    ``cfg.arenas == 1`` is excluded explicitly even though the formula is the
+    identity there, so the N=1 path provably never reaches the wrapper.
+
+    Args:
+        cfg: The training config.
+
+    Returns:
+        Whether :class:`PerActorEpsilonPolicy` should wrap the arena policies.
+    """
+    return bool(cfg.per_actor_eps) and int(cfg.arenas) > 1
+
+
+def per_actor_epsilon(
+    base_epsilon: float, arena_id: int, arenas: int, alpha: float
+) -> float:
+    """Return arena ``arena_id``'s ε under the Ape-X spread.
+
+    ``ε_i = base ** (1 + i/(N-1) * α)``. Because ``base <= 1``, a LARGER exponent
+    means a SMALLER ε, so:
+
+      * arena ``0`` gets exponent 1 and therefore ``base`` itself — **the most
+        exploratory arena**, which is the Ape-X convention and what TC27 pins;
+      * arena ``N-1`` gets exponent ``1 + α`` (``base ** 8`` at the default
+        α = 7) — the near-greedy exploit arm.
+
+    ``arenas == 1`` returns ``base`` unchanged and is checked BEFORE the
+    ``N - 1`` ratio is formed, so there is no division by zero on the
+    single-arena path.
+
+    The values are distinct for every arena only while ``0 < base < 1``. At
+    ``base == 1`` (episode 0 of a fresh, non-warm-started run) every power is 1,
+    and at ``base == 0`` every power is 0; both are correct, and both are
+    momentary — the schedule leaves 1.0 after one episode and never reaches 0
+    (``eps_end`` is the floor).
+
+    Args:
+        base_epsilon: The GLOBAL schedule's ε for this episode, in ``[0, 1]``.
+        arena_id: 0-based arena index, in ``[0, arenas)``.
+        arenas: Total arena count (>= 1).
+        alpha: The spread exponent α (> 0).
+
+    Returns:
+        This arena's effective ε.
+
+    Raises:
+        ValueError: on ``arenas < 1``, an ``arena_id`` outside ``[0, arenas)``,
+            or a ``base_epsilon`` outside ``[0, 1]``. The last one matters: a
+            base above 1 would GROW with the exponent and silently invert the
+            ordering, making arena 0 the least exploratory.
+    """
+    n = int(arenas)
+    index = int(arena_id)
+    if n < 1:
+        raise ValueError(f"arenas must be >= 1, got {arenas}")
+    if not (0 <= index < n):
+        raise ValueError(f"arena_id {arena_id} out of range [0, {n})")
+    # `not 0 <= x <= 1` rather than or-ed comparisons so NaN is rejected instead
+    # of slipping through as an always-false predicate.
+    if not 0.0 <= base_epsilon <= 1.0:
+        raise ValueError(f"base_epsilon must be in [0, 1], got {base_epsilon!r}")
+    if n == 1:
+        # Single arena: the spread is the identity. Returned before the ratio so
+        # `N - 1 == 0` can never be a denominator.
+        return float(base_epsilon)
+    exponent = 1.0 + (index / float(n - 1)) * float(alpha)
+    return float(base_epsilon) ** exponent
+
+
+def mean_per_actor_epsilon(base_epsilon: float, cfg: TrainConfig) -> float:
+    """Return the MEAN ε across the fleet for a global-schedule ``base_epsilon``.
+
+    With the spread off (or at N=1) this is ``base_epsilon`` itself. With it on
+    the fleet's mean is far below the schedule value — at 25 pads, α=7 and
+    base 0.25 the mean is ~0.02 — so a log line that reports the schedule value
+    as "mean epsilon" is simply false once issue #15 ships. This is what
+    ``train_multi_arena`` logs instead.
+
+    Args:
+        base_epsilon: The global schedule's ε for the current episode.
+        cfg: The run config (arena count, spread flag, α).
+
+    Returns:
+        The arithmetic mean of the arenas' effective ε values.
+    """
+    if not per_actor_eps_enabled(cfg):
+        return float(base_epsilon)
+    n = int(cfg.arenas)
+    alpha = float(cfg.per_actor_eps_alpha)
+    return sum(per_actor_epsilon(base_epsilon, i, n, alpha) for i in range(n)) / n
+
+
+class PerActorEpsilonPolicy:
+    """Wrap one arena's :class:`RolloutPolicy` so it acts under its OWN Ape-X ε.
+
+    A pure pass-through except for :meth:`act`, whose ``epsilon`` argument — the
+    GLOBAL schedule value the Collector computed — is mapped through
+    :func:`per_actor_epsilon` before it reaches the wrapped policy. Everything
+    else (weight refresh, re-seeding, hidden init, and the three Episode-stamp
+    attributes) is delegated to the wrapped policy so the wrapper satisfies
+    ``RolloutPolicy`` structurally and nothing downstream can tell the difference.
+
+    ``policy_version`` is delegated as a PROPERTY, never copied at construction:
+    the wrapped :class:`~distributed.weights.SnapshotPolicy` mutates it inside
+    ``maybe_refresh``, and a copy taken here would freeze every collected
+    Episode's provenance stamp at ``-1``.
+
+    Args:
+        policy: The wrapped per-arena policy (a ``SnapshotPolicy`` live).
+        arenas: Total arena count ``N`` (must be > 1 — at N=1 the transform is
+            the identity and the wrapper is pointless, so the caller
+            :func:`maybe_wrap_per_actor_epsilon` refuses to build one).
+        alpha: The spread exponent α.
+
+    Raises:
+        ValueError: if ``arenas < 2`` or ``alpha <= 0``.
+    """
+
+    def __init__(self, policy: Any, *, arenas: int, alpha: float) -> None:
+        if int(arenas) < 2:
+            raise ValueError(
+                "PerActorEpsilonPolicy needs arenas >= 2 (at N=1 the Ape-X "
+                f"exponent is exactly 1 and the wrapper is a no-op), got {arenas}"
+            )
+        if not float(alpha) > 0.0:  # `not >` so NaN is rejected too
+            raise ValueError(f"alpha must be > 0, got {alpha!r}")
+        self._policy = policy
+        self._arenas = int(arenas)
+        self._alpha = float(alpha)
+
+    # -- the one behavior this class adds ---------------------------------
+
+    def epsilon_for(self, base_epsilon: float) -> float:
+        """Map a global-schedule ε to THIS arena's ε (see :func:`per_actor_epsilon`)."""
+        return per_actor_epsilon(
+            base_epsilon, self._policy.arena_id, self._arenas, self._alpha
+        )
+
+    def act(
+        self,
+        obs: torch.Tensor,
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+        epsilon: float,
+    ) -> Tuple[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """Act under this arena's ε rather than the shared schedule value."""
+        return self._policy.act(obs, hidden, self.epsilon_for(epsilon))
+
+    # -- pure delegation ---------------------------------------------------
+
+    @property
+    def arena_id(self) -> int:
+        return self._policy.arena_id
+
+    @property
+    def policy_version(self) -> int:
+        return self._policy.policy_version
+
+    @property
+    def code_version(self) -> str:
+        return self._policy.code_version
+
+    def maybe_refresh(self, store: Any) -> None:
+        self._policy.maybe_refresh(store)
+
+    def reseed(self, episode_seed: int) -> None:
+        self._policy.reseed(episode_seed)
+
+    def init_hidden(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._policy.init_hidden()
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails. The `_policy` guard prevents the
+        # infinite recursion that would follow if this fired before __init__ bound
+        # it (e.g. during copy/unpickle).
+        if name == "_policy":
+            raise AttributeError(name)
+        return getattr(self._policy, name)
+
+
+def maybe_wrap_per_actor_epsilon(policy: Any, cfg: TrainConfig) -> Any:
+    """Return ``policy`` wrapped for Ape-X ε, or unchanged when the spread is off.
+
+    The single decision point, extracted from ``train_multi_arena``'s closure so
+    it is directly unit-testable: a test can hand it any object and assert
+    whether it comes back wrapped.
+
+    Args:
+        policy: One arena's rollout policy.
+        cfg: The run config (:func:`per_actor_eps_enabled` decides).
+
+    Returns:
+        The same object when the spread is off or ``arenas == 1``; a
+        :class:`PerActorEpsilonPolicy` around it otherwise.
+    """
+    if not per_actor_eps_enabled(cfg):
+        return policy
+    return PerActorEpsilonPolicy(
+        policy, arenas=int(cfg.arenas), alpha=float(cfg.per_actor_eps_alpha)
+    )
+
+
+def build_arena_policy(
+    arena_id: int,
+    cfg: TrainConfig,
+    *,
+    net_factory: Callable[[], Any],
+    code_version: str = "",
+) -> Any:
+    """Build arena ``arena_id``'s rollout policy for the multi-arena pool.
+
+    A :class:`~distributed.weights.SnapshotPolicy` over its own net clone, seeded
+    from that arena's local-episode-0 seed, wrapped by
+    :func:`maybe_wrap_per_actor_epsilon`. Module-level (rather than inline in
+    ``train_multi_arena``) so the wrapping is provable by a unit test instead of
+    only by a full offline run.
+
+    Args:
+        arena_id: 0-based arena index.
+        cfg: The run config.
+        net_factory: Zero-arg callable returning a fresh net for the clone.
+        code_version: Build stamp copied onto every Episode this policy collects.
+
+    Returns:
+        The arena's ``RolloutPolicy``.
+    """
+    from distributed.weights import SnapshotPolicy
+
+    policy = SnapshotPolicy(
+        net_factory,
+        # The generator seed is the arena's local-episode-0 seed; the policy
+        # re-seeds per episode anyway, so this is just a distinct, reproducible
+        # starting point per arena.
+        generator_seed=arena_episode_seed(cfg, arena_id, 0),
+        arena_id=arena_id,
+        code_version=code_version,
+    )
+    return maybe_wrap_per_actor_epsilon(policy, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -2466,8 +2855,15 @@ def train_multi_arena(
     Determinism: each arena's per-episode seed is ``arena_episode_seed(cfg,
     arena_id, local_ep)`` (its own ``torch.Generator`` inside the SnapshotPolicy);
     the ε schedule advances off the GLOBAL episode counter (in the Collector); PER β
-    anneals off the learner's ``grad_step`` (inside ``trainer.learn()``). The MEAN ε
-    across arenas is logged (each arena carries its own ε under the global schedule).
+    anneals off the learner's ``grad_step`` (inside ``trainer.learn()``).
+
+    Exploration: ONE global ε schedule (``epsilon_for_episode`` off the shared
+    counter) plus, when ``cfg.per_actor_eps`` and ``cfg.arenas > 1``, the Ape-X
+    per-actor spread — arena ``i`` acts at ``ε ** (1 + i/(N-1)*α)``, so arena 0 is
+    the most exploratory and arena ``N-1`` is near-greedy
+    (:func:`per_actor_epsilon`). ``train/epsilon_mean`` logs the fleet's TRUE mean
+    under that spread, and ``train/epsilon_schedule`` the underlying schedule
+    value; with the spread off the two are equal.
 
     Args:
         cfg: Training hyperparameters. ``cfg.arenas`` (> 1) sets the collector count;
@@ -2579,7 +2975,9 @@ def train_multi_arena(
     from distributed.actor import ActorPool, GlobalEpisodeCounter, PoolAbortedError
     from distributed.learner import LearnerLoop, LearnerWatchdog
     from distributed.transport import LocalTransport
-    from distributed.weights import SnapshotPolicy, WeightStore
+    # SnapshotPolicy itself is constructed by the module-level build_arena_policy
+    # (which also applies the Ape-X ε wrap), so only the store is needed here.
+    from distributed.weights import WeightStore
 
     from agent.contract_config import code_version as _code_version
     from agent.dqn import DuelingDRQN
@@ -2676,14 +3074,12 @@ def train_multi_arena(
     def _policy_for(arena_id: int) -> Any:
         policy = policies.get(arena_id)
         if policy is None:
-            policy = SnapshotPolicy(
-                _net_factory,
-                # The generator seed is the arena's local-episode-0 seed; the policy
-                # re-seeds per episode anyway, so this is just a distinct, reproducible
-                # starting point per arena.
-                generator_seed=arena_episode_seed(cfg, arena_id, 0),
-                arena_id=arena_id,
-                code_version=code_ver,
+            # build_arena_policy also applies the Ape-X per-actor ε wrap (T16(f))
+            # when cfg.per_actor_eps is on AND cfg.arenas > 1. It is module-level
+            # so that wrapping is unit-testable rather than only observable
+            # through a full run.
+            policy = build_arena_policy(
+                arena_id, cfg, net_factory=_net_factory, code_version=code_ver
             )
             policies[arena_id] = policy
         return policy
@@ -2776,16 +3172,13 @@ def train_multi_arena(
         _emit(f"[multi] checkpoint saved ({why}) at grad_step {grad_step}")
 
     def _maybe_log_mean_epsilon(grad_step: int) -> None:
-        # The logged epsilon is per-arena under N collectors; log the MEAN across the
-        # arenas' current schedule positions (computed from the GLOBAL counter so it
-        # reflects the combined stream the schedule actually advanced over).
+        # The row is built by the module-level epsilon_log_row so what gets logged
+        # is unit-testable without driving a whole multi-arena run. It reports the
+        # fleet's TRUE mean under the Ape-X spread alongside the shared schedule
+        # value they derive from.
         if logger is None:
             return
-        # All arenas share the global episode counter, so they sit at (nearly) the
-        # same schedule point; the mean over the counter's value is the representative
-        # ε. We sample the schedule at the current global episode count.
-        global_eps = epsilon_for_episode(max(0, counter.value - 1), cfg)
-        logger.log({"train/epsilon_mean": float(global_eps)}, step=int(grad_step))
+        logger.log(epsilon_log_row(counter.value, cfg), step=int(grad_step))
 
     _emit(
         f"[multi] starting {cfg.arenas} pads - "
@@ -2814,6 +3207,13 @@ def train_multi_arena(
         )
         + (f", stop_on_pass={'on' if stop_on_pass else 'off'}")
     )
+    # --- the exploration schedule, said out loud (T16 / AC15) ----------------
+    # All N pads draw from ONE episode counter, so eps_decay_episodes is spent N
+    # times faster than a single-arena reading of it suggests. Report where the
+    # floor actually lands so an operator sees it in the run's opening lines
+    # rather than inferring it from a flat epsilon curve at 3am.
+    for _line in epsilon_schedule_report(cfg):
+        _emit(_line)
     if checkpoint_hook is None and best_checkpoint_hook is None:
         # Said at the START, loudly. A multi-hour run that saves nothing is
         # unrecoverable at 8am, and the only symptom is an empty runs/ directory.
@@ -3181,6 +3581,44 @@ def _build_parser() -> "Any":
         "--no-stop-on-pass", dest="stop_on_pass", action="store_false",
         help="run the full budget even if an eval clears the M2 gate.",
     )
+    # -- exploration + replay sizing (T16; all default to None -> the config) --
+    parser.add_argument(
+        "--eps-decay-episodes", type=int, default=None,
+        help="GLOBAL episodes over which epsilon decays to its floor. Omitted, it "
+        "is DERIVED from --arenas by TrainConfig.eps_decay_episodes_for (~15%% of "
+        "the episodes that many pads are projected to collect overnight) - every "
+        "pad claims from ONE shared episode counter, so a single-arena number is "
+        "spent N times too fast. The projection assumes an UNMEASURED mean episode "
+        "length; set this flag from the smoke run's measured mean (do NOT use 400, "
+        "which is the timeout, not a typical episode).",
+    )
+    parser.add_argument(
+        "--replay-capacity", type=int, default=None,
+        help="max stored transitions in the prioritized sequence replay (default: "
+        "TrainConfig's 1e6, ~2.3 GB - the per-step LSTM hidden snapshot is 90%% of "
+        "that). Lower it on a smaller machine.",
+    )
+    parser.add_argument(
+        "--min-replay", type=int, default=None,
+        help="transitions that must be stored before the FIRST gradient step "
+        "(default: TrainConfig's 25000).",
+    )
+    parser.add_argument(
+        "--per-actor-eps", dest="per_actor_eps", action="store_true", default=None,
+        help="give each arena its own Ape-X epsilon, eps**(1 + i/(N-1)*alpha), so "
+        "arena 0 is the MOST exploratory and arena N-1 is near-greedy (issue #15). "
+        "ON by default, and a no-op at --arenas 1.",
+    )
+    parser.add_argument(
+        "--no-per-actor-eps", dest="per_actor_eps", action="store_false",
+        help="every arena shares one epsilon (the pre-issue-#15 behavior). The "
+        "instant off switch if the smoke run looks wrong.",
+    )
+    parser.add_argument(
+        "--per-actor-eps-alpha", type=float, default=None,
+        help="Ape-X alpha: the last arena acts at eps**(1+alpha) (default: 7.0, the "
+        "paper's value). Must be > 0; use --no-per-actor-eps to disable, not 0.",
+    )
     parser.add_argument(
         "--seed", type=int, default=0,
         help="base RNG seed (overrides TrainConfig.seed) (default: 0).",
@@ -3237,6 +3675,11 @@ _CONFIG_OVERRIDE_FLAGS: Tuple[Tuple[str, str, Callable[[Any], Any]], ...] = (
     ("eval_opponent_preset", "eval_opponent_preset", str),
     ("warm_start", "warm_start", str),
     ("warm_start_eps_start", "warm_start_eps_start", float),
+    ("eps_decay_episodes", "eps_decay_episodes", int),
+    ("replay_capacity", "replay_capacity", int),
+    ("min_replay", "min_replay", int),
+    ("per_actor_eps", "per_actor_eps", bool),
+    ("per_actor_eps_alpha", "per_actor_eps_alpha", float),
 )
 
 
@@ -3247,6 +3690,14 @@ def _config_from_args(args: Any) -> TrainConfig:
     defaults); applies every entry of :data:`_CONFIG_OVERRIDE_FLAGS` only when the
     flag was actually passed, so an omitted flag keeps the dataclass default
     rather than re-declaring it in two places.
+
+    ``eps_decay_episodes`` is the ONE field whose omitted-flag fallback is not
+    "keep the dataclass default": the default is sized for
+    ``DEFAULT_EPS_DECAY_ARENAS`` pad(s) and every arena claims from the SAME
+    global episode counter, so at 25 pads that default floors ε about 1% into an
+    overnight run. Omitted, it is therefore RE-DERIVED by the dataclass's own
+    :func:`~agent.train_config.eps_decay_episodes_for` at this run's real
+    ``--arenas`` — same function the default calls, so the two cannot drift.
 
     ``TrainConfig.__post_init__`` validates the result, so a bad CLI value (a
     mixture outside [0, 1], an unknown eval preset, an empty ``--warm-start``)
@@ -3269,6 +3720,11 @@ def _config_from_args(args: Any) -> TrainConfig:
         value = getattr(args, dest, None)
         if value is not None:
             overrides[field_name] = cast(value)
+    # Not expressible in the table above (its fallback is the dataclass default,
+    # this one's is a formula) — an explicit --eps-decay-episodes has already been
+    # applied by the loop and wins.
+    if "eps_decay_episodes" not in overrides:
+        overrides["eps_decay_episodes"] = eps_decay_episodes_for(int(args.arenas))
     return dataclasses.replace(TrainConfig(), **overrides)
 
 
@@ -3405,6 +3861,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "eps_start_effective": effective_eps_start(cfg),
             "eps_end": cfg.eps_end,
             "eps_decay_episodes": cfg.eps_decay_episodes,
+            # The ε window is DERIVED from --arenas when the flag is omitted, so
+            # the number alone does not say whether the run explored for long
+            # enough. Record where the floor lands and how the fleet was spread.
+            "eps_floor_fraction_of_run": eps_floor_fraction_of_run(cfg),
+            "per_actor_eps": per_actor_eps_enabled(cfg),
+            "per_actor_eps_alpha": cfg.per_actor_eps_alpha,
+            "replay_capacity": cfg.replay_capacity,
+            "min_replay": cfg.min_replay,
             **reward_cfg,
         },
     )

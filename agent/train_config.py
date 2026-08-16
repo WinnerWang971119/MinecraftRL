@@ -34,6 +34,19 @@ are short (tens of decisions), so a per-STEP decay collapses ε in a handful of
 episodes and silently kills exploration. Keeping the schedule on the episode
 boundary is the documented fix.
 
+------------------------------------------------------------------------------
+Second gotcha: the ε schedule is counted in GLOBAL episodes, not per-arena ones
+------------------------------------------------------------------------------
+Under ``arenas > 1`` every collector claims its episode index from ONE shared
+``distributed.actor.GlobalEpisodeCounter`` (``distributed/actor.py:672-674``
+claims the index and feeds it straight into ``epsilon_for_episode``; the counter
+itself is built at ``agent/train.py:2636`` and re-read for logging at
+``agent/train.py:2787``). So ``eps_decay_episodes`` is consumed N times faster at
+N pads: the single-arena value of 200 that this file used to ship floored ε after
+8 episodes PER ARENA at 25 pads — about 1% of a one-night run, against the
+field's own ~15% guidance. :func:`eps_decay_episodes_for` is the fix: the default
+is COMPUTED from the arena count rather than written down for one pad.
+
 Owner: T16 (DQN core track)
 """
 
@@ -43,7 +56,176 @@ from dataclasses import dataclass
 
 from agent.replay import DEFAULT_ALPHA, DEFAULT_BETA0, DEFAULT_PRIORITY_EPS
 
-__all__ = ["TrainConfig"]
+__all__ = [
+    "TrainConfig",
+    "MEASURED_PER_ARENA_TRANSITIONS_PER_S",
+    "ASSUMED_RUN_HOURS",
+    "ASSUMED_MEAN_EPISODE_STEPS",
+    "EPS_DECAY_FRACTION_OF_RUN",
+    "DEFAULT_EPS_DECAY_ARENAS",
+    "projected_episodes",
+    "eps_decay_episodes_for",
+]
+
+
+# ---------------------------------------------------------------------------
+# Sizing the ε schedule from throughput (T16(a) / AC15 / AC17).
+#
+# The four inputs below are the ONLY quantities the default ε-decay window is
+# built from. Exactly one of them is measured; the other three are assumptions,
+# and each says so on its own line. Anything derived from them is therefore a
+# PROJECTION, never a measurement — which is why ``--eps-decay-episodes`` exists.
+# ---------------------------------------------------------------------------
+
+#: MEASURED (AC16, 2026-08-16). Per-arena collection rate in transitions/second,
+#: from the 600 s confirm run at 25 pads: 121.95/s aggregate over 25 arenas ==
+#: 4.8782/s each (``runs/confirm-n25/summary.json``). Per-arena rate varied 0.05%
+#: across N = 16/20/24/25, so treating it as a constant and multiplying by the
+#: arena count is what the sweep actually licenses.
+MEASURED_PER_ARENA_TRANSITIONS_PER_S: float = 4.8782
+
+#: ASSUMPTION — the length of one unattended overnight run, in hours. 12 h is
+#: "start it after dinner, read it at breakfast"; it is a plan for the night, not
+#: a measurement of one. A shorter run makes the projected episode budget (and so
+#: the decay window) proportionally smaller.
+ASSUMED_RUN_HOURS: float = 12.0
+
+#: ASSUMPTION — NOT MEASURED. Mean decisions per TRAINING episode against the
+#: scripted opponent. **Override the result with ``--eps-decay-episodes N`` once
+#: the smoke run reports a real mean episode length**; do not edit this constant
+#: under schedule pressure.
+#:
+#: It is deliberately NOT ``MAX_EPISODE_STEPS`` (400): 400 is the TIMEOUT, the
+#: length of an episode in which nobody won, not a typical one. The only measured
+#: figure in this repo is ``mean_episode_length: 17.0``
+#: (``runs/m2_multi/summary.json``) — but that is a GREEDY eval against a
+#: STATIONARY dummy, i.e. the easiest episode this env can produce, so it is a
+#: LOWER bound on a training episode against an opponent that moves, strafes and
+#: (on HARD) flees. 30 is that lower bound doubled.
+#:
+#: Erring low here is intentional, because the error is asymmetric. This value
+#: is the DIVISOR of the projected episode count, so assuming too LOW a length
+#: over-estimates the episode count and the decay window comes out long — ε then
+#: sits above its floor for more of the night. Assuming too HIGH a length
+#: re-creates exactly the bug this constant exists to fix: ε on the floor a few
+#: percent into the run. Under a warm start ε only spans 0.25 -> 0.05, so a decay
+#: window that runs long costs very little, while one that runs short costs the
+#: night.
+ASSUMED_MEAN_EPISODE_STEPS: float = 30.0
+
+#: ASSUMPTION (field convention, and the number AC15 is written against) —
+#: fraction of a run's projected episodes the ε decay should span. ~15% is the
+#: DQN-lineage guidance: rich exploration early, mostly exploitative for the bulk
+#: of training.
+EPS_DECAY_FRACTION_OF_RUN: float = 0.15
+
+#: The arena count :attr:`TrainConfig.eps_decay_episodes`'s DATACLASS default is
+#: sized for. A dataclass default is one frozen number and cannot depend on
+#: ``arenas``, so it is pinned at the single-arena case (today's M1/M2 loop) and
+#: the multi-arena launch path re-derives it from the real pad count via
+#: :func:`eps_decay_episodes_for` (``agent.train._config_from_args``). A config
+#: hand-built as ``TrainConfig(arenas=25)`` therefore keeps the N=1 window —
+#: ``agent.train.train_multi_arena`` logs the resulting floor position at startup
+#: and warns when it lands early, because that is the silent shape of this bug.
+DEFAULT_EPS_DECAY_ARENAS: int = 1
+
+
+def projected_episodes(
+    arenas: int,
+    *,
+    hours: float = ASSUMED_RUN_HOURS,
+    per_arena_transitions_per_s: float = MEASURED_PER_ARENA_TRANSITIONS_PER_S,
+    mean_episode_steps: float = ASSUMED_MEAN_EPISODE_STEPS,
+) -> float:
+    """Project how many EPISODES a run of ``arenas`` pads collects.
+
+    The formula, in full::
+
+        transitions = arenas * per_arena_transitions_per_s * 3600 * hours
+        episodes    = transitions / mean_episode_steps
+
+    Linear in ``arenas`` because AC16 measured the per-arena rate flat to 0.05%
+    from 16 to 25 pads (no knee, no thermal decay over a 600 s confirm).
+
+    Args:
+        arenas: Pad count for the run (>= 1).
+        hours: Wall-clock length of the run (see :data:`ASSUMED_RUN_HOURS`).
+        per_arena_transitions_per_s: Collection rate for ONE pad (see
+            :data:`MEASURED_PER_ARENA_TRANSITIONS_PER_S`).
+        mean_episode_steps: Mean decisions per episode (see
+            :data:`ASSUMED_MEAN_EPISODE_STEPS` — an ASSUMPTION, not a
+            measurement).
+
+    Returns:
+        Projected episode count as a float (a projection; it is not rounded here
+        so callers can take fractions of it without compounding rounding).
+
+    Raises:
+        ValueError: on a non-positive input, so a zero episode budget can never
+            reach the ε schedule and make its denominator meaningless.
+    """
+    if arenas < 1:
+        raise ValueError(f"arenas must be >= 1, got {arenas}")
+    if not (hours > 0.0):
+        raise ValueError(f"hours must be > 0, got {hours!r}")
+    if not (per_arena_transitions_per_s > 0.0):
+        raise ValueError(
+            "per_arena_transitions_per_s must be > 0, got "
+            f"{per_arena_transitions_per_s!r}"
+        )
+    if not (mean_episode_steps > 0.0):
+        raise ValueError(f"mean_episode_steps must be > 0, got {mean_episode_steps!r}")
+
+    transitions = int(arenas) * float(per_arena_transitions_per_s) * 3600.0 * float(hours)
+    return transitions / float(mean_episode_steps)
+
+
+def eps_decay_episodes_for(
+    arenas: int,
+    *,
+    fraction: float = EPS_DECAY_FRACTION_OF_RUN,
+    hours: float = ASSUMED_RUN_HOURS,
+    per_arena_transitions_per_s: float = MEASURED_PER_ARENA_TRANSITIONS_PER_S,
+    mean_episode_steps: float = ASSUMED_MEAN_EPISODE_STEPS,
+) -> int:
+    """Return the ε-decay window (in GLOBAL episodes) for a run of ``arenas`` pads.
+
+    ``round(fraction * projected_episodes(arenas, ...))``, floored at 1 so the
+    result always satisfies ``TrainConfig``'s own ``eps_decay_episodes >= 1``.
+
+    This is the ONE place the default window is computed. The dataclass default
+    calls it at :data:`DEFAULT_EPS_DECAY_ARENAS`, and
+    ``agent.train._config_from_args`` calls it again with the run's real
+    ``--arenas`` whenever ``--eps-decay-episodes`` was not given — same function,
+    so the two can never drift apart.
+
+    Args:
+        arenas: Pad count for the run (>= 1).
+        fraction: Share of the projected episodes the decay spans (see
+            :data:`EPS_DECAY_FRACTION_OF_RUN`).
+        hours / per_arena_transitions_per_s / mean_episode_steps: Forwarded to
+            :func:`projected_episodes`.
+
+    Returns:
+        The episode count over which ε decays from its start value to
+        ``eps_end`` (>= 1).
+
+    Raises:
+        ValueError: if ``fraction`` is not in (0, 1], or from
+            :func:`projected_episodes` on a bad projection input.
+    """
+    # `not 0 < x <= 1` rather than two or-ed comparisons so NaN — which fails
+    # every ordered comparison — is rejected instead of slipping through as an
+    # always-false predicate.
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction!r}")
+    episodes = projected_episodes(
+        arenas,
+        hours=hours,
+        per_arena_transitions_per_s=per_arena_transitions_per_s,
+        mean_episode_steps=mean_episode_steps,
+    )
+    return max(1, int(round(fraction * episodes)))
 
 
 #: The opponent sources ``TrainConfig.opponent`` accepts. ``"dummy"`` is the
@@ -139,26 +321,51 @@ class TrainConfig:
     #: must keep probing alternatives in a non-stationary self-play world).
     eps_end: float = 0.05
 
-    #: TUNE — number of EPISODES (NOT steps) over which ε decays linearly from
-    #: ``eps_start`` to ``eps_end``; it is flat at ``eps_end`` afterwards. Sized
-    #: at ~10–20% of the planned episode budget so exploration is rich early and
-    #: largely exploitative for the bulk of training. Per-EPISODE on purpose
-    #: (see module docstring / agent.seeding): a per-step decay collapses ε far
-    #: too fast on short episodes. TUNE to ~15% of total episodes.
-    eps_decay_episodes: int = 200
+    #: Number of GLOBAL EPISODES (NOT steps, and NOT per-arena episodes) over
+    #: which ε decays linearly from ``eps_start`` to ``eps_end``; it is flat at
+    #: ``eps_end`` afterwards. Per-EPISODE on purpose (see module docstring /
+    #: agent.seeding): a per-step decay collapses ε far too fast on short
+    #: episodes.
+    #:
+    #: The default is COMPUTED, not written down — see
+    #: :func:`eps_decay_episodes_for` for the formula and every assumption behind
+    #: it. It is ~15% of the episodes a run of
+    #: :data:`DEFAULT_EPS_DECAY_ARENAS` pad(s) is projected to collect. The
+    #: multi-arena CLI re-derives it from the real ``--arenas`` (all arenas share
+    #: ONE episode counter, so N pads consume this budget N times faster), and
+    #: ``--eps-decay-episodes N`` overrides both — THAT is the flag to set from
+    #: the smoke run's measured mean episode length, rather than editing any
+    #: constant in this file.
+    eps_decay_episodes: int = eps_decay_episodes_for(DEFAULT_EPS_DECAY_ARENAS)
 
     # -- replay buffer sizing --------------------------------------------
-    #: TUNE — max stored TRANSITIONS in the prioritized sequence replay. 100k is a
-    #: large, diverse history that fits comfortably in RAM for the kickoff
-    #: single-arena setup (the buffer is pure-NumPy). Raise toward 1e6 for the
-    #: distributed scale-up.
-    replay_capacity: int = 100_000
+    #: TUNE — max stored TRANSITIONS in the prioritized sequence replay. 1e6 for
+    #: the multi-arena scale-up: at the measured 121.95 transitions/s aggregate
+    #: (AC16, 25 pads) the old 100k held ~14 minutes of experience, so an
+    #: overnight run would have been sampling almost exclusively from the last
+    #: quarter-hour it collected. 1e6 is ~2.3 hours of that same stream.
+    #:
+    #: MEMORY (measured on the pinned modules, not estimated — the plan's
+    #: "~200 MB at OBS_DIM=23" is wrong by ~11x because it counts only the
+    #: transition tuple): per stored transition the buffer holds
+    #: ``obs`` 23xf32 (92 B) + ``next_obs`` 23xf32 (92 B) + action i64 (8 B) +
+    #: reward f32 (4 B) + done bool (1 B) + **the per-step LSTM hidden snapshot
+    #: (2, LSTM_LAYERS=1, LSTM_HIDDEN=256) f32 = 2048 B** == 2245 B, plus 32 B per
+    #: CAPACITY SLOT for the sum-tree (2 x f64) and the two i64 leaf maps. That is
+    #: 2277 B/transition => **~2.28 GB of array payload at 1e6** (~2.5 GB
+    #: resident, measured RSS). The hidden-state term is 90% of it and is the part
+    #: that gets forgotten. Use ``--replay-capacity`` to shrink it on a smaller
+    #: machine.
+    replay_capacity: int = 1_000_000
 
     #: TUNE — transitions that must be stored before the FIRST gradient step
-    #: (warm-up). 1000 ensures the initial batches are not dominated by a handful
-    #: of correlated early episodes. Gating is on ``len(replay) >= min_replay``.
-    #: TUNE: keep >= a few full windows; raise for more diverse warm-up.
-    min_replay: int = 1_000
+    #: (warm-up). 25k for the multi-arena path: the old 1000 is ~8 seconds of
+    #: fleet output (121.95/s) and about 33 episodes, so the first gradients came
+    #: from a handful of correlated openings. 25k spreads the warm-up over ~800
+    #: episodes drawn from all N pads, which is what makes them decorrelated.
+    #: Gating is on ``len(replay) >= min_replay``. TUNE: keep >= a few full
+    #: windows; raise for more diverse warm-up.
+    min_replay: int = 25_000
 
     # -- PER (prioritized experience replay) knobs -----------------------
     #: TUNE — PER priority exponent α (§5.4). Mirrors the replay default; 0 ==
@@ -186,9 +393,18 @@ class TrainConfig:
     #: this only sets the cadence at which the hook is CALLED). 0 disables.
     eval_interval: int = 5_000
 
-    #: TUNE — gradient steps between checkpoint hook invocations (T20 owns the
-    #: actual save; this only sets the cadence). 0 disables.
-    checkpoint_interval: int = 10_000
+    #: TUNE — gradient steps between checkpoint hook invocations. 0 disables.
+    #: 5k rather than 10k so a night produces twice as many late candidates for
+    #: freeze-day selection.
+    #:
+    #: WHICH PATH READS THIS. ``Trainer._fire_hooks`` (the ``Trainer.train()``
+    #: cadence) is DEAD on the multi-arena path — the learner thread calls
+    #: ``trainer.learn()`` directly and never ``trainer.train()``. But the value
+    #: is NOT dead there: T13 made it the default periodic-save cadence at
+    #: ``agent/train.py:2756-2760``, used whenever
+    #: ``--checkpoint-every-grad-steps`` is omitted. Passing that flag overrides
+    #: this field entirely.
+    checkpoint_interval: int = 5_000
 
     #: TUNE — gradient steps between log hook invocations. 0 disables.
     log_interval: int = 100
@@ -231,6 +447,39 @@ class TrainConfig:
     #: even when ``seed`` is small. 1_000_000 gives each arena a
     #: million-episode independent band. Only read when ``arenas > 1``.
     seed_stride: int = 1_000_000
+
+    # -- Ape-X per-actor ε (issue #15) ---------------------------------------
+    #: When True (the default) each arena acts under its OWN ε rather than the
+    #: one shared schedule value: arena ``i`` of ``N`` uses
+    #: ``ε_i = ε ** (1 + i/(N-1) * per_actor_eps_alpha)`` (Ape-X, Horgan et al.
+    #: 2018). Since ``ε <= 1``, raising it to a larger power SHRINKS it, so
+    #: **arena 0 is the most exploratory** (``ε_0 == ε`` exactly) and arena
+    #: ``N-1`` is the most exploitative. One fleet then spans exploration and
+    #: exploitation simultaneously instead of moving through them together.
+    #:
+    #: EFFECTIVE ONLY WHEN ``arenas > 1``. At ``arenas == 1`` the exponent is
+    #: exactly 1 and the value is the base ε unchanged, so the single-arena
+    #: (M1/M2) path is byte-identical whatever this says — and there is no
+    #: ``N-1 == 0`` division anywhere, because that branch is taken before the
+    #: ratio is formed. ``agent.train.per_actor_eps_enabled`` is the one place
+    #: the ``and arenas > 1`` gate is expressed.
+    #:
+    #: Turn it off with ``--no-per-actor-eps`` — no source edit, no relaunch
+    #: cost beyond the run itself. This is the plan's declared schedule cut #2.
+    #:
+    #: WARM-START INTERPLAY, so nobody "fixes" it on demo day: under
+    #: ``warm_start`` the base ε spans 0.25 -> 0.05, so at 25 pads arena 24 acts
+    #: at ``0.25 ** 8`` ~= 1.5e-5 — effectively greedy from episode 0. That is the
+    #: Ape-X exploit arm doing its job (it is the arm whose episodes show what the
+    #: current policy actually does), not a broken schedule.
+    per_actor_eps: bool = True
+
+    #: Ape-X's ``α``: how hard the per-arena ε spread fans out. The last arena
+    #: acts at ``ε ** (1 + α)``, so 7.0 (the paper's value) spans ε down to ε**8.
+    #: Lower it for a tighter fleet; ``0`` is NOT the off switch (it would flatten
+    #: every arena onto the same ε, which is what ``per_actor_eps=False`` already
+    #: means) and is rejected. Only read when ``per_actor_eps`` and ``arenas > 1``.
+    per_actor_eps_alpha: float = 7.0
 
     # -- opponent + curriculum (T12; demo-day scripted-opponent track) --------
     #: Which opponent the collectors fight. ``"dummy"`` (the default) is the
@@ -385,6 +634,15 @@ class TrainConfig:
             )
         if self.seed_stride < 1:
             raise ValueError(f"seed_stride must be >= 1, got {self.seed_stride}")
+        # `not x > 0` (not `x <= 0`) so NaN is rejected: NaN fails every ordered
+        # comparison, so `<= 0` would be False and let it through, and a NaN
+        # exponent turns every arena's ε into NaN with nothing to catch it.
+        if not self.per_actor_eps_alpha > 0.0:
+            raise ValueError(
+                "per_actor_eps_alpha must be > 0 (use per_actor_eps=False / "
+                f"--no-per-actor-eps to disable the spread), got "
+                f"{self.per_actor_eps_alpha!r}"
+            )
         if self.opponent not in _OPPONENT_CHOICES:
             raise ValueError(
                 f"opponent must be one of {sorted(_OPPONENT_CHOICES)}, got "
