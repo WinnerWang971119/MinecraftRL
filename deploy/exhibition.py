@@ -1,4 +1,4 @@
-"""deploy.exhibition — one-command human-exhibition launcher (T5).
+"""deploy.exhibition — one-command human-exhibition launcher (T5) + reset (T6).
 
 ``python -m deploy.exhibition`` starts Paper, waits for it to actually accept
 connections, starts the bridge in HUMAN opponent mode (``--opponent-mode
@@ -6,6 +6,11 @@ human``, T3), connects the trained agent playing GREEDILY (epsilon=0, no
 learning) from a checkpoint, and prints the LAN join address plus the pad
 coordinates so a classmate can join and find the arena without being talked
 through it.
+
+``python -m deploy.exhibition --reset`` is the SEPARATE between-challengers
+command (T6): it heals and repositions both sides, arms the next challenger and
+re-drives play — once per invocation, never by itself. See "THE RESET COMMAND"
+below.
 
 This module deliberately does the ORDERING ``server/setup/start-pads.sh``
 already gets right — preflight gates before anything is spawned, write
@@ -52,17 +57,58 @@ BEFORE anything is spawned and before ``ops.json`` is written, in this order:
      comes back through :func:`_dump_log_tail`.
 
 LIFECYCLE. This process is a FOREGROUND supervisor, like ``start-pads.sh``: it
-plays EXACTLY ONE match (:func:`play_one_match` is called once), then holds the
-agent's bridge connection open and idles until Ctrl-C, which is what tears
-Paper and the bridge down. A match ending (``done=True``, AC4: no auto-restart)
-neither exits the process nor starts a second match — it reports the result and
-idles, still connected. Driving another match is T6's job, and it has to happen
-INSIDE this process: the bridge accepts exactly one TCP client, so a separate
-reset process that connected would evict this one's live agent connection.
-:func:`_idle_until_interrupt` is the seam where that plugs in. Whether T6
-reuses this live connection or this process should instead disconnect while
-idling is T6's call, not decided here — left as a one-line TODO at that
-function.
+plays one match, reports the result, and then WAITS — holding the agent's
+bridge connection open — for either a reset request or Ctrl-C, which is what
+tears Paper and the bridge down. A match ending (``done=True``) never starts
+another one by itself (AC4).
+
+THE RESET COMMAND (T6). ``python -m deploy.exhibition --reset`` does not talk to
+the bridge and starts nothing. It files a one-shot REQUEST FILE
+(``<log-dir>/reset.request``) that the running launcher above is polling for,
+and the launcher does the work in-process:
+
+  1. heal + reposition the HUMAN through Paper's console (see "THE HUMAN SIDE"),
+  2. re-drive :func:`play_one_match`, whose ``env.reset()`` is what heals and
+     repositions the LEARNER, sweeps the pad and releases the bridge's
+     challenger slot for the next person.
+
+WHY A REQUEST FILE, and not a second process that speaks the wire: the bridge
+accepts exactly ONE TCP client and a second connect DESTROYS the first, so a
+``--reset`` that connected would evict the live agent mid-exhibition. Among the
+in-process triggers, a file beats the alternatives on this machine: a signal
+needs a pidfile, and a stale pidfile whose pid has been REUSED aims SIGUSR1 at
+an unrelated process (macOS has no ``/proc`` to validate it against); a signal
+handler is also asynchronous, and this module's teardown chain is carefully
+``BaseException``-proof for exactly one such interruption (Ctrl-C) — adding a
+second class of async delivery into it buys nothing here. stdin would tie the
+launcher to an interactive terminal it does not otherwise need. A file also
+gives the exact semantics the user asked for — "one command, one trigger" —
+because a duplicate ``--reset`` collapses onto the same single file rather than
+queueing a second match.
+
+ONE TRIGGER, ONE MATCH, AND NEVER A DEATH. The request is honored ONLY while
+the launcher is idle between matches. A request filed while a match is still
+running is DISCARDED (loudly) when that match ends, because honoring it would
+make the death itself the proximate cause of the restart — which is the thing
+AC4 forbids and the thing the user was explicit about ("after one death, no
+restart auto for human"). Requests left over from an earlier launch are
+discarded at startup for the same reason.
+
+THE HUMAN SIDE. ``formatHumanResetCommands`` (``bridge/bot.js``) resets the
+LEARNER only; the datapack has no template for a challenger, and the wire has no
+slot for one. That is invisible in the common case — a human who DIES respawns
+at full health — but a match ending in the AGENT's death leaves the human
+carrying partial health into the next round, i.e. it goes wrong exactly when
+somebody has just beaten the AI in front of a room. The only command channel
+this process can reach is Paper's own console, so ``run()`` starts Paper with a
+stdin PIPE and writes the heal/reposition lines into it
+(:func:`human_reset_commands`, mirroring the dummy's datapack template).
+Best-effort by construction: every command is echoed to the exhibition log, a
+write failure is reported with the commands that did not run, and
+``--no-paper-console`` turns the channel off. It needs a PINNED
+``--challenger-username``: nothing on the wire tells this process who claimed
+the slot, so an unpinned exhibition gets a warning at reset time instead of a
+heal.
 
 TEARDOWN IS ``BaseException``-PROOF, not ``Exception``-proof. Ctrl-C is the
 normal way an exhibition ends, so the teardown chain runs with an operator's
@@ -88,7 +134,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NoReturn, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from distributed.launcher import PadAnchor, pad_anchor, pad_usernames, write_ops_json
 from env.mc_pvp_env import ExhibitionConfig, MCPvPEnv, TcpBridgeClient
@@ -97,10 +143,19 @@ __all__ = [
     "ExhibitionLaunchError",
     "CheckpointError",
     "build_bridge_argv",
+    "drain_reset_request",
     "find_toolchain_problems",
+    "human_reset_commands",
     "is_port_free",
     "load_greedy_policy",
     "play_one_match",
+    "request_reset",
+    "reset_command_hint",
+    "reset_mode_conflicts",
+    "reset_request_path",
+    "send_paper_console_commands",
+    "take_reset_request",
+    "wait_for_reset_request",
     "main",
     "run",
 ]
@@ -139,7 +194,41 @@ BRIDGE_READY_TIMEOUT_SECONDS = 120.0
 PORT_POLL_SECONDS = 2.0
 STOP_GRACE_SECONDS = 20.0
 LOG_TAIL_LINES = 40
-IDLE_POLL_SECONDS = 5.0
+
+# ---------------------------------------------------------------------------
+# The reset trigger (T6).
+# ---------------------------------------------------------------------------
+
+#: The one-shot request file ``--reset`` creates and the launcher consumes. It
+#: lives in the log dir, which is already this launcher's own runtime directory
+#: and is git-ignored (``server/logs/``), so a stray request can never dirty the
+#: tree the way ``server/ops.json`` can (issue #29).
+RESET_REQUEST_FILENAME = "reset.request"
+
+#: How often the idle launcher looks for a request. Deliberately shorter than a
+#: human's patience: an operator who typed the reset command in front of a class
+#: and saw nothing happen for five seconds types it again, and the second one
+#: would be pure noise (it collapses onto the same file, but they do not know
+#: that while they are waiting).
+RESET_POLL_SECONDS = 1.0
+
+# --- The challenger's spawn, mirroring the DUMMY's datapack template --------
+# ``server/arena/data/arena/function/spawn_dummy_pad.mcfunction`` places the
+# opponent at the pad anchor + 3 on x, feet at y=64, facing -X (yaw 90) toward
+# the learner:
+#     $tp $(dummy) $(x).5 64 $(z).5
+#     $execute positioned $(x).5 64 $(z).5 run tp $(dummy) ~3 ~ ~ 90 0
+# and heals it with `effect clear` + instant_health/saturation. A human
+# challenger stands in the same slot and gets the same treatment, so these
+# constants mirror that file rather than inventing a second opponent spawn.
+# tests/test_exhibition.py reads the committed datapack and fails if it moves.
+CHALLENGER_SPAWN_DX = 3
+PAD_SPAWN_Y = 64
+#: Yaw looking -X, i.e. back at the learner (yaw 90 -> (-1, 0); see
+#: ``env/perception_filter.py`` for the look-vector convention). The learner's
+#: own template is the mirror image, -90. The two must stay opposite or both
+#: fighters spawn pointing the same way.
+CHALLENGER_SPAWN_YAW = 90
 
 
 def _ascii_log(message: str) -> None:
@@ -416,6 +505,329 @@ def build_bridge_argv(
 
 
 # ---------------------------------------------------------------------------
+# The reset trigger (T6): the request file, the human-side commands, and the
+# ``--reset`` side of the CLI. Pure functions first, I/O behind seams after.
+# ---------------------------------------------------------------------------
+
+
+def reset_request_path(log_dir: Path) -> Path:
+    """Where the reset request lives for a launcher using ``log_dir``.
+
+    The ONE place this path is derived, so the ``--reset`` process and the
+    launcher process cannot disagree about it — they are separate invocations
+    of this module and have nothing else in common but their ``--log-dir``.
+    """
+    return Path(log_dir) / RESET_REQUEST_FILENAME
+
+
+def reset_command_hint(log_dir: Path) -> str:
+    """The exact command line the operator types to arm the next challenger.
+
+    Carries ``--log-dir`` only when it is not the default: the reset process
+    finds the request file by that flag alone, so a hint that omitted a
+    non-default one would send the operator's request somewhere the launcher is
+    not looking — a failure with no error message at either end.
+    """
+    hint = "python -m deploy.exhibition --reset"
+    if Path(log_dir) != DEFAULT_LOG_DIR:
+        hint = f"{hint} --log-dir {log_dir}"
+    return hint
+
+
+def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[str]:
+    """Paper CONSOLE lines that heal and reposition the human challenger.
+
+    Mirrors the dummy's datapack template (``spawn_dummy_pad.mcfunction``)
+    applied to a player instead of a bot: teleport to the opponent slot facing
+    the learner, clear leftover effects, then restore health and food. Same
+    amplifiers (``instant_health 1 9``, ``saturation 1 19``), same
+    clear-then-give ORDER — an instant effect is applied on its first tick, so a
+    clear issued afterwards can strip it before it ever lands, which is the bug
+    that ordering exists to remove.
+
+    Deliberately NOT included, and both are for T15's runbook rather than
+    silent omissions: no ``clear`` (taking a person's items is not "heal and
+    reposition"), and no ``give`` of a weapon (the datapack gives the dummy none
+    either, and a per-reset give would pile up swords in the human's inventory).
+
+    NO LEADING SLASH. These go to the server console, whose commands are
+    slash-free — unlike ``formatHumanResetCommands``' output, which the bridge
+    feeds to ``bot.chat()`` and which therefore must keep its ``/``.
+
+    Raises:
+        ValueError: on a username that is not a Minecraft username, or a pad
+            anchor that is not a pair of non-negative ints. Validation is not
+            decoration here: this text is executed by a level-4 console, so a
+            name containing a newline would be a second command of the
+            attacker's choosing (``op <them>``). :class:`ExhibitionConfig` owns
+            the username rule and is reused rather than re-implemented.
+    """
+    if not isinstance(challenger_username, str) or not challenger_username:
+        raise ValueError(
+            "challenger_username must be a non-empty Minecraft username, got "
+            f"{challenger_username!r}"
+        )
+    ExhibitionConfig(challenger_username=challenger_username)  # raises on a bad name
+    for label, value in (("x", anchor.x), ("z", anchor.z)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(
+                f"pad anchor {label} must be a non-negative int, got {value!r}"
+            )
+    # `<n>.5` is written as a textual concatenation for the same reason the
+    # datapack builds `$(x).5`: it is a block CENTRE, and the anchor is always a
+    # non-negative int (asserted above), so the two forms agree character for
+    # character.
+    spawn_x = f"{anchor.x + CHALLENGER_SPAWN_DX}.5"
+    spawn_z = f"{anchor.z}.5"
+    return [
+        f"tp {challenger_username} {spawn_x} {PAD_SPAWN_Y} {spawn_z} "
+        f"{CHALLENGER_SPAWN_YAW} 0",
+        f"effect clear {challenger_username}",
+        f"effect give {challenger_username} minecraft:instant_health 1 9 true",
+        f"effect give {challenger_username} minecraft:saturation 1 19 true",
+    ]
+
+
+def take_reset_request(path: Path) -> bool:
+    """Consume a pending reset request; True iff there was one.
+
+    The take is the ``unlink`` itself rather than an ``exists()`` followed by
+    one, so the request is consumed exactly once even if it is filed at the
+    instant it is read. An unexpected ``OSError`` (a permission problem on the
+    log dir, say) deliberately PROPAGATES: returning False there would spin the
+    idle loop forever on a reset that can never arrive, silently, which is the
+    project's signature failure mode.
+    """
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def drain_reset_request(path: Path, reason: str, *, log: Callable[[str], None]) -> bool:
+    """Discard a request that must not arm a match, and say so. True if one was
+    discarded.
+
+    Two callers, one rule — a match only ever starts from a request the operator
+    filed while the launcher was IDLE:
+
+      * at startup, a file left over from an earlier launch;
+      * at the end of every match, a file filed while that match was still
+        running. Honoring that one would make the death the proximate cause of
+        the restart, which is exactly what AC4 forbids.
+
+    Never silent: a discarded request is a command the operator typed and is
+    waiting on.
+    """
+    if not take_reset_request(path):
+        return False
+    log(f"discarded a reset request {reason}.")
+    return True
+
+
+def wait_for_reset_request(
+    path: Path,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    poll_seconds: float = RESET_POLL_SECONDS,
+) -> None:
+    """Block until a reset request appears, then consume it and return.
+
+    The only other way out is the ``KeyboardInterrupt`` that ends the
+    exhibition, which unwinds into :func:`run`'s handler exactly as it did when
+    this was an unconditional idle loop.
+    """
+    while not take_reset_request(path):
+        sleep(poll_seconds)
+
+
+def reset_dir_missing_message(log_dir: Path) -> str:
+    """Refusal text for ``--reset`` with no launcher log dir to file into."""
+    return (
+        f"no exhibition launcher is using {log_dir}: that directory does not "
+        "exist, so there is nothing here to reset.\n"
+        "the reset command does NOT start anything and never connects to the "
+        "bridge (the bridge accepts exactly ONE TCP client, and a second "
+        "connect would evict the running agent) -- it only hands a request to "
+        "an already-running launcher.\n"
+        "start the exhibition first with `python -m deploy.exhibition`, or pass "
+        "the same --log-dir that launcher was given."
+    )
+
+
+def reset_already_armed_message(request_path: Path) -> str:
+    """Refusal text for a request that is still sitting unconsumed."""
+    return (
+        f"a reset is already armed and has not been consumed: {request_path}\n"
+        "an idle launcher picks one up within about a second, so either it is "
+        "still playing the current match (the request will be DISCARDED when "
+        "that match ends -- a death must never restart the match by itself; "
+        "run this again once it has), or no launcher is running at all.\n"
+        "nothing was changed."
+    )
+
+
+def reset_armed_message(request_path: Path) -> str:
+    """The confirmation ``--reset`` prints once the request is filed."""
+    return (
+        f"reset armed: {request_path}\n"
+        "the running launcher will heal and reposition both fighters, release "
+        "the challenger slot for the next person, and play ONE more match. It "
+        "does not restart by itself after that -- one reset command, one "
+        "match.\n"
+        "if the launcher is mid-match right now, this request is discarded when "
+        "that match ends; run it again once it has."
+    )
+
+
+def reset_mode_conflicts(args: Any, defaults: Any) -> List[str]:
+    """Option flags passed alongside ``--reset`` that ``--reset`` cannot honor.
+
+    Everything except ``--log-dir`` is decided when the LAUNCHER starts: the
+    checkpoint is already loaded, the ports are already bound, the challenger is
+    already pinned into the bridge's argv. A ``--reset`` that quietly ignored
+    ``--challenger-username`` would look to the operator like it had swapped
+    the challenger, which is precisely the mistake it is worth an error to
+    prevent. Compares the parsed namespace against the parser's own defaults, so
+    a new flag is covered the day it is added rather than the day someone
+    remembers to list it here.
+    """
+    conflicts = []
+    for name, default in sorted(vars(defaults).items()):
+        if name in ("reset", "log_dir"):
+            continue
+        if getattr(args, name, default) != default:
+            conflicts.append(_flag_for(name))
+    return conflicts
+
+
+def _flag_for(dest: str) -> str:
+    """The command-line spelling of an argparse ``dest``.
+
+    ``--no-paper-console`` stores into ``paper_console``, so the mechanical
+    ``dest.replace("_", "-")`` would name a flag that does not exist and send an
+    operator looking for it.
+    """
+    if dest == "paper_console":
+        return "--no-paper-console"
+    return "--" + dest.replace("_", "-")
+
+
+def reset_conflicts_message(conflicts: Sequence[str]) -> str:
+    """Refusal text for :func:`reset_mode_conflicts`' findings."""
+    lines = [
+        "--reset takes only --log-dir. These were also passed and it cannot "
+        "honor them:"
+    ]
+    lines.extend(f"  {flag}" for flag in conflicts)
+    lines.append(
+        "they are all decided when the LAUNCHER starts (the checkpoint is "
+        "loaded, the ports are bound, the challenger is pinned into the "
+        "bridge's argv), so changing one means restarting the exhibition."
+    )
+    lines.append("nothing was changed.")
+    return "\n".join(lines)
+
+
+def request_reset(
+    log_dir: Path,
+    *,
+    log: Callable[[str], None] = _ascii_log,
+    now: Callable[[], str] = lambda: time.strftime("%Y-%m-%d %H:%M:%S"),
+) -> int:
+    """File one reset request for a running launcher. Returns an exit code.
+
+    Starts nothing, connects to nothing, loads no checkpoint and does not create
+    the log dir — a missing dir is the evidence that no launcher is using it,
+    and creating one would destroy that evidence.
+    """
+    request_path = reset_request_path(log_dir)
+    if not Path(log_dir).is_dir():
+        log(reset_dir_missing_message(log_dir))
+        return 1
+    try:
+        # "x": exclusive-create. The refusal for an already-armed reset is the
+        # SAME operation as the arming itself, so two operators racing cannot
+        # both believe they armed it.
+        with open(request_path, "x", encoding="ascii") as handle:
+            handle.write(f"reset requested {now()}\n")
+    except FileExistsError:
+        log(reset_already_armed_message(request_path))
+        return 1
+    except OSError as exc:
+        log(f"could not file the reset request at {request_path}: {exc}")
+        return 1
+    log(reset_armed_message(request_path))
+    return 0
+
+
+def send_paper_console_commands(
+    proc: Any, commands: Sequence[str], *, log: Callable[[str], None] = _ascii_log
+) -> bool:
+    """Write ``commands`` into Paper's console. True iff all of them were sent.
+
+    ``server/setup/start.sh`` ``exec``s the JVM, so the pipe :func:`run` opens
+    on the start script IS the server console's stdin. Console lines carry no
+    leading slash.
+
+    Best-effort and non-fatal: Paper dying mid-exhibition surfaces here as a
+    ``BrokenPipeError`` (an ``OSError``) and a launcher that aborted a match
+    over a failed heal would be worse than one that plays it unhealed. Whatever
+    happens, the commands are echoed to the exhibition log — an operator who is
+    opped can run them by hand, and a channel that quietly did nothing is the
+    failure mode this repo keeps paying for.
+    """
+    stream = getattr(proc, "stdin", None)
+    if stream is None:
+        _log_unrun_commands(
+            commands,
+            "no console pipe to Paper (--no-paper-console, or a server this "
+            "launcher did not start)",
+            log=log,
+        )
+        return False
+    try:
+        for command in commands:
+            stream.write(f"{command}\n".encode("ascii"))
+        stream.flush()
+    except (OSError, ValueError) as exc:  # broken pipe, closed stream
+        _log_unrun_commands(
+            commands, f"the Paper console rejected the write ({exc!r})", log=log
+        )
+        return False
+    for command in commands:
+        log(f"  console> {command}")
+    return True
+
+
+def _log_unrun_commands(
+    commands: Sequence[str], why: str, *, log: Callable[[str], None]
+) -> None:
+    log(f"could not heal/reposition the human: {why}.")
+    log("these console commands did NOT run:")
+    for command in commands:
+        log(f"  {command}")
+
+
+def _close_paper_console(proc: Any) -> None:
+    """Close Paper's console pipe. Silent, and cannot raise.
+
+    Last action of the teardown chain, after the JVM has already been stopped,
+    so there is nothing left to say to it. Explicit rather than left to garbage
+    collection because a buffered writer finalized against a dead child prints
+    "Exception ignored in ..." at interpreter exit — noise on the operator's
+    terminal that reads like a crash in a launcher that shut down correctly.
+    """
+    try:
+        stream = getattr(proc, "stdin", None)
+        if stream is not None:
+            stream.close()
+    except BaseException:  # noqa: BLE001 — teardown's last link must not raise.
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Small side-effecting helpers, each taking its I/O behind a keyword seam.
 # ---------------------------------------------------------------------------
 
@@ -642,23 +1054,45 @@ def play_one_match(env: Any, policy: Any, *, log: Callable[[str], None] = _ascii
     return result
 
 
-def _idle_until_interrupt(
-    *, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = IDLE_POLL_SECONDS
-) -> NoReturn:
-    """Block, holding the agent's connection open, until Ctrl-C.
+def _reset_human_side(
+    paper_proc: Any,
+    anchor: PadAnchor,
+    challenger_username: Optional[str],
+    *,
+    paper_console: bool,
+    log: Callable[[str], None] = _ascii_log,
+) -> bool:
+    """Heal and reposition the human before the next match. True iff it ran.
 
-    Annotated ``NoReturn`` because it is: the loop has no exit condition, so
-    the only ways out are the ``KeyboardInterrupt`` this exists to wait for or
-    an exception from ``sleep``. Both unwind into :func:`run`'s handlers.
-
-    TODO(T6): the separate reset command needs a way to arm the next
-    challenger while this process still holds the bridge's single TCP client
-    slot. This is the seam where that plugs in (e.g. watching a reset-request
-    file or a signal) instead of a second process reconnecting to the bridge
-    and evicting this one. Left as a plain wait — T6 decides the mechanism.
+    The learner's half of the reset is the bridge's job and happens inside
+    :func:`play_one_match`'s ``env.reset()``; this is the half nothing else
+    covers. Never fatal — an unhealed challenger is a worse match, a crashed
+    launcher is no match at all — but never silent either: every path that
+    cannot heal says so and prints what would have run.
     """
-    while True:
-        sleep(poll_seconds)
+    if challenger_username is None:
+        log(
+            "NOT healing or repositioning the human: no --challenger-username "
+            "was pinned, and nothing on the wire tells this process who "
+            "claimed the challenger slot (the state message has no field for "
+            "it). If the last match ended in the AGENT's death, your "
+            "challenger starts this one on whatever health they had left. "
+            "Restart the exhibition with --challenger-username <name> to fix "
+            "it for the rest of the demo."
+        )
+        return False
+    commands = human_reset_commands(anchor, challenger_username)
+    if not paper_console:
+        log(
+            "--no-paper-console: not healing or repositioning "
+            f"{challenger_username}. Run these from an opped account if the "
+            "last match ended in the AGENT's death:"
+        )
+        for command in commands:
+            log(f"  {command}")
+        return False
+    log(f"healing and repositioning {challenger_username} via the Paper console.")
+    return send_paper_console_commands(paper_proc, commands, log=log)
 
 
 # ---------------------------------------------------------------------------
@@ -674,9 +1108,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "to be ready, starts the bridge in human-opponent mode, and "
             "connects the trained agent playing GREEDILY (no exploration, no "
             "learning) from a checkpoint. Runs in the foreground for the "
-            "whole exhibition; Ctrl-C tears Paper and the bridge down. Arming "
-            "the next challenger between matches is the separate --reset "
-            "command (T6)."
+            "whole exhibition; Ctrl-C tears Paper and the bridge down. It "
+            "plays ONE match and then waits: nothing restarts a match by "
+            "itself. Arm the next challenger with the separate --reset "
+            "command (T6), run from another terminal."
+        ),
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "ARM THE NEXT CHALLENGER in an exhibition that is already running, "
+            "then exit. Heals and repositions both fighters, releases the "
+            "challenger slot and plays exactly ONE more match -- one reset "
+            "command, one match, never automatic. Starts nothing and never "
+            "connects to the bridge (a second TCP client would evict the "
+            "running agent); it hands a request file to the live launcher, "
+            "which must be using the same --log-dir. Takes no other flags."
+        ),
+    )
+    parser.add_argument(
+        "--no-paper-console",
+        dest="paper_console",
+        action="store_false",
+        help=(
+            "do NOT open a console pipe to Paper. The pipe is how a reset "
+            "heals and repositions the HUMAN (the datapack resets the learner "
+            "only), so turning it off means a challenger who beat the agent "
+            "carries their leftover health into the next match; the commands "
+            "are printed instead. An escape hatch, not a default."
         ),
     )
     parser.add_argument(
@@ -758,16 +1218,32 @@ def run(
     paths without a live server AND without writing the git-tracked
     ``server/ops.json`` (TC20/TC21).
 
-    Returns the process exit code: 0 only for a clean ``--dry-run``, 130 for
-    a Ctrl-C (SIGINT) — the NORMAL way to end an exhibition, whether it
-    interrupts the live boot or the post-match idle wait — and non-zero for
-    any refusal or boot failure.
+    Returns the process exit code: 0 for a clean ``--dry-run`` or an armed
+    ``--reset``, 130 for a Ctrl-C (SIGINT) — the NORMAL way to end an
+    exhibition, whether it interrupts the live boot or the wait between
+    matches — and non-zero for any refusal or boot failure.
+
+    ``--reset`` (T6) is handled first and returns before every gate below: it
+    is a different program that happens to share this entry point, and it must
+    start nothing at all (see :func:`request_reset`).
     """
-    args = _build_arg_parser().parse_args(argv)
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
 
     checkpoint_path = Path(args.checkpoint)
     checkpoints_dir = Path(args.checkpoints_dir)
     log_dir = Path(args.log_dir)
+
+    # --- `--reset` is a different program sharing one entry point (T6). It
+    # returns BEFORE every gate below: it loads no checkpoint, probes no port,
+    # spawns nothing, writes no ops.json and does not even create the log dir.
+    # All it does is hand a request to the launcher that is already running. ---
+    if args.reset:
+        conflicts = reset_mode_conflicts(args, parser.parse_args([]))
+        if conflicts:
+            log(reset_conflicts_message(conflicts))
+            return 1
+        return request_reset(log_dir, log=log)
 
     # --- Preflight gates. Nothing is spawned, and no file is written, until
     # every one of these passes (AC5: refusal paths start nothing). ----------
@@ -832,6 +1308,12 @@ def run(
 
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- A request left over from an earlier launch must never arm a match
+    # nobody asked for. Drained here, before anything is running, so the first
+    # thing the idle loop sees below is genuinely this operator's request. -----
+    request_path = reset_request_path(log_dir)
+    drain_reset_request(request_path, "left over from an earlier launch", log=log)
+
     # --- ops.json BEFORE Paper boots: Paper reads the op list at startup and
     # will not re-read a file written into an already-running server. At N=1
     # this is byte-identical to the committed server/ops.json, so it both ops
@@ -849,13 +1331,19 @@ def run(
     try:
         # --- Paper ----------------------------------------------------------
         log(f"starting Paper (log: {paper_log}); start.sh pins Java 21.")
+        # stdin is a PIPE, not DEVNULL: `start.sh` execs the JVM, so this pipe
+        # is the SERVER CONSOLE, and it is the only command channel this process
+        # can reach (RCON is off and the wire has no command slot). A reset uses
+        # it to heal and reposition the human, whom the datapack's reset does
+        # not touch. --no-paper-console falls back to DEVNULL, exactly the T5
+        # behavior, and prints the commands instead of running them.
         with open(paper_log, "wb") as handle:
             paper_proc = popen(
                 ["bash", str(START_SH)],
                 cwd=str(SERVER_DIR),
                 stdout=handle,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if args.paper_console else subprocess.DEVNULL,
                 env=_paper_env(args.xms, args.xmx),
             )
         if not wait_for_port(
@@ -907,16 +1395,40 @@ def run(
             transport=transport, max_episode_steps=exhibition_cfg.env_max_episode_steps
         )
 
-        play_one_match(env, policy, log=log)
-        log(
-            "holding Paper and the bridge up. Run the reset command before the "
-            "next challenger (T6); Ctrl-C here ends the exhibition."
-        )
-        _idle_until_interrupt(sleep=sleep)
-        # Unreachable: _idle_until_interrupt is NoReturn. Kept so every path
-        # out of this block is an explicit exit code rather than an implicit
-        # None, if that function ever grows a way to finish normally.
-        return 0
+        # --- One match per trigger, for as long as the operator keeps asking.
+        # The launch itself is the first trigger; every later match needs a
+        # reset command. Nothing here can start a match on its own, which is
+        # AC4 and the user's own rule ("after one death, no restart auto"). ----
+        hint = reset_command_hint(log_dir)
+        match_number = 1
+        while True:
+            log(f"--- match {match_number} ---")
+            play_one_match(env, policy, log=log)
+            log(
+                "no auto-restart: a death ends the match and nothing starts "
+                f"another one by itself. To arm the next challenger, run `{hint}` "
+                "in another terminal. Ctrl-C here ends the exhibition."
+            )
+            # A request filed while that match was still running is discarded:
+            # honoring it would make the death the proximate cause of the
+            # restart. Loud, because the operator is waiting on it.
+            drain_reset_request(
+                request_path,
+                "that was filed while the match was still running -- a death "
+                f"must never restart the match by itself, so run `{hint}` again "
+                "now that this one has ended",
+                log=log,
+            )
+            wait_for_reset_request(request_path, sleep=sleep)
+            match_number += 1
+            log(f"reset requested -- arming match {match_number}.")
+            _reset_human_side(
+                paper_proc,
+                anchor,
+                exhibition_cfg.challenger_username,
+                paper_console=args.paper_console,
+                log=log,
+            )
     except ExhibitionLaunchError as exc:
         log(str(exc))
         return 1
@@ -947,8 +1459,16 @@ def run(
                 if bridge_proc is not None:
                     _stop_process(bridge_proc, "bridge", log=log)
             finally:
-                if paper_proc is not None:
-                    _stop_process(paper_proc, "Paper", log=log)
+                try:
+                    if paper_proc is not None:
+                        _stop_process(paper_proc, "Paper", log=log)
+                finally:
+                    # Last link, and deliberately after Paper is already down:
+                    # there is nothing left to say to the console, and an
+                    # unclosed pipe finalized at interpreter exit prints an
+                    # "Exception ignored in ..." that reads like a crash.
+                    if paper_proc is not None:
+                        _close_paper_console(paper_proc)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

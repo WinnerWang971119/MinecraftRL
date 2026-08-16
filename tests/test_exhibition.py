@@ -1,4 +1,4 @@
-"""tests/test_exhibition.py — T5: the one-command exhibition launcher.
+"""tests/test_exhibition.py — T5 launcher + T6 reset command.
 
 Offline only: no socket is opened, no subprocess is spawned, no live Paper
 server or Node bridge is touched, and the git-tracked ``server/ops.json`` is
@@ -22,16 +22,26 @@ Required by the plan (docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md
     never comes up": without it, deleting the ``play_one_match()`` call from
     ``run()`` entirely leaves every other test in this file green.
 
+  * T6 (AC5) — the SEPARATE reset command. ``--reset`` files a request and
+    starts nothing; the running launcher consumes it, heals and repositions
+    BOTH sides and plays exactly one more match. The AC4 half is tested as
+    hard as the AC5 half: a match never restarts itself, a request left over
+    from an earlier launch is discarded, and a request filed while a match is
+    still running is discarded too (honoring it would make the death the
+    proximate cause of the restart).
+
 Everything else here is supporting coverage for the pure helpers `run()` is
 built from (``is_port_free``, ``find_checkpoints``, ``build_bridge_argv``,
 ``load_greedy_policy``, ``wait_for_port``, ``play_one_match``,
-``find_toolchain_problems``) plus the --checkpoint-missing/unloadable "never
-random-init" guarantee, the --challenger-username help-text requirement from
-the spec, and the ``BaseException``-proof teardown a second Ctrl-C depends on.
+``find_toolchain_problems``, ``human_reset_commands``, the request-file
+helpers) plus the --checkpoint-missing/unloadable "never random-init"
+guarantee, the --challenger-username help-text requirement from the spec, and
+the ``BaseException``-proof teardown a second Ctrl-C depends on.
 """
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -40,31 +50,81 @@ from bridge.messages import ResetAckMsg, StateMsg
 from deploy.exhibition import (
     DEFAULT_BRIDGE_HOST,
     DEFAULT_BRIDGE_PORT,
+    DEFAULT_LOG_DIR,
     DEFAULT_MC_PORT,
+    RESET_REQUEST_FILENAME,
     CheckpointError,
     build_bridge_argv,
     checkpoint_missing_message,
     checkpoint_unloadable_message,
+    drain_reset_request,
     find_checkpoints,
     find_toolchain_problems,
+    human_reset_commands,
     is_port_free,
     load_greedy_policy,
     main,
     play_one_match,
+    request_reset,
+    reset_command_hint,
+    reset_mode_conflicts,
+    reset_request_path,
     run,
+    send_paper_console_commands,
+    take_reset_request,
     wait_for_port,
+    wait_for_reset_request,
 )
 from distributed.launcher import pad_anchor, pad_usernames
 from env.mc_pvp_env import BridgeError, MCPvPEnv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OPS_JSON = REPO_ROOT / "server" / "ops.json"
+DUMMY_PAD_MCFUNCTION = (
+    REPO_ROOT / "server" / "arena" / "data" / "arena" / "function" / "spawn_dummy_pad.mcfunction"
+)
 
 
 # ---------------------------------------------------------------------------
 # Shared fakes (mirror the FakeProc / ScriptedProbe style in
 # tests/test_pad_launcher.py — no real OS process or socket).
 # ---------------------------------------------------------------------------
+
+
+class FakeConsole:
+    """Stand-in for Paper's stdin PIPE — the server console (T6).
+
+    Records the lines written to it. ``fail=True`` is Paper having died
+    mid-exhibition: the real pipe raises ``BrokenPipeError`` (an ``OSError``),
+    which a reset must survive rather than take the exhibition down with it.
+
+    ``write`` asserts BYTES. ``subprocess.PIPE`` without an encoding is a binary
+    stream, so a launcher that wrote ``str`` would raise ``TypeError`` on the
+    first real reset and heal nobody; a fake that accepted both would hide it.
+    """
+
+    def __init__(self, *, fail=False, record=None):
+        self.lines = []
+        self.flushes = 0
+        self.closed = False
+        self._fail = fail
+        self._record = record
+
+    def write(self, data):
+        if self._fail:
+            raise BrokenPipeError("paper is gone")
+        assert isinstance(data, bytes), f"the console pipe takes bytes, got {type(data)}"
+        line = data.decode("ascii").rstrip("\n")
+        self.lines.append(line)
+        if self._record is not None:
+            self._record(("console", line))
+        return len(data)
+
+    def flush(self):
+        self.flushes += 1
+
+    def close(self):
+        self.closed = True
 
 
 class FakeProc:
@@ -74,13 +134,17 @@ class FakeProc:
     appends ``(what, label)`` to the shared event list, which is how the
     happy-path test pins teardown ORDER (bridge before Paper) rather than
     merely asserting both were stopped.
+
+    ``stdin`` mirrors ``Popen.stdin``: a stream when the caller asked for
+    ``subprocess.PIPE``, ``None`` otherwise (``DEVNULL`` opens no pipe).
     """
 
-    def __init__(self, pid=4242, exit_code=None, *, label=None, record=None):
+    def __init__(self, pid=4242, exit_code=None, *, label=None, record=None, stdin=None):
         self.pid = pid
         self._exit_code = exit_code
         self.label = label
         self._record = record
+        self.stdin = stdin
         self.terminated = False
         self.killed = False
         self.waits = 0
@@ -1012,15 +1076,33 @@ class ScriptedBridgeTransport:
     Replies are produced inside ``send()`` rather than queued up front, so the
     inbound queue can never drift out of step with what the env asked for.
     ``close`` gets no reply -- ``MCPvPEnv.close()`` sends it and never reads.
+
+    ``steps_sent`` is PER EPISODE and is re-zeroed by ``reset`` (T6). Left
+    cumulative, the second match's very FIRST step would satisfy
+    ``steps_sent >= steps_to_win`` and end instantly, so every re-drive test
+    would pass while proving nothing about the match actually being played.
+
+    ``max_resets`` is a HANG GUARD, and it earned its place: a launcher that
+    consumed a reset request without removing it replays a match forever, and
+    a runaway loop makes the whole pytest session hang instead of failing one
+    test -- the same "green for the wrong reason" class as an escaping
+    KeyboardInterrupt. Exceeding it raises, which unwinds into run()'s fatal
+    handler and fails the assertions loudly.
     """
 
-    def __init__(self, *, steps_to_win, record, interrupt_on_close=False):
+    def __init__(
+        self, *, steps_to_win, record, interrupt_on_close=False, on_step=None, max_resets=8
+    ):
         self._steps_to_win = steps_to_win
         self._record = record
         self._interrupt_on_close = interrupt_on_close
+        self._on_step = on_step
+        self._max_resets = max_resets
         self._inbound = []
         self._tick = 0
         self.steps_sent = 0
+        self.total_steps = 0
+        self.resets = 0
         self.connects = 0
         self.closes = 0
 
@@ -1033,10 +1115,25 @@ class ScriptedBridgeTransport:
         self._record(("bridge.send", kind))
         self._tick += 1
         if kind == "reset":
+            self.resets += 1
+            if self.resets > self._max_resets:
+                raise AssertionError(
+                    f"the launcher started {self.resets} matches; this test "
+                    f"scripted at most {self._max_resets}. Something is "
+                    "re-driving play without a reset request."
+                )
+            self.steps_sent = 0
             self._inbound.append(_reset_ack_msg())
             self._inbound.append(_state_msg(tick=self._tick))
         elif kind == "step":
             self.steps_sent += 1
+            self.total_steps += 1
+            if self._on_step is not None:
+                # The hook is how a test simulates something happening WHILE a
+                # match is in flight (an operator filing a reset request mid-
+                # match, say) -- the launcher is inside play_one_match there and
+                # is not polling anything.
+                self._on_step(self)
             killed = self.steps_sent >= self._steps_to_win
             self._inbound.append(
                 _state_msg(
@@ -1097,11 +1194,27 @@ class ExhibitionRun:
         self.escaped = None
         self.events = []
         self.messages = []
+        #: What the SEPARATE ``--reset`` invocations printed. A different
+        #: process in real life, so a different sink here.
+        self.reset_messages = []
+        self.reset_codes = []
         self.ops_writes = []
         self.procs = {}
+        self.spawn_kwargs = {}
         self.envs = []
         self.transports = []
         self.policy = None
+        self.request_path = None
+
+    @property
+    def console_lines(self):
+        """Every line written to Paper's console pipe, in order."""
+        paper = self.procs.get("paper")
+        console = getattr(paper, "stdin", None) if paper is not None else None
+        return list(console.lines) if console is not None else []
+
+    def text(self):
+        return "\n".join(self.messages)
 
 
 def drive_exhibition(
@@ -1112,13 +1225,25 @@ def drive_exhibition(
     proc_classes=None,
     interrupt_on_close=False,
     log_bomb=None,
+    resets=0,
+    idle_wakeups=0,
+    challenger="Steve",
+    extra_argv=(),
+    console_fails=False,
+    on_step=None,
 ):
     """Drive the REAL ``run()`` through a complete exhibition and record it.
 
     Spawning a child "opens" its port, so both boot on their first probe and
-    ``wait_for_port`` never sleeps. That leaves the idle wait as the only
-    sleeper, and its first call raises ``KeyboardInterrupt`` -- the normal way
-    an exhibition ends.
+    ``wait_for_port`` never sleeps. That leaves the between-matches wait as the
+    only sleeper.
+
+    ``resets`` is how many times the OPERATOR runs the reset command. Each one
+    is delivered from inside a ``sleep`` — the launcher is blocked there,
+    exactly as it is in production — and it goes through the REAL ``--reset``
+    branch of ``run()``, not a hand-written file touch, so both halves of T6
+    are the code under test. Once they are used up, the next ``sleep`` raises
+    ``KeyboardInterrupt``: the normal way an exhibition ends.
 
     ``MCPvPEnv`` is WRAPPED, not replaced: the launcher builds the real class
     over the scripted transport and the wrapper only keeps a reference, so a
@@ -1133,6 +1258,8 @@ def drive_exhibition(
     result = ExhibitionRun()
     record = result.events.append
     ports = {"mc": False, "bridge": False}
+    log_dir = tmp_path / "logs"
+    result.request_path = reset_request_path(log_dir)
 
     def port_probe(host, port):
         if port == DEFAULT_MC_PORT:
@@ -1146,8 +1273,18 @@ def drive_exhibition(
         label = "paper" if cmd[0] == "bash" else "bridge"
         ports["mc" if label == "paper" else "bridge"] = True
         record(("spawn", label))
+        result.spawn_kwargs[label] = kwargs
+        # Popen only exposes a .stdin stream when the caller asked for a PIPE.
+        console = (
+            FakeConsole(fail=console_fails, record=record)
+            if kwargs.get("stdin") is subprocess.PIPE
+            else None
+        )
         proc = proc_classes.get(label, FakeProc)(
-            pid=101 if label == "paper" else 202, label=label, record=record
+            pid=101 if label == "paper" else 202,
+            label=label,
+            record=record,
+            stdin=console,
         )
         result.procs[label] = proc
         return proc
@@ -1158,6 +1295,10 @@ def drive_exhibition(
             steps_to_win=steps_to_win,
             record=record,
             interrupt_on_close=interrupt_on_close,
+            on_step=on_step,
+            # One match at launch plus one per reset command is the MOST this
+            # launcher may play. Anything beyond it is a runaway loop.
+            max_resets=1 + resets,
         )
         result.transports.append(transport)
         return transport
@@ -1167,7 +1308,22 @@ def drive_exhibition(
         result.ops_writes.append((n_pads, path))
         return path
 
+    pending = {"resets": resets, "wakeups": idle_wakeups}
+
     def interrupting_sleep(seconds):
+        if pending["wakeups"] > 0:
+            # A poll that found nothing: the launcher woke up, nobody had run
+            # the reset command, and it must go straight back to waiting.
+            pending["wakeups"] -= 1
+            record(("idle_poll",))
+            return
+        if pending["resets"] > 0:
+            pending["resets"] -= 1
+            # The operator, in ANOTHER terminal, runs the real reset command.
+            code = run(["--reset", "--log-dir", str(log_dir)], log=result.reset_messages.append)
+            result.reset_codes.append(code)
+            record(("reset_command", code))
+            return
         raise KeyboardInterrupt
 
     real_env_cls = MCPvPEnv
@@ -1194,14 +1350,18 @@ def drive_exhibition(
     checkpoint.write_bytes(b"unused, load_policy is stubbed")
     result.policy = RecordingGreedyPolicy(record)
 
+    launch_argv = [
+        "--checkpoint", str(checkpoint),
+        "--checkpoints-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+    ]
+    if challenger is not None:
+        launch_argv.extend(["--challenger-username", challenger])
+    launch_argv.extend(extra_argv)
+
     try:
         result.code = run(
-            [
-                "--checkpoint", str(checkpoint),
-                "--checkpoints-dir", str(tmp_path),
-                "--challenger-username", "Steve",
-                "--log-dir", str(tmp_path / "logs"),
-            ],
+            launch_argv,
             popen=popen,
             port_probe=port_probe,
             sleep=interrupting_sleep,
@@ -1432,3 +1592,539 @@ class TestStopProcessInterruptProofing:
         _close_env(BrokenEnv(), log=log)
 
         assert any("socket already gone" in m for m in messages)
+
+
+# ===========================================================================
+# T6 — the separate reset command (AC5), and the AC4 guarantees around it.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# The request file: the whole trigger mechanism, as pure helpers.
+# ---------------------------------------------------------------------------
+
+
+class TestResetRequestFile:
+    def test_the_path_is_the_shared_filename_inside_the_log_dir(self, tmp_path):
+        # The launcher and the --reset process are separate invocations with
+        # nothing in common but --log-dir, so this derivation is the only thing
+        # that makes them agree on where the request lives.
+        assert reset_request_path(tmp_path) == tmp_path / RESET_REQUEST_FILENAME
+
+    def test_taking_a_missing_request_is_false_not_an_error(self, tmp_path):
+        assert take_reset_request(tmp_path / RESET_REQUEST_FILENAME) is False
+
+    def test_a_request_is_taken_exactly_once_and_the_file_is_gone(self, tmp_path):
+        path = tmp_path / RESET_REQUEST_FILENAME
+        path.write_text("reset requested\n")
+
+        assert take_reset_request(path) is True
+        # Consumed, not merely observed: a request that survived being taken
+        # would re-fire at the end of the very match it just started, which is
+        # an auto-restart with extra steps.
+        assert not path.exists()
+        assert take_reset_request(path) is False
+
+    def test_draining_reports_and_removes_a_pending_request(self, tmp_path):
+        path = tmp_path / RESET_REQUEST_FILENAME
+        path.write_text("reset requested\n")
+        messages, log = collector()
+
+        assert drain_reset_request(path, "for a reason", log=log) is True
+        assert not path.exists()
+        # Never silent: the operator typed that command and is waiting on it.
+        assert any("discarded a reset request for a reason" in m for m in messages)
+
+    def test_draining_nothing_says_nothing(self, tmp_path):
+        messages, log = collector()
+
+        assert drain_reset_request(tmp_path / "nope", "for a reason", log=log) is False
+        assert messages == []
+
+    def test_waiting_polls_until_the_request_appears_then_consumes_it(self, tmp_path):
+        path = tmp_path / RESET_REQUEST_FILENAME
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:  # the operator finally runs the reset command
+                path.write_text("reset requested\n")
+
+        wait_for_reset_request(path, sleep=sleep, poll_seconds=0.5)
+
+        assert sleeps == [0.5, 0.5, 0.5]
+        assert not path.exists()
+
+    def test_the_hint_names_a_non_default_log_dir(self, tmp_path):
+        # The reset process finds the request file by --log-dir alone. A hint
+        # that dropped a non-default one would send the operator's request
+        # somewhere no launcher is looking, with no error at either end.
+        hint = reset_command_hint(tmp_path)
+        assert hint == f"python -m deploy.exhibition --reset --log-dir {tmp_path}"
+
+    def test_the_hint_stays_short_for_the_default_log_dir(self):
+        assert reset_command_hint(DEFAULT_LOG_DIR) == "python -m deploy.exhibition --reset"
+
+
+# ---------------------------------------------------------------------------
+# `--reset`, driven through the real run() — it files a request and starts
+# NOTHING. Not a checkpoint load, not a port probe, not a process, not
+# ops.json, and not even the log dir.
+# ---------------------------------------------------------------------------
+
+
+def exploding_load_policy(_checkpoint_path, _checkpoints_dir):
+    raise AssertionError("--reset must not load a checkpoint")
+
+
+def exploding_probe(host, port):
+    raise AssertionError("--reset must not probe any port")
+
+
+class TestResetCommand:
+    def _drive_reset(self, log_dir, *extra):
+        messages, log = collector()
+        popen = RefusingPopen()
+        ops_writes = []
+        code = run(
+            ["--reset", "--log-dir", str(log_dir), *extra],
+            popen=popen,
+            port_probe=exploding_probe,
+            load_policy=exploding_load_policy,
+            write_ops=recording_write_ops(ops_writes),
+            which=lambda name: None,
+            log=log,
+        )
+        return code, "\n".join(messages), popen, ops_writes
+
+    def test_files_a_request_and_starts_nothing(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+
+        code, text, popen, ops_writes = self._drive_reset(log_dir)
+
+        assert code == 0
+        assert (log_dir / RESET_REQUEST_FILENAME).is_file()
+        # The refusal-proof trio: the checkpoint gate, the port gates and the
+        # spawn are all AFTER this branch returns. exploding_load_policy and
+        # exploding_probe would have raised; RefusingPopen would have raised.
+        assert popen.calls == []
+        assert ops_writes == []
+        assert str(log_dir / RESET_REQUEST_FILENAME) in text
+        # It must say plainly that ONE reset means ONE match.
+        assert "one reset command, one match" in text
+
+    def test_never_connects_to_the_bridge(self, tmp_path):
+        # THE structural constraint: the bridge accepts exactly one TCP client
+        # and a second connect destroys the first, so a --reset that spoke the
+        # wire would evict the live agent mid-exhibition. exploding_probe
+        # covers the port; this pins the reasoning in the refusal text an
+        # operator reads when it cannot find a launcher.
+        code, text, _popen, _ops = self._drive_reset(tmp_path / "not-a-dir")
+
+        assert code != 0
+        assert "ONE TCP client" in text
+
+    def test_refuses_when_no_launcher_is_using_that_log_dir(self, tmp_path):
+        missing = tmp_path / "logs"
+
+        code, text, popen, ops_writes = self._drive_reset(missing)
+
+        assert code != 0
+        assert popen.calls == []
+        assert ops_writes == []
+        # It must NOT create the directory: its absence is the evidence that no
+        # launcher is using it, and creating one destroys that evidence (and
+        # leaves a request nobody will ever consume).
+        assert not missing.exists()
+        assert "does not exist" in text
+        assert "python -m deploy.exhibition" in text
+
+    def test_refuses_a_second_request_without_disturbing_the_first(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        request = log_dir / RESET_REQUEST_FILENAME
+        request.write_text("the first request\n")
+
+        code, text, _popen, _ops = self._drive_reset(log_dir)
+
+        assert code != 0
+        assert request.read_text() == "the first request\n"  # not overwritten
+        assert "already armed" in text
+        # And it explains the mid-match case rather than leaving the operator to
+        # guess why nothing consumed it.
+        assert "DISCARDED" in text
+
+    def test_refuses_flags_it_cannot_honor_instead_of_ignoring_them(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+
+        code, text, _popen, _ops = self._drive_reset(log_dir, "--challenger-username", "Bob")
+
+        assert code != 0
+        # Silently ignoring it would look, to the operator, like the challenger
+        # had been swapped for the next match. It cannot be: the name is pinned
+        # into the bridge's argv at LAUNCH.
+        assert "--challenger-username" in text
+        assert not (log_dir / RESET_REQUEST_FILENAME).exists()
+
+    def test_request_reset_writes_a_timestamped_marker(self, tmp_path):
+        messages, log = collector()
+
+        assert request_reset(tmp_path, log=log, now=lambda: "2026-08-16 12:00:00") == 0
+
+        assert (tmp_path / RESET_REQUEST_FILENAME).read_text() == (
+            "reset requested 2026-08-16 12:00:00\n"
+        )
+
+
+class TestResetModeConflicts:
+    def _args(self, argv):
+        from deploy.exhibition import _build_arg_parser
+
+        return _build_arg_parser().parse_args(argv)
+
+    def test_log_dir_alone_is_no_conflict(self, tmp_path):
+        defaults = self._args([])
+        assert reset_mode_conflicts(self._args(["--reset", "--log-dir", str(tmp_path)]), defaults) == []
+
+    def test_every_launch_only_flag_is_reported(self):
+        defaults = self._args([])
+        conflicts = reset_mode_conflicts(
+            self._args(["--reset", "--checkpoint", "x.pt", "--mc-port", "1234"]), defaults
+        )
+        assert conflicts == ["--checkpoint", "--mc-port"]
+
+    def test_the_store_false_flag_is_named_the_way_it_is_typed(self):
+        # dest is `paper_console`, so the mechanical dest->flag rendering would
+        # print "--paper-console", a flag that does not exist.
+        defaults = self._args([])
+        conflicts = reset_mode_conflicts(self._args(["--reset", "--no-paper-console"]), defaults)
+        assert conflicts == ["--no-paper-console"]
+
+
+# ---------------------------------------------------------------------------
+# human_reset_commands — the half of the reset the datapack does not do.
+# ---------------------------------------------------------------------------
+
+
+class TestHumanResetCommands:
+    def test_the_exact_commands_for_pad_zero(self):
+        assert human_reset_commands(pad_anchor(0), "Steve") == [
+            "tp Steve 3.5 64 0.5 90 0",
+            "effect clear Steve",
+            "effect give Steve minecraft:instant_health 1 9 true",
+            "effect give Steve minecraft:saturation 1 19 true",
+        ]
+
+    def test_no_command_carries_a_leading_slash(self):
+        # Console commands are slash-free; formatHumanResetCommands' output is
+        # NOT, because the bridge feeds it to bot.chat(). Copying that form here
+        # is the obvious "consistency" fix and it would send `/tp ...` to a
+        # console that has no idea what that is.
+        for command in human_reset_commands(pad_anchor(0), "Steve"):
+            assert not command.startswith("/")
+
+    def test_the_clear_comes_before_the_gives(self):
+        commands = human_reset_commands(pad_anchor(0), "Steve")
+        clear_idx = next(i for i, c in enumerate(commands) if c.startswith("effect clear"))
+        give_idx = next(i for i, c in enumerate(commands) if c.startswith("effect give"))
+        # An instant effect applies on its first tick, so a clear issued after
+        # the give can strip it before it ever lands -- the datapack's ordering
+        # note owns this reasoning and this is the same trap.
+        assert clear_idx < give_idx
+
+    def test_a_non_zero_pad_anchor_still_lands_on_the_opponent_slot(self):
+        anchor = pad_anchor(3)
+        commands = human_reset_commands(anchor, "Steve")
+        assert commands[0] == (
+            f"tp Steve {anchor.x + 3}.5 64 {anchor.z}.5 90 0"
+        )
+
+    def test_a_username_that_could_inject_a_second_command_is_refused(self):
+        # This text is executed by a LEVEL-4 console. A newline in the name is a
+        # free command of the attacker's choosing.
+        with pytest.raises(ValueError):
+            human_reset_commands(pad_anchor(0), "a\nop b")
+        with pytest.raises(ValueError):
+            human_reset_commands(pad_anchor(0), "Steve Jobs")
+
+    def test_an_empty_or_missing_username_is_refused(self):
+        with pytest.raises(ValueError):
+            human_reset_commands(pad_anchor(0), "")
+        with pytest.raises(ValueError):
+            human_reset_commands(pad_anchor(0), None)
+
+    def test_a_negative_anchor_is_refused(self):
+        from distributed.launcher import PadAnchor
+
+        # `<n>.5` is a textual concatenation exactly like the datapack's
+        # `$(x).5`, so a negative anchor would silently yield anchor MINUS half
+        # a block -- the same trap arena:setup_pad's header documents.
+        with pytest.raises(ValueError):
+            human_reset_commands(PadAnchor(x=-1, z=0), "Steve")
+
+    def test_they_still_mirror_the_committed_dummy_datapack(self):
+        """Drift pin. These commands duplicate the dummy's reset template for a
+        player instead of a bot; if that template moves, this fails here rather
+        than in a live exhibition where the human quietly spawns in the wrong
+        place or at the wrong health."""
+        datapack = DUMMY_PAD_MCFUNCTION.read_text(encoding="utf-8").splitlines()
+
+        # Position: anchor + 3 on x, y=64, z centre, yaw 90 (facing the
+        # learner). The datapack expresses the +3 as a relative hop from the
+        # learner cell; CHALLENGER_SPAWN_DX is the same 3.
+        assert "$execute positioned $(x).5 64 $(z).5 run tp $(dummy) ~3 ~ ~ 90 0" in datapack
+        # Health/food: same effects, same amplifiers, same clear-then-give.
+        assert "$effect clear $(dummy)" in datapack
+        assert "$effect give $(dummy) minecraft:instant_health 1 9 true" in datapack
+        assert "$effect give $(dummy) minecraft:saturation 1 19 true" in datapack
+
+        ours = human_reset_commands(pad_anchor(0), "Steve")
+        for line in datapack:
+            if line.startswith("$effect "):
+                assert line[1:].replace("$(dummy)", "Steve") in ours
+
+
+# ---------------------------------------------------------------------------
+# The Paper console channel — the only command path this process can reach.
+# ---------------------------------------------------------------------------
+
+
+class TestPaperConsole:
+    def test_commands_are_written_as_bytes_lines_and_flushed(self):
+        console = FakeConsole()
+        proc = FakeProc(stdin=console)
+        messages, log = collector()
+
+        assert send_paper_console_commands(proc, ["say one", "say two"], log=log) is True
+
+        assert console.lines == ["say one", "say two"]
+        assert console.flushes == 1
+        # Echoed, always: a channel that quietly did nothing is this project's
+        # signature failure mode, and an opped operator can re-run these by hand.
+        assert any("console> say one" in m for m in messages)
+
+    def test_no_pipe_is_reported_with_the_commands_that_did_not_run(self):
+        proc = FakeProc(stdin=None)  # DEVNULL opens no pipe
+        messages, log = collector()
+
+        assert send_paper_console_commands(proc, ["say one"], log=log) is False
+
+        text = "\n".join(messages)
+        assert "did NOT run" in text
+        assert "say one" in text
+
+    def test_a_broken_pipe_is_survivable_and_reported(self):
+        # Paper died mid-exhibition. A launcher that took the whole exhibition
+        # down over a failed heal would be worse than one that plays unhealed.
+        proc = FakeProc(stdin=FakeConsole(fail=True))
+        messages, log = collector()
+
+        assert send_paper_console_commands(proc, ["say one"], log=log) is False
+
+        text = "\n".join(messages)
+        assert "BrokenPipeError" in text
+        assert "did NOT run" in text
+
+
+# ---------------------------------------------------------------------------
+# End to end: one reset command -> one more match, in the SAME process.
+# ---------------------------------------------------------------------------
+
+
+class TestResetRedrivesPlay:
+    def test_one_reset_command_plays_exactly_one_more_match(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=3, resets=1)
+
+        assert result.escaped is None
+        assert result.code == 130
+        assert result.reset_codes == [0]
+        # THE point of T6: resetting the arena is not enough -- play has to be
+        # re-driven from inside this process, because the bridge's single TCP
+        # client slot is held here. Two resets and two full step sequences on
+        # the wire, from one launcher and one connection.
+        (transport,) = result.transports
+        assert transport.resets == 2
+        assert transport.total_steps == 6
+        assert result.policy.reset_calls == 2
+        assert len(result.envs) == 1  # the SAME connection, not a second one
+        assert transport.connects == 1
+        # The request was CONSUMED by the wait, not merely observed by it.
+        # Asserted here and not only on the helper: a launcher that read the
+        # file some other way would leave it behind for the NEXT match's drain
+        # to remove, and the operator would be told their honored reset had
+        # been "discarded" -- a message that must only ever appear for a
+        # request that really was filed mid-match.
+        assert not result.request_path.exists()
+        assert "discarded a reset request" not in result.text()
+
+    def test_two_reset_commands_play_two_more_matches(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2, resets=2)
+
+        (transport,) = result.transports
+        assert transport.resets == 3
+        assert transport.total_steps == 6
+        assert result.text().count("match finished") == 3
+
+    def test_the_human_is_healed_and_repositioned_before_the_next_match(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2, resets=1)
+
+        # The gap T3's review found: formatHumanResetCommands resets the LEARNER
+        # only, so a match the AGENT lost leaves the human on partial health.
+        assert result.console_lines == human_reset_commands(pad_anchor(0), "Steve")
+
+        # And they land BEFORE the second match's reset -- a heal that arrives
+        # after the fight has started is a heal mid-fight.
+        console_idx = next(i for i, e in enumerate(result.events) if e[0] == "console")
+        reset_indices = [
+            i for i, e in enumerate(result.events) if e == ("bridge.send", "reset")
+        ]
+        assert reset_indices[0] < console_idx < reset_indices[1]
+
+    def test_no_human_commands_are_sent_before_the_first_match(self, tmp_path, monkeypatch):
+        # Nobody has joined yet at launch, so healing "the challenger" would be
+        # a pile of `No player was found` lines in the console an operator is
+        # watching -- the exact noise T3 worked to remove.
+        result = drive_exhibition(tmp_path, monkeypatch, resets=0)
+
+        assert result.console_lines == []
+
+    def test_an_unpinned_challenger_still_plays_but_says_what_it_cannot_do(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2, resets=1, challenger=None)
+
+        (transport,) = result.transports
+        assert transport.resets == 2  # the match is still re-driven
+        assert result.console_lines == []
+        text = result.text()
+        # Nothing on the wire tells this process who claimed the slot, so this
+        # is a real limitation -- stated, with the fix, not silently skipped.
+        assert "NOT healing or repositioning the human" in text
+        assert "--challenger-username" in text
+
+    def test_no_paper_console_prints_the_commands_instead_of_running_them(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=2, resets=1, extra_argv=["--no-paper-console"]
+        )
+
+        assert result.spawn_kwargs["paper"]["stdin"] is subprocess.DEVNULL
+        assert result.console_lines == []
+        text = result.text()
+        assert "--no-paper-console" in text
+        for command in human_reset_commands(pad_anchor(0), "Steve"):
+            assert command in text
+        # The match is still played: the console is a fairness aid, not a gate.
+        assert result.transports[0].resets == 2
+
+    def test_a_dead_console_does_not_take_the_exhibition_down(self, tmp_path, monkeypatch):
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=2, resets=1, console_fails=True
+        )
+
+        assert result.escaped is None
+        assert result.code == 130
+        assert result.transports[0].resets == 2
+        assert "did NOT run" in result.text()
+
+    def test_paper_gets_a_console_pipe_and_the_bridge_does_not(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch)
+
+        # start.sh execs the JVM, so this pipe IS the server console -- the only
+        # command channel this process can reach (RCON is off, and the wire has
+        # no slot for a command).
+        assert result.spawn_kwargs["paper"]["stdin"] is subprocess.PIPE
+        assert result.spawn_kwargs["bridge"]["stdin"] is subprocess.DEVNULL
+
+    def test_the_console_pipe_is_closed_after_paper_is_stopped(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch)
+
+        # Last link of the teardown chain. Left open, the buffered writer is
+        # finalized at interpreter exit and prints "Exception ignored in ...",
+        # which reads like a crash in a launcher that shut down correctly.
+        assert result.procs["paper"].stdin.closed is True
+
+    def test_the_reset_hint_names_this_launchers_log_dir(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch)
+
+        assert f"--reset --log-dir {tmp_path / 'logs'}" in result.text()
+
+
+class TestNothingRestartsAMatchByItself:
+    """AC4, and the user's own rule: "after one death, no restart auto for
+    human". Every match after the first must trace back to a command the
+    operator ran while the launcher was IDLE."""
+
+    def test_a_death_alone_never_starts_a_second_match(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, resets=0)
+
+        (transport,) = result.transports
+        assert transport.resets == 1
+        assert result.text().count("match finished") == 1
+        assert "no auto-restart" in result.text()
+
+    def test_idle_polls_that_find_no_request_never_start_a_match(
+        self, tmp_path, monkeypatch
+    ):
+        # The wait must key on the REQUEST, not merely on having waited. A loop
+        # that replayed a match every time its sleep returned would look right
+        # in every test where a request happens to be filed.
+        result = drive_exhibition(tmp_path, monkeypatch, resets=0, idle_wakeups=5)
+
+        assert result.events.count(("idle_poll",)) == 5
+        assert result.transports[0].resets == 1
+        assert result.text().count("match finished") == 1
+
+    def test_a_request_left_over_from_an_earlier_launch_is_discarded(
+        self, tmp_path, monkeypatch
+    ):
+        # A previous exhibition died before consuming its request. Honoring it
+        # would start a second match nobody asked for, in front of a room.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / RESET_REQUEST_FILENAME).write_text("stale\n")
+
+        result = drive_exhibition(tmp_path, monkeypatch, resets=0)
+
+        assert result.transports[0].resets == 1
+        assert "left over from an earlier launch" in result.text()
+
+    def test_a_request_filed_mid_match_is_discarded_when_that_match_ends(
+        self, tmp_path, monkeypatch
+    ):
+        # Honoring it would make the DEATH the proximate cause of the restart,
+        # which is the thing AC4 exists to prevent. The launcher is inside
+        # play_one_match here and is polling nothing, so the request is filed
+        # from the transport's step hook -- the same instant it would arrive in
+        # production.
+        log_dir = tmp_path / "logs"
+
+        def file_a_request_mid_match(transport):
+            path = log_dir / RESET_REQUEST_FILENAME
+            if transport.total_steps == 1 and not path.exists():
+                path.write_text("filed while the match was running\n")
+
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=3, resets=0, on_step=file_a_request_mid_match
+        )
+
+        (transport,) = result.transports
+        assert transport.resets == 1  # NOT re-driven
+        text = result.text()
+        assert "filed while the match was still running" in text
+        # And the operator is told exactly what to do about it.
+        assert "run again" in text or "again now that this one has ended" in text
+        assert not (log_dir / RESET_REQUEST_FILENAME).exists()
+
+    def test_the_help_text_says_one_command_one_match(self):
+        from deploy.exhibition import _build_arg_parser
+
+        help_text = " ".join(_build_arg_parser().format_help().split())
+
+        assert "--reset" in help_text
+        assert "one reset command, one match, never automatic" in help_text
