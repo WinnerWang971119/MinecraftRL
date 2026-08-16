@@ -95,6 +95,7 @@ from typing import Callable, Dict, List, Optional, Protocol
 
 from agent.train import (
     EnvProtocol,
+    EpisodeOpponent,
     RolloutPolicy,
     arena_episode_seed,
     collect_episode,
@@ -402,6 +403,14 @@ class Collector:
         mc_host / mc_port: Where the shared JVM listens. Passed to ``jvm_probe`` AND
             named in the abort message, so the two can never disagree.
         max_episode_steps: Per-episode decision cap forwarded to ``collect_episode``.
+        opponent: Optional per-arena :class:`~agent.train.EpisodeOpponent` (T12).
+            ``None`` (the default) is the stationary-dummy path: no ``opp_action``
+            reaches the wire and this collector behaves exactly as it did before
+            the parameter existed. When given it is THIS ARENA'S OWN driver —
+            never one shared with another collector, because all
+            ``ScriptedBot`` state is instance-level and two threads sharing one
+            would interleave a single RNG stream. It survives a bridge relaunch
+            untouched: a pad restart rebuilds the env, not the opponent.
         relaunch_backoff_seconds: Initial backoff after a failed reconnect.
         relaunch_backoff_max_seconds: Cap the (doubling) backoff grows toward.
         reset_reconnect_attempts: Bounded env ``reset()`` reconnect attempts before
@@ -427,6 +436,7 @@ class Collector:
         mc_host: str = MC_HOST,
         mc_port: int = MC_PORT,
         max_episode_steps: Optional[int] = None,
+        opponent: Optional[EpisodeOpponent] = None,
         relaunch_backoff_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_SECONDS,
         relaunch_backoff_max_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_MAX_SECONDS,
         reset_reconnect_attempts: int = _DEFAULT_RESET_RECONNECT_ATTEMPTS,
@@ -446,6 +456,7 @@ class Collector:
         self._mc_host = str(mc_host)
         self._mc_port = int(mc_port)
         self._max_episode_steps = max_episode_steps
+        self._opponent = opponent
         self._relaunch_backoff_seconds = float(relaunch_backoff_seconds)
         self._relaunch_backoff_max_seconds = float(relaunch_backoff_max_seconds)
         self._reset_reconnect_attempts = int(reset_reconnect_attempts)
@@ -669,6 +680,9 @@ class Collector:
         # (4) Roll one episode. collect_episode re-reseeds and resets the env from
         # episode_seed; it raises BridgeError straight through on a mid-episode desync
         # (env.step never silent-retries), which our caller funnels into recovery.
+        # With an opponent attached it also drives THIS ARENA'S opponent policy —
+        # one raw view, one macro, one env.step per decision window — and scores
+        # the finished episode into the shared curriculum gate.
         episode = collect_episode(
             env,
             self._policy,
@@ -676,6 +690,7 @@ class Collector:
             episode_index=global_index,
             epsilon=epsilon,
             episode_seed=episode_seed,
+            opponent=self._opponent,
         )
 
         # (5) Hand the whole Episode to the learner (the only replay mutator).
@@ -1024,6 +1039,7 @@ class ActorPool:
         launcher: ArenaLauncher,
         counter: Optional[GlobalEpisodeCounter] = None,
         max_episode_steps: Optional[int] = None,
+        opponent_for: Optional[Callable[[int], EpisodeOpponent]] = None,
         relaunch_backoff_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_SECONDS,
         relaunch_backoff_max_seconds: float = _DEFAULT_RELAUNCH_BACKOFF_MAX_SECONDS,
         reset_reconnect_attempts: int = _DEFAULT_RESET_RECONNECT_ATTEMPTS,
@@ -1050,6 +1066,14 @@ class ActorPool:
             weight_store: Shared snapshot store.
             launcher: Shared :class:`ArenaLauncher` (bridge lifecycle only).
             counter: Optional shared :class:`GlobalEpisodeCounter`; created if ``None``.
+            opponent_for: Optional ``arena_id -> EpisodeOpponent`` (T12), called ONCE
+                per arena here. ``None`` (the default) builds collectors with no
+                opponent — the stationary-dummy path, unchanged. A factory MUST
+                return a DISTINCT driver per arena
+                (:func:`agent.train.build_scripted_opponents` memoizes one per id);
+                handing every collector the same object would put N threads on one
+                ``ScriptedBot``'s RNG and correlate the arenas it is meant to keep
+                independent.
             max_episode_steps / relaunch_backoff_* / reset_reconnect_attempts / sleep:
                 Forwarded to every :class:`Collector` (see its docstring).
             jvm_probe / mc_host / mc_port: The tier-2 detector, given to the pool AND
@@ -1079,6 +1103,10 @@ class ActorPool:
                 mc_host=mc_host,
                 mc_port=mc_port,
                 max_episode_steps=max_episode_steps,
+                # One driver per arena — never one shared across the fleet.
+                opponent=(
+                    opponent_for(arena_id) if opponent_for is not None else None
+                ),
                 relaunch_backoff_seconds=relaunch_backoff_seconds,
                 relaunch_backoff_max_seconds=relaunch_backoff_max_seconds,
                 reset_reconnect_attempts=reset_reconnect_attempts,

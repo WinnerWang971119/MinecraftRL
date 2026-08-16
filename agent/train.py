@@ -51,8 +51,21 @@ Owner: T16 (DQN core track)
 
 from __future__ import annotations
 
+import random
+import threading
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+)
 
 import numpy as np
 import torch
@@ -66,6 +79,7 @@ from agent.replay import PrioritizedSequenceReplay, SequenceBatch
 from agent.seeding import seed_everything
 from agent.train_config import TrainConfig
 from distributed.serialization import Episode
+from opponents.scripted_bot import OpponentView, ScriptedBot, ScriptedPreset
 
 __all__ = [
     "EnvProtocol",
@@ -74,6 +88,11 @@ __all__ = [
     "train",
     "epsilon_for_episode",
     "arena_episode_seed",
+    "opponent_seed",
+    "EpisodeOpponent",
+    "OpponentCurriculum",
+    "ScriptedOpponentDriver",
+    "build_scripted_opponents",
     "collect_episode",
     "hidden_snapshot",
     "LearnStats",
@@ -96,7 +115,16 @@ __all__ = [
 
 
 class EnvProtocol(Protocol):
-    """Structural Gym-style env the trainer rolls out against."""
+    """Structural Gym-style env the trainer rolls out against.
+
+    Deliberately still the MINIMAL dummy-path surface. The scripted-opponent path
+    (T12) additionally calls ``env.raw_opponent_view()`` and passes
+    ``env.step(action, opp_action=...)``, but those are NOT declared here: this
+    Protocol is what the M1/M2 path requires, and widening it would structurally
+    un-satisfy every existing two-argument fake env for a capability only the
+    opponent path uses. :func:`collect_episode` documents the extra surface at the
+    one place that depends on it.
+    """
 
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
         """Start an episode and return the initial observation ``(OBS_DIM,)``."""
@@ -201,6 +229,398 @@ def arena_episode_seed(cfg: TrainConfig, arena_id: int, local_ep: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Opponent stepping + the win-rate-gated EASY/HARD curriculum (T12).
+#
+# WHAT THIS IS FOR. Through M2 the opponent was a stationary dummy served
+# entirely by the bridge / Paper server, so the training loop never stepped an
+# opponent policy — it only talked to the env. The demo-day retrain fights the
+# omniscient :class:`~opponents.scripted_bot.ScriptedBot` instead, which lives in
+# PYTHON: once per decision the loop reads ``env.raw_opponent_view()``, asks the
+# bot for a ``Macro``, and threads it through ``env.step(action, opp_action=...)``
+# so the bridge drives the opponent handle in the SAME window as the learner's.
+#
+# ONE STEP == ONE DECISION WINDOW. The env shadow-tracks the opponent's attack
+# meter by COUNTING decision windows (it deliberately does not read the coarse
+# server clock in ``state.tick``), so the rollout must call ``env.step`` exactly
+# once per opponent decision — never skipping a step, never taking two for one
+# decision. :func:`collect_episode` below is the one place that invariant lives.
+#
+# PASS THE VIEW STRAIGHT THROUGH. ``raw_opponent_view()`` clamps
+# ``attack_cooldown`` to exactly 1.0 because ``ScriptedBot`` treats the swing as
+# ready at ``>= 1.0 - 1e-6``. Rounding it, re-deriving it, or handing the bot a
+# view captured before the last step yields a value a hair under 1.0 — and then
+# the bot NEVER ATTACKS, presenting as a mysteriously passive opponent rather
+# than as an error. Nothing on this path may touch that number.
+#
+# THE CURRICULUM IS A GATED MIXTURE, NOT A PROMOTION CLIFF. Every episode draws
+# EASY or HARD at ``cfg.opponent_mix_easy``; once the rolling win rate over a
+# FULL window of ``cfg.opponent_gate_window`` EASY episodes reaches
+# ``cfg.opponent_gate_winrate``, the draw shifts to
+# ``cfg.opponent_mix_easy_after`` — which is 0.2, not 0.0, so EASY episodes keep
+# arriving (they are what keeps the gate's own window fed). The gate can only
+# ever change one probability: it never blocks, never waits, never raises, and
+# never divides by zero, so a run whose gate never fires simply trains to
+# completion at the initial ratio (AC10).
+# ---------------------------------------------------------------------------
+
+
+#: Seed roles inside one arena's opponent band, in index order. Each per-arena
+#: driver owns three independent RNG streams — the EASY/HARD mixture draw, and
+#: one per ``ScriptedBot`` — and they must not collide with each other or with
+#: another arena's.
+_OPPONENT_SEED_ROLES: Tuple[str, ...] = ("mixture", "easy", "hard")
+
+
+def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
+    """Return the deterministic seed for one arena's opponent RNG ``role``.
+
+    The scheme is ``arena_episode_seed(cfg, arena_id, 0) + cfg.seed_stride // 2 +
+    role_index`` — i.e. it reuses the per-arena seed bands
+    :func:`arena_episode_seed` already carves out (arena ``i`` owns
+    ``cfg.seed_stride`` consecutive seeds) but sits HALF A STRIDE up, far above
+    the ``cfg.seed + arena_id * stride + local_ep`` episode seeds that grow from
+    the bottom of the same band. With the default stride that is 500 000
+    episodes of clearance per arena, so an opponent stream can never coincide
+    with an episode stream, and two arenas can never coincide at all.
+
+    Seeding at CONSTRUCTION (rather than per episode) is the deliberate half of
+    the determinism contract: ``ScriptedBot.reset()`` with no argument is a
+    no-op on the RNG (the gym convention), so the constructor seed governs the
+    whole run while consecutive episodes stay naturally decorrelated. Re-seeding
+    per episode from entropy would destroy run reproducibility; re-seeding per
+    episode from a constant would replay one identical opponent stream forever.
+
+    Args:
+        cfg: The training config (supplies ``seed`` and ``seed_stride``).
+        arena_id: 0-based arena index.
+        role: One of :data:`_OPPONENT_SEED_ROLES` — ``"mixture"``, ``"easy"``,
+            or ``"hard"``.
+
+    Returns:
+        The integer seed for that arena's stream.
+
+    Raises:
+        ValueError: if ``role`` is not a known role (a typo would otherwise
+            silently alias two streams onto one seed).
+    """
+    try:
+        offset = _OPPONENT_SEED_ROLES.index(role)
+    except ValueError:
+        raise ValueError(
+            f"unknown opponent seed role {role!r}; expected one of "
+            f"{list(_OPPONENT_SEED_ROLES)}"
+        ) from None
+    return arena_episode_seed(cfg, arena_id, 0) + int(cfg.seed_stride) // 2 + offset
+
+
+class EpisodeOpponent(Protocol):
+    """The per-arena opponent surface :func:`collect_episode` drives.
+
+    Deliberately narrow: three calls, all on the collector's own thread, with the
+    episode boundary made explicit so the implementation can sample a difficulty
+    tier per episode and score the result. :class:`ScriptedOpponentDriver` is the
+    only implementation; a test may substitute a recorder.
+    """
+
+    def begin_episode(self) -> None:
+        """Called once before an episode's first decision (pick a tier, reset)."""
+        ...
+
+    def act(self, view: OpponentView) -> int:
+        """Return the opponent's macro (``0..N_ACTIONS-1``) for this window."""
+        ...
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Called once with the FINAL step's ``info`` so the episode can be scored."""
+        ...
+
+
+class OpponentCurriculum:
+    """Thread-safe EASY/HARD mixture with a rolling win-rate gate (AC10).
+
+    Shared by every arena in a multi-arena run — the arenas are concurrent
+    threads feeding one learner, so the gate's state is guarded by a lock and
+    every mutation is a short critical section. The per-arena Bernoulli draw
+    itself happens OUTSIDE the lock, against that arena's own
+    ``random.Random``, so the mixture stays reproducible per arena and the lock
+    is never held across a call into another object.
+
+    The gate:
+
+      * only EASY episodes enter the window (the gate measures the agent against
+        the EASY tier, so a HARD loss must not depress it and a HARD win must not
+        inflate it — HARD outcomes are still counted for reporting);
+      * the window must be **FULL** (``cfg.opponent_gate_window`` EASY episodes)
+        before it is compared to the threshold. Evaluating a partial window would
+        fire the gate on the very first EASY win (1/1 == 100% >= 0.6);
+      * once fired it LATCHES. After the shift EASY episodes arrive ~4x more
+        slowly, so an un-firing gate would flap on a window that refills at a
+        different rate than it drained. Latching is not a promotion: the mixture
+        still draws EASY at ``cfg.opponent_mix_easy_after``, which is 0.2.
+
+    It cannot stall a run. There is no waiting, no blocking, no unbounded
+    accumulation (the window is a bounded ``deque``), and no arithmetic that can
+    divide by zero — a gate that never fires simply leaves
+    :meth:`mix_easy` at ``cfg.opponent_mix_easy`` forever.
+
+    Args:
+        cfg: The training config supplying the four curriculum knobs.
+    """
+
+    def __init__(self, cfg: TrainConfig) -> None:
+        self._cfg = cfg
+        self._lock = threading.Lock()
+        # Bounded by construction: the deque drops the oldest EASY outcome once
+        # the window is full, so this is a rolling win rate and not a growing
+        # accumulator. maxlen >= 1 is guaranteed by TrainConfig validation.
+        self._easy_window: Deque[bool] = deque(maxlen=int(cfg.opponent_gate_window))
+        self._gate_fired = False
+        self._episodes = 0
+        self._easy_episodes = 0
+        self._hard_episodes = 0
+        self._easy_wins = 0
+        self._hard_wins = 0
+
+    # -- read side ---------------------------------------------------------
+
+    @property
+    def gate_fired(self) -> bool:
+        """True once the rolling EASY win rate has cleared the gate (latched)."""
+        with self._lock:
+            return self._gate_fired
+
+    def mix_easy(self) -> float:
+        """The CURRENT probability that an episode draws the EASY preset."""
+        with self._lock:
+            return float(
+                self._cfg.opponent_mix_easy_after
+                if self._gate_fired
+                else self._cfg.opponent_mix_easy
+            )
+
+    def easy_window_win_rate(self) -> Optional[float]:
+        """Rolling EASY win rate, or ``None`` while the window is not yet full.
+
+        ``None`` (rather than a partial average) is what makes "the window must
+        be full" a property of the data and not only of the gate's caller.
+        """
+        with self._lock:
+            window = self._easy_window
+            if len(window) < int(self._cfg.opponent_gate_window):
+                return None
+            return sum(1 for won in window if won) / float(len(window))
+
+    def stats(self) -> Dict[str, Any]:
+        """A snapshot of the curriculum's counters (logging / assertions)."""
+        with self._lock:
+            window = list(self._easy_window)
+            full = len(window) >= int(self._cfg.opponent_gate_window)
+            return {
+                "episodes": self._episodes,
+                "easy_episodes": self._easy_episodes,
+                "hard_episodes": self._hard_episodes,
+                "easy_wins": self._easy_wins,
+                "hard_wins": self._hard_wins,
+                "gate_fired": self._gate_fired,
+                "easy_window_size": len(window),
+                "easy_window_win_rate": (
+                    sum(1 for won in window if won) / float(len(window))
+                    if full and window
+                    else None
+                ),
+                "mix_easy": float(
+                    self._cfg.opponent_mix_easy_after
+                    if self._gate_fired
+                    else self._cfg.opponent_mix_easy
+                ),
+            }
+
+    # -- write side --------------------------------------------------------
+
+    def sample_preset(self, rng: random.Random) -> ScriptedPreset:
+        """Draw this episode's preset from the current mixture.
+
+        Args:
+            rng: The CALLER's own ``random.Random`` (one per arena), so the draw
+                is reproducible per arena and no two arenas share RNG state. The
+                draw happens outside the curriculum's lock.
+
+        Returns:
+            ``ScriptedPreset.EASY`` with probability :meth:`mix_easy`, else
+            ``ScriptedPreset.HARD``. ``mix_easy == 1.0`` always yields EASY
+            (``random()`` is on ``[0, 1)``) and ``0.0`` never does.
+        """
+        p_easy = self.mix_easy()
+        return ScriptedPreset.EASY if rng.random() < p_easy else ScriptedPreset.HARD
+
+    def record_episode(self, preset: ScriptedPreset, won: bool) -> bool:
+        """Score one finished episode; return True iff the gate fired on THIS call.
+
+        Args:
+            preset: The tier that episode was fought at.
+            won: Whether the LEARNER won it (``info["won"]`` from the env's final
+                step — the agent's win, which is what the gate measures).
+
+        Returns:
+            ``True`` only on the single call that flips the gate, so a caller can
+            log the transition exactly once. Always ``False`` afterwards.
+        """
+        fired_now = False
+        with self._lock:
+            self._episodes += 1
+            if preset is ScriptedPreset.EASY:
+                self._easy_episodes += 1
+                if won:
+                    self._easy_wins += 1
+                self._easy_window.append(bool(won))
+                # FULL window only — a partial one fires on the first EASY win.
+                if (
+                    not self._gate_fired
+                    and len(self._easy_window) >= int(self._cfg.opponent_gate_window)
+                ):
+                    rate = sum(1 for w in self._easy_window if w) / float(
+                        len(self._easy_window)
+                    )
+                    if rate >= float(self._cfg.opponent_gate_winrate):
+                        self._gate_fired = True
+                        fired_now = True
+            else:
+                self._hard_episodes += 1
+                if won:
+                    self._hard_wins += 1
+        return fired_now
+
+
+class ScriptedOpponentDriver:
+    """One arena's scripted opponent: per-episode tier draw + per-window macro.
+
+    Owns TWO :class:`~opponents.scripted_bot.ScriptedBot` instances — one per
+    preset — plus the mixture RNG, all seeded from this arena's own band via
+    :func:`opponent_seed`. Two bots rather than one because ``ScriptedBot`` fixes
+    its preset at construction and the curriculum re-draws the tier every
+    episode; rebuilding a bot per episode would either replay one identical RNG
+    stream (constant seed) or destroy reproducibility (entropy seed). The
+    invariant that matters is that NOTHING is shared across arenas: every arena
+    gets its own driver, its own bots, and its own RNG streams, because all
+    ``ScriptedBot`` state is instance-level by design.
+
+    Per episode: :meth:`begin_episode` draws the tier and calls the active bot's
+    ``reset()`` with NO argument — which is deliberately a no-op on the RNG (gym
+    convention: continue the stream), so episodes stay decorrelated while the
+    constructor seed still governs the whole run.
+
+    Args:
+        cfg: The training config (seeds + curriculum knobs).
+        curriculum: The SHARED :class:`OpponentCurriculum` (one per run).
+        arena_id: 0-based arena index; selects this driver's seed band.
+    """
+
+    def __init__(
+        self, cfg: TrainConfig, curriculum: OpponentCurriculum, arena_id: int
+    ) -> None:
+        self.arena_id = int(arena_id)
+        self._curriculum = curriculum
+        self._rng = random.Random(opponent_seed(cfg, self.arena_id, "mixture"))
+        self._bots: Dict[ScriptedPreset, ScriptedBot] = {
+            ScriptedPreset.EASY: ScriptedBot(
+                ScriptedPreset.EASY, seed=opponent_seed(cfg, self.arena_id, "easy")
+            ),
+            ScriptedPreset.HARD: ScriptedBot(
+                ScriptedPreset.HARD, seed=opponent_seed(cfg, self.arena_id, "hard")
+            ),
+        }
+        # The tier in force. Replaced by every begin_episode(); the initial value
+        # only matters if act() were somehow called first, which collect_episode
+        # never does.
+        self._preset = ScriptedPreset.EASY
+
+    @property
+    def preset(self) -> ScriptedPreset:
+        """The preset this arena is currently fighting at."""
+        return self._preset
+
+    @property
+    def name(self) -> str:
+        """The active bot's name (``"scripted_easy"`` / ``"scripted_hard"``)."""
+        return self._bots[self._preset].name
+
+    def bot_for(self, preset: ScriptedPreset) -> ScriptedBot:
+        """This arena's bot for ``preset`` (exposed for tests / introspection)."""
+        return self._bots[preset]
+
+    def begin_episode(self) -> None:
+        """Draw this episode's tier and start the chosen bot's episode."""
+        self._preset = self._curriculum.sample_preset(self._rng)
+        # NO argument on purpose: ScriptedBot.reset() is a no-op on the RNG, so
+        # the stream continues across episodes under the constructor's seed.
+        # reset(None) does NOT re-seed either — never pass one hoping it will.
+        self._bots[self._preset].reset()
+
+    def act(self, view: OpponentView) -> int:
+        """Return the active bot's macro for this decision window.
+
+        ``view`` is passed through untouched — in particular its
+        ``attack_cooldown``, which the producer clamped to exactly 1.0 and which
+        the bot compares against a deliberately tight ``>= 1.0 - 1e-6``.
+
+        Returns:
+            The macro as an ``int`` in ``[0, N_ACTIONS)``. ``ScriptedBot.act``
+            only ever returns ``Macro`` members, so the env's own range check on
+            ``opp_action`` is unreachable from here.
+        """
+        return int(self._bots[self._preset].act(view))
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Score the finished episode into the shared curriculum.
+
+        ``info["won"]`` is the LEARNER's win (the opponent died), which is what
+        the gate measures. A missing key reads as a loss: the only way to get
+        one is an episode that ended without a final env ``info``, which is not
+        a win by any reading.
+
+        An episode aborted mid-flight by a ``BridgeError`` never reaches here,
+        so a lost episode is simply not scored — it is not counted as a loss
+        against the gate, which would otherwise let a flaky pad depress the
+        curriculum.
+        """
+        self._curriculum.record_episode(self._preset, bool(info.get("won", False)))
+
+
+def build_scripted_opponents(
+    cfg: TrainConfig,
+) -> Tuple[OpponentCurriculum, Callable[[int], ScriptedOpponentDriver]]:
+    """Build the shared curriculum and a per-arena driver factory.
+
+    The factory MEMOIZES one :class:`ScriptedOpponentDriver` per ``arena_id``, so
+    a given arena keeps the same bots (and therefore the same continuing RNG
+    streams) for the whole run, while two arenas can never be handed the same
+    driver. Memoization is lock-guarded because a pool may build its collectors
+    from more than one thread.
+
+    Args:
+        cfg: The training config (seeds + curriculum knobs).
+
+    Returns:
+        ``(curriculum, opponent_for)`` — the shared gate and
+        ``arena_id -> ScriptedOpponentDriver``.
+    """
+    curriculum = OpponentCurriculum(cfg)
+    drivers: Dict[int, ScriptedOpponentDriver] = {}
+    lock = threading.Lock()
+
+    def opponent_for(arena_id: int) -> ScriptedOpponentDriver:
+        key = int(arena_id)
+        with lock:
+            driver = drivers.get(key)
+            if driver is None:
+                driver = ScriptedOpponentDriver(cfg, curriculum, key)
+                drivers[key] = driver
+            return driver
+
+    return curriculum, opponent_for
+
+
+# ---------------------------------------------------------------------------
 # Reentrant rollout — the actor-side collection path (shared by N=1 and N>1).
 #
 # ``collect_episode`` below is a FREE function with NO writes to any shared
@@ -282,6 +702,7 @@ def collect_episode(
     episode_index: int,
     epsilon: float,
     episode_seed: int,
+    opponent: Optional[EpisodeOpponent] = None,
 ) -> Episode:
     """Roll ONE episode against ``env`` with ``policy`` and return it as an Episode.
 
@@ -317,6 +738,16 @@ def collect_episode(
             an episode, per the per-EPISODE schedule).
         episode_seed: Deterministic seed for BOTH the env reset and the policy's
             action RNG, so the exploration stream is replayable.
+        opponent: Optional per-arena :class:`EpisodeOpponent` (T12). ``None`` (the
+            default) is the M1/M2 stationary-dummy path and is BYTE-IDENTICAL to
+            what this loop did before the parameter existed: ``env.step(action)``
+            is called with one positional argument, no ``opp_action`` reaches the
+            wire, and the env is never asked for a raw view. When given, each
+            decision reads ``env.raw_opponent_view()``, asks the opponent for a
+            macro, and sends both actions in ONE ``env.step`` — see the
+            one-step-one-window invariant in this section's banner. The env must
+            then expose ``raw_opponent_view()`` and accept ``opp_action``
+            (``MCPvPEnv`` does; a fake env used with an opponent must too).
 
     Returns:
         An immutable :class:`~distributed.serialization.Episode` whose
@@ -335,6 +766,11 @@ def collect_episode(
     policy.reseed(episode_seed)
     obs = env.reset(seed=episode_seed)
     hidden = policy.init_hidden()
+    # Episode boundary for the opponent: draw this episode's difficulty tier and
+    # start its bot's episode. AFTER env.reset(), because the reset re-arms the
+    # opponent's shadow swing meter that the bot's ATTACK gate reads.
+    if opponent is not None:
+        opponent.begin_episode()
 
     transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
     hidden_states: List[np.ndarray] = []
@@ -342,6 +778,7 @@ def collect_episode(
     total_reward = 0.0
     done = False
     steps = 0
+    last_info: Optional[Mapping[str, Any]] = None
     while not done:
         # Capture the hidden state SEEN by this step (the LSTM state that produced
         # the action), stacked (num_layers, hidden) for burn-in seeding by the
@@ -351,7 +788,17 @@ def collect_episode(
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=_policy_device(hidden))
         action, hidden = policy.act(obs_tensor, hidden, epsilon)
 
-        next_obs, reward, done, _info = env.step(action)
+        if opponent is None:
+            # The M1/M2 line, unchanged: one positional argument, no opp_action.
+            next_obs, reward, done, info = env.step(action)
+        else:
+            # ONE view, ONE macro, ONE step — the decision window the env counts.
+            # The view is read here (not cached from an earlier step) so the
+            # opponent decides from the same state the agent just acted on, and
+            # its clamped attack_cooldown reaches the bot untouched.
+            opp_action = opponent.act(env.raw_opponent_view())
+            next_obs, reward, done, info = env.step(action, opp_action=opp_action)
+        last_info = info
 
         transitions.append(
             (
@@ -369,6 +816,14 @@ def collect_episode(
         steps += 1
         if max_steps is not None and steps >= max_steps:
             break
+
+    # Score the finished episode into the curriculum. The FINAL step's info holds
+    # the terminal verdict (``won`` / ``lost`` / ``timeout``); an episode stopped
+    # by ``max_steps`` carries won=False, which is the right reading — it did not
+    # win. The loop body always runs at least once, so ``last_info`` is only None
+    # in a pathological env.
+    if opponent is not None:
+        opponent.observe_outcome(last_info if last_info is not None else {})
 
     return Episode(
         transitions=transitions,
@@ -1172,6 +1627,18 @@ def train_vs_dummy(
         raise ValueError(
             f"eval_every_episodes must be >= 0, got {eval_every_episodes}"
         )
+    if cfg.opponent != "dummy":
+        # REFUSE, do not ignore. This loop steps no opponent policy — the dummy is
+        # served entirely by the bridge — so honoring cfg.opponent here would mean
+        # silently training against a stationary dummy while the run's own config
+        # said "scripted", which is exactly the kind of silent-substitution failure
+        # this project keeps paying for. The scripted curriculum lives on the
+        # multi-arena path (T12).
+        raise ValueError(
+            f"train_vs_dummy is the stationary-dummy loop and cannot fight "
+            f"cfg.opponent={cfg.opponent!r}: it never steps an opponent policy. "
+            "Use train_multi_arena (--arenas >= 2) for the scripted opponent."
+        )
 
     def _emit(message: str) -> None:
         # Route standalone lines through the reporter when present so they clear
@@ -1491,6 +1958,10 @@ class MultiArenaResult:
         stop_reason: One of ``"passed_m2"`` / ``"max_grad_steps"`` /
             ``"max_episodes"`` / ``"learner_error"`` / ``"pool_aborted"``.
         is_live: ``True`` for a real-bridge run, ``False`` for the offline proof.
+        curriculum: The shared :class:`OpponentCurriculum` when the run fought the
+            scripted opponent (``cfg.opponent == "scripted"``), else ``None``. Kept
+            on the result so a caller can read the final mixture / gate state
+            without reaching into the pool.
     """
 
     trainer: "Trainer"
@@ -1501,6 +1972,7 @@ class MultiArenaResult:
     reports: List[Any] = None  # type: ignore[assignment]  # set in __post_init__
     stop_reason: str = "max_grad_steps"
     is_live: bool = False
+    curriculum: Optional["OpponentCurriculum"] = None
 
     def __post_init__(self) -> None:
         if self.reports is None:
@@ -1785,6 +2257,15 @@ def train_multi_arena(
             "live run, or a fake launcher in tests."
         )
 
+    # --- the opponent curriculum (T12) --------------------------------------
+    # "dummy" (the default) builds nothing at all: no opponent_for reaches the
+    # pool, no opp_action reaches the wire, and the M2 path is untouched.
+    # "scripted" builds ONE shared curriculum gate plus one driver per arena.
+    curriculum: Optional[OpponentCurriculum] = None
+    opponent_for: Optional[Callable[[int], EpisodeOpponent]] = None
+    if cfg.opponent == "scripted":
+        curriculum, opponent_for = build_scripted_opponents(cfg)
+
     # --- per-arena snapshot policies (same net architecture as the learner) --
     # Each collector owns its own net clone (built from the SAME net_kwargs so the
     # learner's published state_dict load_state_dicts cleanly) and its own RNG seeded
@@ -1822,6 +2303,8 @@ def train_multi_arena(
         counter=counter,
         max_episode_steps=rollout_step_cap,
     )
+    if opponent_for is not None:
+        actor_kwargs["opponent_for"] = opponent_for
     if relaunch_backoff_seconds is not None:
         actor_kwargs["relaunch_backoff_seconds"] = relaunch_backoff_seconds
     if relaunch_backoff_max_seconds is not None:
@@ -1886,6 +2369,14 @@ def train_multi_arena(
         f"bridge_restart={'on' if cfg.fault_relaunch else 'OFF'}, "
         f"jvm_watch={'on' if jvm_probe is not None else 'off'}, "
         + (
+            f"opponent=scripted (mix_easy {cfg.opponent_mix_easy:.2f} -> "
+            f"{cfg.opponent_mix_easy_after:.2f} at win_rate "
+            f"{cfg.opponent_gate_winrate:.2f} over {cfg.opponent_gate_window} "
+            f"EASY eps), "
+            if curriculum is not None
+            else "opponent=dummy, "
+        )
+        + (
             f"eval every {eval_every_grad_steps} grad steps on arena {designated_arena}"
             if do_eval
             else "eval disabled"
@@ -1894,6 +2385,11 @@ def train_multi_arena(
 
     pool.start()
     learner_thread.start()
+
+    # One-shot latch so the curriculum's shift is logged exactly once. Purely
+    # observational — the driver loop NEVER waits on the gate, so a gate that
+    # does not fire cannot hold the run up (AC10).
+    gate_logged = False
 
     try:
         while True:
@@ -1911,6 +2407,18 @@ def train_multi_arena(
 
             grad_step = int(trainer.grad_step)
             received = int(learner.received)
+
+            # --- curriculum observability (never a control point) ---------------
+            if curriculum is not None and not gate_logged and curriculum.gate_fired:
+                gate_logged = True
+                stats = curriculum.stats()
+                _emit(
+                    f"[multi grad_step {grad_step}] opponent curriculum gate FIRED: "
+                    f"mix_easy {cfg.opponent_mix_easy:.2f} -> "
+                    f"{cfg.opponent_mix_easy_after:.2f} after "
+                    f"{stats['easy_episodes']} EASY episodes "
+                    f"(rolling win_rate={stats['easy_window_win_rate']})"
+                )
 
             # --- budget checks (the learner is the single clock) ----------------
             if max_grad_steps is not None and grad_step >= max_grad_steps:
@@ -2001,6 +2509,7 @@ def train_multi_arena(
         reports=reports,
         stop_reason=stop_reason,
         is_live=bool(is_live),
+        curriculum=curriculum,
     )
 
 
@@ -2089,6 +2598,15 @@ def _build_parser() -> "Any":
         "measurement --arenas.",
     )
     parser.add_argument(
+        "--opponent", type=str, default="dummy", choices=("dummy", "scripted"),
+        help="who the agent fights (default: dummy). 'dummy' is the M1/M2 "
+        "stationary dummy served entirely by the bridge - no opponent action ever "
+        "goes on the wire. 'scripted' steps the ScriptedBot curriculum in Python "
+        "and threads its macro through as opp_action; it requires --arenas >1 "
+        "(the single-arena loop steps no opponent policy and refuses rather than "
+        "silently fighting the dummy).",
+    )
+    parser.add_argument(
         "--seed", type=int, default=0,
         help="base RNG seed (overrides TrainConfig.seed) (default: 0).",
     )
@@ -2146,10 +2664,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
 
     # Honor the CLI seed by replacing it on the frozen config. For N>1 also stamp the
-    # arena count onto the (frozen) config so the multi-arena stack reads it.
+    # arena count onto the (frozen) config so the multi-arena stack reads it. The
+    # opponent source is stamped the same way (TrainConfig validates the choice).
     cfg = dataclasses.replace(
-        TrainConfig(), seed=int(args.seed), arenas=int(args.arenas)
+        TrainConfig(),
+        seed=int(args.seed),
+        arenas=int(args.arenas),
+        opponent=str(args.opponent),
     )
+
+    # Refuse the one combination that cannot be honored, before anything starts:
+    # the single-arena loop steps no opponent policy, so --opponent scripted there
+    # would quietly train against the stationary dummy instead.
+    if int(args.arenas) < 2 and cfg.opponent != "dummy":
+        print(
+            f"[train] FATAL: --opponent {cfg.opponent} needs --arenas >1. The "
+            "single-arena loop never steps an opponent policy (the dummy is served "
+            "by the bridge), so it would silently train against the stationary "
+            "dummy while this run's config claimed otherwise. Re-run with "
+            "--arenas N (N >= 2) against a booted pad fleet. Aborting.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Reward coefficients go into the run's own config so the run stays readable
     # without them. `code_version` cannot stand in for this: its SHA half has no
@@ -2170,6 +2706,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "host": args.host,
             "port": args.port,
             "arenas": args.arenas,
+            "opponent": args.opponent,
             "seed": args.seed,
             "max_episodes": args.max_episodes,
             "eval_episodes": args.eval_episodes,
