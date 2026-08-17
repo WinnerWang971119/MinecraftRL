@@ -600,14 +600,11 @@ echo ""
 
 # --- 1. ops.json (BEFORE Paper boots; Paper reads the op list at startup) ---
 if [[ "${START_SERVER}" -eq 1 ]]; then
+    # server/ops.json is git-IGNORED, like server.properties and bukkit.yml: it is
+    # generated per fleet size (2N entries) and Paper rewrites it on shutdown, so
+    # tracking it dirtied the tree on every cycle (issue #29). Rewriting it here is
+    # the normal path, not something to clean up afterwards.
     launcher_py --pads "${PADS}" --write-ops --ops-path "${OPS_FILE}"
-    if [[ "${PADS}" -gt 1 && "${OPS_FILE}" == "${REPO_ROOT}/server/ops.json" ]]; then
-        # server/ops.json is git-TRACKED (unlike server.properties and bukkit.yml,
-        # which are ignored), so a fleet boot leaves the tree dirty with 2N entries.
-        # That is required for Paper to op the bots; it is not a change to commit.
-        warn "server/ops.json now lists $(( 2 * PADS )) bots and is git-tracked."
-        warn "  Expect a dirty tree; do not commit the fleet-sized op list."
-    fi
 fi
 
 # --- 2. Paper ---------------------------------------------------------------

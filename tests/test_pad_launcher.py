@@ -7,8 +7,10 @@ Covers the offline-testable half of T10 (the one-JVM / N-pad launcher):
   * ``pad_usernames`` -- the ``i == 0`` special case (``learner_bot``, NOT
     ``learner_0``) that keeps the manual single-arena path byte-identical, and that
     must agree with ``usernamesForPad`` in ``bridge/run.js``.
-  * ``ops.json`` generation -- offline-mode UUIDs, and byte-identity with the
-    committed ``server/ops.json`` at N=1.
+  * ``ops.json`` generation -- offline-mode UUIDs, and the exact N=1 file text.
+    ``server/ops.json`` is generated, never committed (issue #29), so the generator
+    is the contract; the file's untracked/ignored status is pinned here too, and so
+    is ``start.sh``'s refusal to launch without it.
   * The launch plan -- ports, anchors and the exact bridge argv, including a
     round-trip through run.js's REAL argv parser when node is available (the T9/T10
     seam: launcher.py writes the flags, run.js validates them).
@@ -53,8 +55,11 @@ from distributed.launcher import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 START_PADS_SH = REPO_ROOT / "server" / "setup" / "start-pads.sh"
+START_SH = REPO_ROOT / "server" / "setup" / "start.sh"
 SETUP_SH = REPO_ROOT / "server" / "setup" / "setup.sh"
-COMMITTED_OPS = REPO_ROOT / "server" / "ops.json"
+#: Repo-relative on purpose: the git probes below run with ``cwd=REPO_ROOT``, and
+#: nothing here may assume this path EXISTS — it is generated, not committed.
+SERVER_OPS_RELPATH = "server/ops.json"
 PAPER_JAR = REPO_ROOT / "server" / "paper-1.21.1-133.jar"
 
 
@@ -145,11 +150,18 @@ class TestPadUsernames:
 class TestOpsJson:
     """Offline UUIDs and the exact file shape Paper reads at boot."""
 
-    def test_offline_uuid_matches_the_committed_ops_file(self):
-        committed = json.loads(COMMITTED_OPS.read_text(encoding="utf-8"))
-        by_name = {entry["name"]: entry["uuid"] for entry in committed}
-        assert by_name["learner_bot"] == offline_uuid("learner_bot")
-        assert by_name["dummy_bot"] == offline_uuid("dummy_bot")
+    def test_offline_uuid_matches_the_uuids_paper_assigns(self):
+        """The two UUIDs a live Paper 1.21.1 server wrote for the pad-0 bots.
+
+        Pinned as literals, not read from ``server/ops.json``: that file is
+        generated rather than committed (issue #29), so it is absent on a fresh
+        clone and self-consistent with whatever this function returns once it
+        exists — it can no longer be independent evidence. These digits are the
+        evidence. Paper matches op entries by UUID, not by name, so a wrong value
+        here ops nobody and every ``/function`` fails silently.
+        """
+        assert offline_uuid("learner_bot") == "904ab765-0884-3b39-af00-9cdbf8d5f528"
+        assert offline_uuid("dummy_bot") == "08809ff7-fb5e-3b8d-bdd1-a867b604ded8"
 
     def test_offline_uuid_is_version_3_with_the_ietf_variant(self):
         raw = offline_uuid("learner_7").replace("-", "")
@@ -160,9 +172,33 @@ class TestOpsJson:
         with pytest.raises(ValueError):
             offline_uuid("   ")
 
-    def test_one_pad_is_byte_identical_to_the_committed_file(self):
-        # AC11's ops analog: an N=1 fleet must not rewrite server/ops.json at all.
-        assert ops_json(1) == COMMITTED_OPS.read_text(encoding="utf-8")
+    def test_one_pad_renders_the_exact_file_text(self):
+        """The generator IS the contract for server/ops.json (issue #29).
+
+        Replaces the old byte-comparison against the committed file. That file is
+        no longer tracked, and the comparison was circular anyway once
+        ``start-pads.sh`` and ``deploy/exhibition.py`` both rewrite it in place: a
+        generator that drifted would simply rewrite the file it was compared to.
+        Every byte that mattered there is pinned here instead — both bots in pad
+        order, level 4, the offline UUIDs, the key order Paper itself writes back,
+        the two-space indent and the trailing newline.
+        """
+        assert ops_json(1) == (
+            "[\n"
+            "  {\n"
+            '    "uuid": "904ab765-0884-3b39-af00-9cdbf8d5f528",\n'
+            '    "name": "learner_bot",\n'
+            '    "level": 4,\n'
+            '    "bypassesPlayerLimit": false\n'
+            "  },\n"
+            "  {\n"
+            '    "uuid": "08809ff7-fb5e-3b8d-bdd1-a867b604ded8",\n'
+            '    "name": "dummy_bot",\n'
+            '    "level": 4,\n'
+            '    "bypassesPlayerLimit": false\n'
+            "  }\n"
+            "]\n"
+        )
 
     def test_entries_cover_every_bot_at_level_four(self):
         entries = ops_entries(3)
@@ -216,6 +252,55 @@ class TestOpsJson:
         garbage = tmp_path / "garbage.json"
         garbage.write_text("not json at all", encoding="utf-8")
         assert len(missing_ops(2, str(garbage))) == 4
+
+
+def _git(*args):
+    """Run a READ-ONLY git command at the repo root."""
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=60,
+    )
+
+
+def _require_git_work_tree():
+    """Skip (never fail) when there is no usable git — a tarball export, say."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    inside = _git("rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        pytest.skip("not inside a git work tree")
+
+
+class TestOpsJsonIsNotVersioned:
+    """server/ops.json must stay OUT of git (issue #29).
+
+    Paper co-owns the file: it reads the op list at boot and rewrites it on
+    shutdown WITHOUT the trailing newline the generator emits, so a tracked copy
+    went dirty on every boot-and-stop cycle; and ``start-pads.sh --pads 25`` writes
+    50 entries into it, a much larger diff. Both probes exist because they fail for
+    different reasons: the ignore rule can be deleted, and the file can be re-added
+    by reflex (``git add -f``, or a ``git add .`` predating the rule) while the rule
+    is still present.
+    """
+
+    def test_it_is_not_tracked_by_git(self):
+        _require_git_work_tree()
+        result = _git("ls-files", "--error-unmatch", SERVER_OPS_RELPATH)
+        assert result.returncode != 0, (
+            f"{SERVER_OPS_RELPATH} is tracked again. It is generated at boot "
+            "(issue #29); untrack it with `git rm --cached server/ops.json`."
+        )
+
+    def test_it_is_matched_by_a_gitignore_rule(self):
+        _require_git_work_tree()
+        # --no-index asks about the RULE alone, so this stays a statement about
+        # .gitignore even if someone force-adds the file (which the sibling test
+        # above is the one to catch).
+        result = _git("check-ignore", "--no-index", "--quiet", SERVER_OPS_RELPATH)
+        assert result.returncode == 0, (
+            f"no .gitignore rule matches {SERVER_OPS_RELPATH}; without one it is "
+            "one `git add .` away from being tracked again (issue #29)."
+        )
 
 
 class TestRequiredMaxPlayers:
@@ -970,6 +1055,150 @@ class TestStartPadsPreflight:
         assert "launch plan for 3 pad(s)" in result.stdout
         assert "--pad-origin 1024,0" in result.stdout
         assert "nothing was started" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #29 -- the op-list guard, live in start.sh
+# ---------------------------------------------------------------------------
+
+
+#: Printed by the stub JVM below when start.sh reaches its exec. Its ABSENCE is how
+#: a refusal test proves nothing was launched; its presence is how the happy-path
+#: test proves the guard let a valid op list through.
+STUB_JVM_MARKER = "STUB_JVM_LAUNCHED"
+
+
+def _stub_java_home(tmp_path):
+    """A JAVA_HOME whose ``bin/java`` answers ``-version`` and boots NOTHING.
+
+    start.sh ``exec``s the JVM as its last act, so the only way to test the gate
+    that runs just before it — without starting a real Paper server on port 25565 —
+    is to hand the script a java that reports the pinned major version and then
+    echoes its argv instead of running a jar.
+    """
+    home = tmp_path / "stub-jdk"
+    (home / "bin").mkdir(parents=True)
+    java = home / "bin" / "java"
+    java.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-version\" ]; then\n"
+        # start.sh's java_major() greps for the `version "` line on either stream.
+        "  echo 'openjdk version \"21.0.7\" 2025-04-15' >&2\n"
+        "  exit 0\n"
+        "fi\n"
+        f"echo \"{STUB_JVM_MARKER} $*\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    java.chmod(0o755)
+    return home
+
+
+def _start_sh_server_root(tmp_path, ops_text=None):
+    """A scratch SERVER_DIR that clears start.sh's jar/eula gates.
+
+    ``ops_text=None`` leaves ops.json absent, which is exactly the fresh-clone
+    state issue #29 created: nothing on disk generates it before a bare start.sh.
+    """
+    root = tmp_path / "server"
+    root.mkdir(parents=True)
+    (root / "paper-1.21.1-133.jar").write_text("not really a jar", encoding="utf-8")
+    (root / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+    if ops_text is not None:
+        (root / "ops.json").write_text(ops_text, encoding="utf-8")
+    return root
+
+
+def _run_start_sh(server_root, java_home):
+    env = dict(os.environ)
+    env["SERVER_DIR"] = str(server_root)
+    env["JAVA_HOME"] = str(java_home)
+    env.pop("ALLOW_JAVA_MISMATCH", None)  # never let the host env skip a gate
+    return subprocess.run(
+        ["bash", str(START_SH)],
+        capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, timeout=120,
+    )
+
+
+class TestStartShOpsGuard:
+    """start.sh must refuse to boot Paper on an op list that misses the bots.
+
+    Untracking ``server/ops.json`` (issue #29) means a fresh clone running
+    ``start.sh`` directly has no op list at all — ``setup.sh`` deliberately does not
+    write one, because its contents depend on N. Unopped bots cannot run
+    ``/function`` or ``/attribute``, so the arena is never built and every reset
+    quietly does nothing: a loud refusal is the only acceptable trade for the noisy
+    git diff that was removed. No JVM is started here — see :func:`_stub_java_home`.
+    """
+
+    def test_a_missing_ops_file_refuses_to_launch(self, tmp_path):
+        root = _start_sh_server_root(tmp_path, ops_text=None)
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 1
+        assert STUB_JVM_MARKER not in result.stdout, "the JVM must not be reached"
+        assert "REFUSING TO LAUNCH" in result.stderr
+        assert "does not exist" in result.stderr
+
+    def test_the_refusal_names_the_command_that_writes_the_file(self, tmp_path):
+        """A refusal that does not say how to fix it just moves the confusion."""
+        root = _start_sh_server_root(tmp_path, ops_text=None)
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert "-m distributed.launcher" in result.stderr
+        assert "--write-ops" in result.stderr
+        assert "--pads 1" in result.stderr
+        # SERVER_DIR is not the repo's, so the command must carry --ops-path or it
+        # would write the op list somewhere this launch will never read.
+        assert f"--ops-path {root / 'ops.json'}" in result.stderr
+        assert "start-pads.sh --pads N" in result.stderr
+
+    def test_an_op_list_missing_a_bot_refuses_and_names_it(self, tmp_path):
+        # Pad 0's learner only: the dummy is the bot whose /attribute call sets
+        # knockback resistance, so losing it is a silent arena fault, not a crash.
+        root = _start_sh_server_root(
+            tmp_path, ops_text=json.dumps(ops_entries(1)[:1], indent=2) + "\n"
+        )
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 1
+        assert STUB_JVM_MARKER not in result.stdout
+        assert "not opped at level 4: dummy_bot" in result.stderr
+
+    def test_an_under_levelled_bot_refuses(self, tmp_path):
+        """Present is not opped: level 4 is what /function actually requires."""
+        entries = ops_entries(1)
+        entries[0]["level"] = 3
+        root = _start_sh_server_root(
+            tmp_path, ops_text=json.dumps(entries, indent=2) + "\n"
+        )
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 1
+        assert "not opped at level 4: learner_bot" in result.stderr
+        assert "dummy_bot" not in result.stderr.split("reason :")[1].split("\n")[0]
+
+    def test_a_valid_op_list_reaches_the_launch(self, tmp_path):
+        root = _start_sh_server_root(tmp_path, ops_text=ops_json(1))
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert "REFUSING" not in result.stderr
+        assert f"{STUB_JVM_MARKER} -Xms2G -Xmx2G -jar" in result.stdout
+
+    def test_papers_own_rewrite_without_a_trailing_newline_still_launches(self, tmp_path):
+        """The one-byte diff that started issue #29 must not become a refusal.
+
+        Paper rewrites ops.json on shutdown without the trailing newline the
+        generator emits. That file is completely valid; a guard that rejected it
+        would turn every second boot into a false refusal.
+        """
+        root = _start_sh_server_root(tmp_path, ops_text=ops_json(1).rstrip("\n"))
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert STUB_JVM_MARKER in result.stdout
+
+    def test_a_fleet_sized_op_list_still_launches(self, tmp_path):
+        """start.sh knows nothing about pad counts — 50 entries must not confuse it."""
+        root = _start_sh_server_root(tmp_path, ops_text=ops_json(25))
+        result = _run_start_sh(root, _stub_java_home(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert STUB_JVM_MARKER in result.stdout
 
 
 @pytest.mark.skipif(

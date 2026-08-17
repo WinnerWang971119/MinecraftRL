@@ -8,6 +8,10 @@
 # Java: this script PINS Java 21 (see the JAVA_HOME block below). Paper 1.21.1
 # does not run on Java 26 — it boots, then the JVM dies with SIGSEGV inside the
 # bundled spark profiler's native library. Set JAVA_HOME yourself to override.
+#
+# Ops: this script also refuses to launch unless server/ops.json opps learner_bot
+# and dummy_bot at level 4. That file is generated, never committed (issue #29);
+# setup.sh does not write it because the op list depends on the pad count.
 
 set -euo pipefail
 
@@ -17,7 +21,11 @@ JAR_NAME="paper-${PAPER_VERSION}-${PAPER_BUILD}.jar"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SERVER_DIR="${SERVER_DIR:-$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)}"
+# server/setup/ -> server/ -> repo root. Derived from the SCRIPT location, not from
+# SERVER_DIR, so it stays correct when SERVER_DIR points somewhere else.
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
 JAR_PATH="${SERVER_DIR}/${JAR_NAME}"
+OPS_PATH="${SERVER_DIR}/ops.json"
 XMS="${XMS:-2G}"
 XMX="${XMX:-2G}"
 
@@ -140,6 +148,58 @@ fi
 if [[ ! -f "${SERVER_DIR}/eula.txt" ]]; then
     echo "eula.txt missing. Run server/setup/setup.sh first." >&2
     exit 1
+fi
+
+# --- Assert the arena bots are opped ---------------------------------------
+# ops.json is GENERATED, not committed (issue #29): Paper reads the op list at boot
+# and rewrites it on shutdown, and its contents depend on the pad count, so tracking
+# it dirtied the tree on every cycle. setup.sh deliberately does not write it either
+# (the op list depends on N). start-pads.sh and deploy/exhibition.py both write it
+# before they reach this script; a bare start.sh on a fresh clone does not.
+#
+# This ABORTS rather than warns, for the same reason the Java check does. An unopped
+# bot cannot run /function or /attribute at all, so the datapack builds no arena and
+# every reset fails SILENTLY — the bridge still acks, the bots still join, and the
+# fault surfaces much later as nonsense observations.
+#
+# Deliberately grep-level: this script must validate without the venv on PATH, so no
+# JSON parser. All whitespace is stripped first, which makes the check independent of
+# the two writers' formatting (Paper rewrites the file without the trailing newline
+# our generator emits, and that one byte is what started issue #29).
+OPS_WRITE_CMD=".venv/bin/python -m distributed.launcher --pads 1 --write-ops"
+if [[ "${OPS_PATH}" != "${REPO_ROOT}/server/ops.json" ]]; then
+    OPS_WRITE_CMD="${OPS_WRITE_CMD} --ops-path ${OPS_PATH}"
+fi
+
+ops_refusal() {
+    echo "[start] REFUSING TO LAUNCH: ${OPS_PATH} does not op the arena bots." >&2
+    echo "[start]   reason : $1" >&2
+    echo "[start] Paper reads the op list at BOOT. A bot that is not opped at level 4" >&2
+    echo "[start] cannot run /function or /attribute, so the arena is never built and" >&2
+    echo "[start] every reset fails SILENTLY. That is why this is fatal here." >&2
+    echo "[start] This file is generated, not committed (issue #29). Write it with:" >&2
+    echo "[start]   cd ${REPO_ROOT} && ${OPS_WRITE_CMD}" >&2
+    echo "[start] For a multi-pad fleet use server/setup/start-pads.sh --pads N, which" >&2
+    echo "[start] writes the op list for all 2N bots itself." >&2
+    exit 1
+}
+
+if [[ ! -f "${OPS_PATH}" ]]; then
+    ops_refusal "the file does not exist"
+fi
+
+# Strip every space/tab/newline so "level": 4 and "level":4 compare the same. The
+# 2>/dev/null comes FIRST so an unreadable file reports through our message, not the
+# shell's redirection error.
+OPS_FLAT="$(tr -d '[:space:]' 2>/dev/null <"${OPS_PATH}" || true)"
+UNOPPED=""
+for bot in learner_bot dummy_bot; do
+    if [[ "${OPS_FLAT}" != *"\"name\":\"${bot}\",\"level\":4"* ]]; then
+        UNOPPED="${UNOPPED:+${UNOPPED}, }${bot}"
+    fi
+done
+if [[ -n "${UNOPPED}" ]]; then
+    ops_refusal "not opped at level 4: ${UNOPPED}"
 fi
 
 echo "[start] Java : $("${JAVA_BIN}" -version 2>&1 | head -n1)"
