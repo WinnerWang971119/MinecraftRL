@@ -1,8 +1,9 @@
 # Demo day — running the human exhibition
 
 **What this is:** a classmate joins the Minecraft server over the school LAN and
-fights the trained agent one-on-one. One command starts everything. A second,
-separate command arms the next challenger.
+fights the trained agent one-on-one. One command starts everything. After that,
+**anyone types `reset` in Minecraft chat** to arm the next challenger — no
+terminal, no alt-tab, which is what makes a queue of people workable.
 
 **Who this is for:** the person operating the demo, standing up, with a queue of
 people waiting. Read it once the night before. On the day, work down
@@ -100,12 +101,29 @@ the checkpoint loads, both ports are free, and the Node toolchain resolves.
 
 **5. Gear the pinned name once, for the first match only.**
 
-`--reset` arms the challenger with an iron sword every time, so from the second
-match on this is handled. Match 1 is the exception: it starts before anybody has
+Every reset arms the challenger with an iron sword, so from the second match
+on this is handled. Match 1 is the exception: it starts before anybody has
 joined, so there is nobody to arm yet. Join under the pinned name during a
 standalone Paper boot and hand it one sword — details and the exact command in
 [Gear](#gear-one-iron-sword-each). Do it tonight: during an exhibition there is
 no server console to type into.
+
+**6. Rehearse the chat keyword once, in game.**
+
+Start the exhibition for real, join under the pinned name, and type `reset` in
+chat. You are looking for one line back:
+
+```
+<learner_bot> reset armed - next match starting
+```
+
+Worth the two minutes. Everything else in this guide is covered by automated
+tests, but "the bot receives a player's chat line" can only be proved against a
+live server — mineflayer's chat plugin has silently gone dead on this Minecraft
+version before (the `rl_deaths` scoreboard workaround exists for exactly that
+reason). Confirm it tonight and the keyword is a known quantity tomorrow. If the
+line never comes, nothing is broken for the demo itself: fall back to
+`.venv/bin/python -m deploy.exhibition --reset` from a second terminal.
 
 ---
 
@@ -167,18 +185,56 @@ and **no auto-restart** after a death. The launcher prints the result and waits:
 
 ### 4. Arm the next challenger
 
-From a **second terminal**, in the repo:
+**Type this in Minecraft chat:**
+
+```
+reset
+```
+
+Press `T`, type `reset`, press Enter. `!reset` works too, and case does not
+matter (`RESET` is fine). The bot answers in chat:
+
+```
+<learner_bot> reset armed - next match starting
+```
+
+If you do not see that reply, nothing was armed. Type it again.
+
+**Anyone can type it** — the challenger, the next person in the queue, a
+spectator. There is no permission check, on purpose: the whole point is that
+nobody has to reach a keyboard outside the game.
+
+Two rules that surprise people:
+
+- **It must be the whole message.** "how do I reset?" does nothing. That is
+  deliberate: a chat line that merely *contains* the word must not end a live
+  match.
+- **Type it after the match ends**, not during. A request filed mid-match is
+  discarded when that match ends (see the rules below), and you would have to
+  type it again. Wait for `match finished` in the launcher terminal, or simply
+  for the fight to be over.
+
+Typing it several times in a row is harmless — a 5-second cooldown collapses a
+burst (four people typing it at once, or one person impatient) into exactly one
+reset and one reply.
+
+**The terminal command is the fallback**, and does exactly the same thing. From
+a second terminal, in the repo:
 
 ```bash
 .venv/bin/python -m deploy.exhibition --reset
 ```
 
-This starts nothing and never connects to the bridge. It writes a one-shot
-request file at `server/logs/exhibition/reset.request`, which the running
-launcher picks up within about a second. The launcher then heals, repositions
-and re-arms the human through Paper's console, resets the learner (the datapack
-re-arms that side), releases the challenger slot, and plays **exactly one more
-match**.
+Use it when nobody is in game yet, or when chat is not cooperating. It starts
+nothing and never connects to the bridge.
+
+**Both triggers are one mechanism.** Each writes the same one-shot request file
+at `server/logs/exhibition/reset.request`, which the running launcher picks up
+within about a second — the chat keyword makes the *bridge* write it, since the
+bridge is already in game. The launcher then heals, repositions and re-arms the
+human through Paper's console, resets the learner (the datapack re-arms that
+side), releases the challenger slot, and plays **exactly one more match**. It
+cannot tell which trigger fired.
 
 **The next person joins under the same pinned username.** The pin is baked into
 the bridge's command line for the life of the launcher, and `--reset` refuses to
@@ -194,10 +250,14 @@ Rules worth knowing before you are standing in front of people:
   everything else was decided when the launcher started. Changing the pinned
   challenger means restarting the exhibition.
 - A reset filed **while a match is still running** is discarded when that match
-  ends, loudly, and you run it again. A death must never be what restarts the
-  match.
+  ends, loudly, and you trigger it again. A death must never be what restarts
+  the match. This applies to the chat keyword exactly as it does to `--reset`.
 - If you pass a non-default `--log-dir` to the launcher, pass the same one to
-  `--reset`. The launcher prints the exact command to use.
+  `--reset`. The launcher prints the exact command to use. The chat keyword
+  needs nothing: the launcher hands the bridge the path it is polling.
+- The chat keyword is **exhibition-only**. Training runs the bridge in bot
+  opponent mode, where the keyword is ignored outright, so a stray `reset` typed
+  into a training server cannot perturb a run.
 
 ### 5. Shut down
 
@@ -251,14 +311,17 @@ That check plus one real kill covers the whole death-detection path.
 | Paper reports Done and then dies ~20 s later | Wrong Java. See [The night before](#the-night-before). |
 | Challenger joined but the agent ignores them | Name mismatch against `--challenger-username`. Offline-mode names are case-sensitive and exact. Restart the exhibition with the right name. |
 | Match will not end | Correct. There is no timeout against a human. Somebody has to die. |
+| Typing `reset` in chat gets no reply | Check it was the whole message and nothing else — "reset?" and "reset now" do not count. If a plain `reset` still gets nothing, `server/logs/exhibition/bridge.log` says `in-game chat reset armed:` at startup when the feature is on; use `.venv/bin/python -m deploy.exhibition --reset` and carry on. |
+| The reply came but the match did not restart | The request was filed while the previous match was still running, so it was discarded when that match ended (the launcher terminal says so). Type `reset` again now that it has. |
 
 ---
 
 ## Gear: one iron sword each
 
 **Both fighters carry exactly one iron sword and no armor.** The agent's comes
-from the datapack, every reset. The challenger's comes from `--reset`, which
-sends two more lines through Paper's console:
+from the datapack, every reset. The challenger's comes from the reset itself —
+whichever way it was triggered — which sends two more lines through Paper's
+console:
 
 ```
 clear <their_mc_name> minecraft:iron_sword
@@ -281,7 +344,7 @@ the launcher who claimed the slot, so an unpinned exhibition prints a warning at
 reset time and arms nobody — the same reason [step 2](#2-get-the-challenger-in)
 wants the pin.
 
-**Match 1 of a launch is not armed.** The launcher arms on `--reset`, and match
+**Match 1 of a launch is not armed.** The launcher arms on a reset, and match
 1 starts the moment the agent connects, before anybody has joined — arming a
 name nobody is holding would only print `No player was found`. A reset filed
 while match 1 is still running is discarded on purpose, so it cannot be used to
@@ -301,9 +364,9 @@ still there when the exhibition starts and survives every death after that.
 There is still no way to hand out gear **live**. During an exhibition Paper's
 console stdin belongs to the launcher process, and `server/ops.json` is
 rewritten to exactly `learner_bot` and `dummy_bot` before Paper boots, so no
-human account can be opped and nobody in the world can run a command. `--reset`
-is the only gear channel once the exhibition is up, which is exactly why it arms
-on every single one.
+human account can be opped and nobody in the world can run a command. A reset is
+the only gear channel once the exhibition is up, which is exactly why it arms on
+every single one.
 
 ---
 

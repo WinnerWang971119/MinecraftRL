@@ -596,6 +596,7 @@ class TestBuildBridgeArgv:
             learner_username=learner,
             dummy_username=dummy,
             challenger_username=None,
+            reset_request_path=Path("/repo/server/logs/exhibition/reset.request"),
         )
         kwargs.update(overrides)
         return kwargs
@@ -633,6 +634,17 @@ class TestBuildBridgeArgv:
     def test_pure_no_side_effects_and_deterministic(self):
         kwargs = self._base_kwargs(challenger_username="Bob")
         assert build_bridge_argv(**kwargs) == build_bridge_argv(**kwargs)
+
+    def test_carries_the_reset_request_path_so_chat_can_arm_a_match(self):
+        # The in-game keyword is the demo-day path: with no --reset-request-path
+        # the bridge leaves resetRequestPath at null and every `reset` typed in
+        # chat is silently ignored, which looks exactly like a broken feature
+        # from inside the game.
+        request_path = Path("/some/log/dir/reset.request")
+        argv = build_bridge_argv(**self._base_kwargs(reset_request_path=request_path))
+
+        assert "--reset-request-path" in argv
+        assert argv[argv.index("--reset-request-path") + 1] == str(request_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1312,11 @@ class ExhibitionRun:
         self.ops_writes = []
         self.procs = {}
         self.spawn_kwargs = {}
+        #: The exact argv each child was spawned with, by label. The bridge's
+        #: is the only place the launcher states what it told the bridge, so it
+        #: is the only place a test can prove the two agree about the reset
+        #: request file.
+        self.spawn_argv = {}
         self.envs = []
         self.transports = []
         self.policy = None
@@ -1336,6 +1353,7 @@ def drive_exhibition(
     on_step=None,
     opponent_visible=None,
     stop_with="ctrl-c",
+    log_dir=None,
 ):
     """Drive the REAL ``run()`` through a complete exhibition and record it.
 
@@ -1365,6 +1383,13 @@ def drive_exhibition(
     out of view for specific decisions, exactly as a human circling behind the
     agent would.
 
+    ``log_dir`` overrides the launcher's ``--log-dir``. It exists for one case:
+    passing a RELATIVE directory (with the test's cwd moved into ``tmp_path``),
+    which is the only way to observe that the launcher hands the bridge an
+    ABSOLUTE request path. The bridge is spawned with a different working
+    directory than the launcher keeps, so a relative one would have the two
+    name the same string and open two different files.
+
     ``stop_with`` picks which of the two stop signals ends the exhibition once
     the scripted resets are used up: ``"ctrl-c"`` (the default, and every test
     that predates W2) raises ``KeyboardInterrupt`` from the idle wait, while
@@ -1377,7 +1402,7 @@ def drive_exhibition(
     result = ExhibitionRun()
     record = result.events.append
     ports = {"mc": False, "bridge": False}
-    log_dir = tmp_path / "logs"
+    log_dir = (tmp_path / "logs") if log_dir is None else Path(log_dir)
     result.request_path = reset_request_path(log_dir)
 
     def port_probe(host, port):
@@ -1393,6 +1418,7 @@ def drive_exhibition(
         ports["mc" if label == "paper" else "bridge"] = True
         record(("spawn", label))
         result.spawn_kwargs[label] = kwargs
+        result.spawn_argv[label] = list(cmd)
         # Popen only exposes a .stdin stream when the caller asked for a PIPE.
         console = (
             FakeConsole(fail=console_fails, record=record)
@@ -2017,6 +2043,21 @@ class TestResetRequestFile:
     def test_the_hint_stays_short_for_the_default_log_dir(self):
         assert reset_command_hint(DEFAULT_LOG_DIR) == "python -m deploy.exhibition --reset"
 
+    def test_a_relative_log_dir_still_derives_an_absolute_path(self, tmp_path, monkeypatch):
+        # THE THIRD READER IS WHY THIS MATTERS. The bridge writes this same file
+        # when a player types `reset` in chat, and run() spawns it with
+        # cwd=REPO_ROOT while the launcher keeps the operator's directory. A
+        # relative path would have the two resolve DIFFERENT files while
+        # agreeing character-for-character about the string -- an in-game reset
+        # that answers "reset armed" in chat and then never happens, with
+        # nothing in either log.
+        monkeypatch.chdir(tmp_path)
+
+        path = reset_request_path(Path("logs/exhibition"))
+
+        assert path.is_absolute()
+        assert path == tmp_path / "logs/exhibition" / RESET_REQUEST_FILENAME
+
 
 # ---------------------------------------------------------------------------
 # `--reset`, driven through the real run() — it files a request and starts
@@ -2393,6 +2434,83 @@ class TestResetRedrivesPlay:
         result = drive_exhibition(tmp_path, monkeypatch, resets=0)
 
         assert result.console_lines == []
+
+
+# ---------------------------------------------------------------------------
+# The IN-GAME trigger's launcher half: a player types `reset` in Minecraft
+# chat, the bridge files the request, and the poll above honors it. All this
+# side has to get right is telling the bridge WHICH file -- so that is what is
+# pinned here. The bridge half (keyword matching, own-bot filter, debounce,
+# the exhibition gate) is bridge/bot.test.js.
+# ---------------------------------------------------------------------------
+
+
+class TestInGameChatResetPath:
+    def test_the_bridge_is_told_the_path_and_it_is_the_one_the_launcher_polls(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2, resets=1)
+
+        argv = result.spawn_argv["bridge"]
+        assert "--reset-request-path" in argv
+        handed_to_the_bridge = argv[argv.index("--reset-request-path") + 1]
+
+        # THE WHOLE ASSERTION. `result.request_path` is what this launcher
+        # drains at startup and waits on between matches (proved consumed by
+        # TestResetRedrivesPlay above), so equality here is what makes a
+        # chat-triggered request land in the file that is actually being
+        # watched. Two derivations of "the request file" that agreed today and
+        # drifted tomorrow would produce a keyword that confirms in chat and
+        # arms nothing.
+        assert handed_to_the_bridge == str(result.request_path)
+
+    def test_a_relative_log_dir_still_hands_the_bridge_an_absolute_path(
+        self, tmp_path, monkeypatch
+    ):
+        # THE DIVERGENCE THIS EXISTS TO CATCH, end to end through run(). The
+        # bridge is spawned with cwd=REPO_ROOT while the launcher keeps the
+        # operator's own directory, so a `--log-dir logs` that reached the
+        # bridge as the relative string "logs/reset.request" would have the two
+        # processes open two different files while agreeing exactly about the
+        # text: the keyword would answer "reset armed" in chat and nothing
+        # would ever happen, with nothing in either log.
+        #
+        # This is also the ONLY shape of this test that can tell a launcher
+        # REUSING its polled path from one deriving a second copy. With an
+        # absolute --log-dir the two derivations agree by accident, so a second
+        # implementation free to drift would pass unnoticed.
+        monkeypatch.chdir(tmp_path)
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=2, log_dir=Path("logs/exhibition")
+        )
+
+        argv = result.spawn_argv["bridge"]
+        handed_to_the_bridge = argv[argv.index("--reset-request-path") + 1]
+
+        assert Path(handed_to_the_bridge).is_absolute()
+        assert handed_to_the_bridge == str(result.request_path)
+        assert handed_to_the_bridge == str(tmp_path / "logs/exhibition/reset.request")
+
+    def test_the_bridge_is_told_before_it_is_started(self, tmp_path, monkeypatch):
+        # The flag is argv, so it can only be decided before the spawn -- there
+        # is no channel to tell a running bridge about it afterwards (the wire
+        # has no slot for one and a second TCP client would evict the agent).
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2)
+
+        assert ("spawn", "bridge") in result.events
+        assert "--reset-request-path" in result.spawn_argv["bridge"]
+
+    def test_the_operator_is_told_players_can_type_reset(self, tmp_path, monkeypatch):
+        # The between-matches line is the only place the launcher says how to
+        # arm the next challenger, and after a match it is what the operator is
+        # reading. It has to name the in-game keyword, or the feature exists and
+        # nobody in the room knows it.
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2)
+
+        text = result.text()
+        assert "type `reset` in Minecraft chat" in text
+        # The terminal command stays documented as the fallback.
+        assert "python -m deploy.exhibition --reset" in text
 
     def test_an_unpinned_challenger_still_plays_but_says_what_it_cannot_do(
         self, tmp_path, monkeypatch

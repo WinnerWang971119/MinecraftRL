@@ -552,7 +552,20 @@ connects the agent playing greedily from `runs/m2_multi.pt`. Foreground for the 
 exhibition. Every gate runs **before** anything is spawned, so a refusal leaves
 nothing running.
 
-Arm the next challenger from a second terminal:
+Arm the next challenger **from inside Minecraft** — press `T`, type `reset`, Enter:
+
+```
+reset
+```
+
+`!reset` also works, case is ignored, and the message must be exactly that (a line
+merely containing the word does nothing). The bot replies `reset armed - next match
+starting` in chat; no reply means nothing was armed. Anyone may type it, there is no
+permission check, and a burst of them inside 5 seconds collapses into one reset. This
+is the primary path on demo day: with a queue of people waiting, alt-tabbing to a
+terminal between matches is not workable.
+
+The terminal command is the fallback and does exactly the same thing:
 
 ```bash
 .venv/bin/python -m deploy.exhibition --reset
@@ -562,6 +575,14 @@ It starts nothing and never connects to the bridge. It files
 `server/logs/exhibition/reset.request`, which the running launcher consumes within
 about a second. Exit codes: `0` armed, `1` refused. The launcher itself exits `130` on
 Ctrl-C and `1` on any refusal or boot failure.
+
+**One mechanism, two triggers.** The chat keyword makes the BRIDGE write that same
+request file — it is already in game and already reading chat, so it needs no terminal
+and opens no socket. `deploy.exhibition` passes it the path with `--reset-request-path`,
+the same one the launcher polls, so the two cannot disagree about where the file lives.
+Everything downstream (the heal, the re-arm, one-trigger-one-match, and the discard of
+a request filed mid-match) is identical and cannot tell which trigger fired. The keyword
+is gated on `--opponent-mode human`, so training bridges ignore it outright.
 
 **Do not try to reset by connecting a second client.** `BridgeServer` accepts exactly
 one TCP client and resolves a second connection by destroying the incumbent, so a
@@ -578,8 +599,8 @@ Things that bite, all of them documented at length in the demo-day guide:
   fighters get exactly one iron sword: the learner from the datapack, the human from
   the launcher's reset commands (a `clear` scoped to `minecraft:iron_sword`, then a
   `give`, so repeated resets never pile up duplicates). Neither side gets armor.
-  **Match 1 of a launch is the exception** — `--reset` is what arms the human, and it
-  has not run yet, so the first challenger needs gear handed out before the
+  **Match 1 of a launch is the exception** — a reset is what arms the human, and none
+  has happened yet, so the first challenger needs gear handed out before the
   exhibition starts. There is no live command channel once it is running (Paper's
   stdin belongs to the launcher, and `ops.json` is rewritten to the two bots before
   Paper boots).

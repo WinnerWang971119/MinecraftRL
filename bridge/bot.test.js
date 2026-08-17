@@ -55,6 +55,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const {
@@ -82,6 +83,10 @@ const {
   ATTRIBUTE_GET_TRANSLATE_KEY,
   KNOCKBACK_RESISTANCE_NAME_KEY,
   MOVEMENT_SPEED_NAME_KEY,
+  CHAT_RESET_CONFIRMATION,
+  CHAT_RESET_DEBOUNCE_MS,
+  matchesChatResetKeyword,
+  formatChatResetRequest,
 } = require('./bot');
 // The REAL executor and the REAL weapon period drive the cooldown tests below:
 // MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
@@ -3662,4 +3667,361 @@ test('the inline action guard it replaced still behaves the same: bad action, on
   assert.equal(errors.length, 1);
   assert.match(errors[0].message, /action/);
   assert.equal(socket.written.length, 0);
+});
+
+// ===========================================================================
+// THE IN-GAME CHAT RESET — demo day's "no alt-tab" trigger.
+//
+// A player types `reset` in Minecraft chat and the bridge files the SAME
+// request file `python -m deploy.exhibition --reset` files; the launcher's
+// existing poll does the rest. Nothing here resets anything — that is
+// deliberate, and it is why these tests assert on ONE file write and one line
+// of chat rather than on arena state.
+//
+// FOUR BEHAVIORS ARE LOAD-BEARING AND EACH HAS ITS OWN TEST, because each one
+// fails in a way an operator standing in front of a room cannot debug:
+//   - the EXHIBITION GATE. Training is 25 pads in one JVM all hearing the same
+//     chat; a stray keyword must never perturb a run.
+//   - the OWN-BOT FILTER. The server echoes chat back to the sender, so the
+//     bridge hears its own confirmation on the same channel it triggers from.
+//   - WHOLE-MESSAGE matching. "how do I reset?" must not end a live match.
+//   - the DEBOUNCE. A queue of people all typing `reset` at once is one match,
+//     not five.
+//
+// MOCK FIDELITY: the file writes here are REAL, into a real temp dir, through
+// the real fs. The write is the entire mechanism, and a stubbed fs would prove
+// only that a stub was called. The failure case uses a real ENOENT (a path
+// under a directory that does not exist) for the same reason.
+// ===========================================================================
+
+/**
+ * A temp dir that cleans itself up when the process exits.
+ *
+ * ONE `exit` listener for all of them, not one each: node warns about a
+ * possible leak past ten listeners on the same emitter, and a suite that prints
+ * a MaxListenersExceededWarning teaches everyone to ignore its warnings.
+ */
+const TEMP_LOG_DIRS = [];
+process.on('exit', () => {
+  for (const dir of TEMP_LOG_DIRS) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function tempLogDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-chat-reset-'));
+  TEMP_LOG_DIRS.push(dir);
+  return dir;
+}
+
+/** A clock the debounce tests can move without spending wall-clock in it. */
+function fakeClock(start = 1_700_000_000_000) {
+  const state = { ms: start };
+  return {
+    now: () => state.ms,
+    advance(ms) {
+      state.ms += ms;
+    },
+  };
+}
+
+/**
+ * An arena wired exactly as connect() wires one, with a chat-capable learner.
+ *
+ * The usernames are DELIBERATELY not `learner_bot`/`dummy_bot`: the own-bot
+ * filter has to compare against the resolved, configured names (pad 4 runs
+ * `learner_4`, and the exhibition can rename either), so a fixture using the
+ * defaults would let a filter hard-coded to the literals pass.
+ */
+function chatArena({
+  requestPath = null,
+  opponentMode = OPPONENT_MODE_HUMAN,
+  now = Date.now,
+  chat,
+} = {}) {
+  const arena = new ArenaBots(
+    {
+      opponentMode,
+      resetRequestPath: requestPath,
+      learnerUsername: 'learner_9',
+      dummyUsername: 'dummy_9',
+    },
+    { transport: { send: () => {} }, nowMs: now },
+  );
+  arena.learner = liveBot('learner_9', { chat });
+  // 'bot' mode is the training path, and there the dummy really is connected.
+  if (opponentMode !== OPPONENT_MODE_HUMAN) {
+    arena.dummy = liveBot('dummy_9');
+  }
+  arena.wireDamageEvents();
+  return arena;
+}
+
+/**
+ * One player says one line, with console.error captured.
+ *
+ * Captured rather than silenced: "it was logged" is half of what a
+ * filesystem failure must do (the other half is not taking the bridge down),
+ * and the capture keeps the suite's own output readable.
+ *
+ * @returns {string[]} Whatever the handler logged.
+ */
+function say(arena, username, message) {
+  const logged = [];
+  const realError = console.error;
+  console.error = (...args) => logged.push(args.map((a) => String(a)).join(' '));
+  try {
+    arena.learner.emit('chat', username, message);
+  } finally {
+    console.error = realError;
+  }
+  return logged;
+}
+
+test('the keyword is the WHOLE message: `reset` and `!reset`, any case, trimmed', () => {
+  for (const typed of ['reset', '!reset', 'RESET', '!ReSeT', '  reset  ', '\treset\n', ' !RESET ']) {
+    assert.equal(matchesChatResetKeyword(typed), true, `${JSON.stringify(typed)} must trigger`);
+  }
+
+  // THE DANGEROUS DIRECTION. Chat during a demo is full of sentences with the
+  // word in them, and a substring match would end a live match mid-fight on
+  // any of these.
+  for (const typed of [
+    'how do I reset?',
+    'can we reset after this one',
+    'reset now',
+    'please reset',
+    'resets',
+    'preset',
+    '!resetting',
+    '/reset',
+    '',
+    '   ',
+  ]) {
+    assert.equal(matchesChatResetKeyword(typed), false, `${JSON.stringify(typed)} must NOT trigger`);
+  }
+
+  // Nothing that is not a string is a keyword — the handler is fed whatever
+  // the chat plugin's regex produced.
+  for (const junk of [null, undefined, 42, {}, ['reset']]) {
+    assert.equal(matchesChatResetKeyword(junk), false);
+  }
+});
+
+test('the confirmation the bridge says back is not itself a keyword', () => {
+  // The server echoes chat to the sender, so the confirmation returns on the
+  // very channel that triggers a reset. The own-bot filter is what stops the
+  // loop; this is the second lock on the same door.
+  assert.equal(matchesChatResetKeyword(CHAT_RESET_CONFIRMATION), false);
+});
+
+test('a player typing `reset` files the request and is told so in game', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const clock = fakeClock();
+  const arena = chatArena({ requestPath, now: clock.now });
+
+  const logged = say(arena, 'classmate_1', 'reset');
+
+  // THE MECHANISM: the file the launcher polls, at the path it was given.
+  assert.equal(fs.existsSync(requestPath), true, 'the reset request must be on disk');
+  assert.equal(
+    fs.readFileSync(requestPath, 'utf8'),
+    formatChatResetRequest('classmate_1', new Date(clock.now()).toISOString()),
+  );
+  // THE UX: a silent trigger gets typed five more times by someone who cannot
+  // see a terminal.
+  assert.deepEqual(arena.learner.chatLog, [CHAT_RESET_CONFIRMATION]);
+  assert.equal(
+    logged.some((line) => line.includes('classmate_1') && line.includes(requestPath)),
+    true,
+    'bridge.log must name who armed it and where',
+  );
+});
+
+test('`!reset`, odd casing and stray whitespace all arm it too', () => {
+  for (const typed of ['!reset', 'RESET', '  !ReSeT  ']) {
+    const requestPath = path.join(tempLogDir(), 'reset.request');
+    const arena = chatArena({ requestPath });
+
+    say(arena, 'classmate_1', typed);
+
+    assert.equal(fs.existsSync(requestPath), true, `${JSON.stringify(typed)} must arm a reset`);
+  }
+});
+
+test('a sentence that merely contains the word arms nothing', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const arena = chatArena({ requestPath });
+
+  say(arena, 'classmate_1', 'how do I reset?');
+  say(arena, 'classmate_1', 'reset now');
+
+  assert.equal(fs.existsSync(requestPath), false, 'a live match must not end on a question');
+  assert.deepEqual(arena.learner.chatLog, []);
+});
+
+test('our own bots are not players: their chat is ignored, by resolved name', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const arena = chatArena({ requestPath });
+
+  // Both of THIS pad's bots, under their configured names — not the
+  // learner_bot/dummy_bot literals. A bot reacting to its own line would loop.
+  say(arena, 'learner_9', 'reset');
+  say(arena, 'dummy_9', 'reset');
+
+  assert.equal(fs.existsSync(requestPath), false, 'own-bot chat must never arm a reset');
+  assert.deepEqual(arena.learner.chatLog, []);
+
+  // ...and a real person is still heard on the same channel.
+  say(arena, 'classmate_1', 'reset');
+  assert.equal(fs.existsSync(requestPath), true);
+});
+
+test('a burst from a queue of classmates arms exactly ONE reset', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const clock = fakeClock();
+  const arena = chatArena({ requestPath, now: clock.now });
+
+  say(arena, 'classmate_1', 'reset');
+  const armedAt = fs.readFileSync(requestPath, 'utf8');
+
+  // Four more people (and one of them twice) inside the cooldown.
+  clock.advance(200);
+  say(arena, 'classmate_2', 'reset');
+  clock.advance(900);
+  say(arena, 'classmate_3', '!reset');
+  clock.advance(1500);
+  say(arena, 'classmate_3', 'reset');
+  clock.advance(CHAT_RESET_DEBOUNCE_MS - 2601); // still inside the window
+  say(arena, 'classmate_4', 'RESET');
+
+  // One file (untouched since the first write) and ONE line of chat: a burst
+  // of confirmations is spam in front of a room, and a burst of writes would
+  // race the launcher's consume.
+  assert.equal(fs.readFileSync(requestPath, 'utf8'), armedAt);
+  assert.deepEqual(arena.learner.chatLog, [CHAT_RESET_CONFIRMATION]);
+});
+
+test('the cooldown expires, so the NEXT challenger can arm their own match', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const clock = fakeClock();
+  const arena = chatArena({ requestPath, now: clock.now });
+
+  say(arena, 'classmate_1', 'reset');
+  fs.unlinkSync(requestPath); // the launcher consumed it and played a match
+
+  clock.advance(CHAT_RESET_DEBOUNCE_MS);
+
+  say(arena, 'classmate_2', 'reset');
+
+  // A debounce that never released would give an evening exactly one reset.
+  assert.equal(fs.existsSync(requestPath), true);
+  assert.deepEqual(arena.learner.chatLog, [CHAT_RESET_CONFIRMATION, CHAT_RESET_CONFIRMATION]);
+});
+
+test('TRAINING IS INERT: in `bot` opponent mode the keyword does nothing', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  // A path is configured — the gate under test is the OPPONENT MODE, not the
+  // absence of a path. 25 training arenas all read chat, and a classmate who
+  // wanders onto the training server must not perturb an overnight run.
+  const arena = chatArena({ requestPath, opponentMode: 'bot' });
+
+  say(arena, 'classmate_1', 'reset');
+  say(arena, 'classmate_1', '!reset');
+
+  assert.equal(fs.existsSync(requestPath), false, 'a training run must not see a reset request');
+  assert.deepEqual(arena.learner.chatLog, []);
+});
+
+test('with no request path configured the feature does not exist', () => {
+  const arena = chatArena({ requestPath: null });
+
+  assert.equal(arena.resetRequestPath, null);
+  // Nothing to write to, so nothing is written and nothing is promised.
+  assert.doesNotThrow(() => say(arena, 'classmate_1', 'reset'));
+  assert.deepEqual(arena.learner.chatLog, []);
+});
+
+test('a write failure is logged, says nothing in chat, and never escapes', () => {
+  // A REAL ENOENT: the parent directory does not exist. The bridge is serving
+  // the RL wire and an exception out of a mineflayer listener is process-fatal
+  // here, so this must cost the reset and nothing else.
+  const requestPath = path.join(tempLogDir(), 'no', 'such', 'dir', 'reset.request');
+  const clock = fakeClock();
+  const arena = chatArena({ requestPath, now: clock.now });
+
+  let logged;
+  assert.doesNotThrow(() => {
+    logged = say(arena, 'classmate_1', 'reset');
+  });
+
+  assert.equal(fs.existsSync(requestPath), false);
+  assert.equal(
+    logged.some((line) => line.includes('could not file the request')),
+    true,
+    'a filesystem failure must be loud in bridge.log',
+  );
+  // NO "reset armed" for a request that was never filed — the one lie this
+  // handler must not tell.
+  assert.deepEqual(arena.learner.chatLog, []);
+  // ...and the failure did not arm the cooldown, so the next attempt is fresh
+  // rather than swallowed for 5 s on the strength of a write that never was.
+  assert.equal(arena._lastChatResetMs, null);
+});
+
+test('a throwing bot.chat() cannot take the bridge down after the request is filed', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const arena = chatArena({
+    requestPath,
+    chat: () => {
+      throw new Error('client disconnected');
+    },
+  });
+
+  assert.doesNotThrow(() => say(arena, 'classmate_1', 'reset'));
+
+  // The reset is what matters and it is already on disk; the confirmation is
+  // cosmetic. Losing the bridge here would end the exhibition.
+  assert.equal(fs.existsSync(requestPath), true);
+});
+
+test('a rejected bot.chat() promise is caught, not left to kill the process', async () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const arena = chatArena({
+    requestPath,
+    chat: () => Promise.reject(new Error('chat rejected')),
+  });
+
+  const rejections = [];
+  const onUnhandled = (reason) => rejections.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    say(arena, 'classmate_1', 'reset');
+    // Unhandled rejections are reported a turn later, so let the microtask
+    // queue drain before asserting there were none.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+
+  assert.deepEqual(rejections, [], 'a fire-and-forget bot promise is process-fatal here');
+  assert.equal(fs.existsSync(requestPath), true);
+});
+
+test('re-wiring does not double-register the chat handler', () => {
+  const requestPath = path.join(tempLogDir(), 'reset.request');
+  const clock = fakeClock();
+  const arena = chatArena({ requestPath, now: clock.now });
+
+  // A reconnect re-wires. The handler must be removed from where it was added
+  // (W1a), or a relaunched bridge answers one keyword twice and files two
+  // requests — the second of which would arm a match nobody asked for.
+  arena.wireDamageEvents();
+  arena.wireDamageEvents();
+
+  assert.equal(arena.learner.listenerCount('chat'), 1);
+
+  say(arena, 'classmate_1', 'reset');
+  assert.deepEqual(arena.learner.chatLog, [CHAT_RESET_CONFIRMATION]);
 });

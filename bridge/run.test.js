@@ -34,6 +34,7 @@ const {
   parseOpponentMode,
   parseChallengerUsername,
   parseBoolean,
+  parseAbsolutePath,
   usernamesForPad,
 } = require('./run');
 
@@ -566,4 +567,93 @@ test('parsePadOrigin/parsePadIndex/usernamesForPad are exported for the launcher
   assert.equal(parseChallengerUsername('AUTO', '--challenger-username'), 'AUTO');
   assert.equal(parseBoolean('false', '--dummy-knockback-immune'), false);
   assert.equal(parseBoolean(' true ', '--dummy-knockback-immune'), true);
+});
+
+// ===========================================================================
+// IN-GAME CHAT RESET (--reset-request-path). deploy/exhibition.py hands the
+// bridge the path of the reset request file its launcher polls, so a player
+// typing `reset` in Minecraft chat files exactly the request the operator's
+// `--reset` command files from a terminal. Omitting it — which every training
+// launcher does — leaves the feature off.
+// ===========================================================================
+
+test('parseBridgeConfig omits resetRequestPath when it is not given (the training default)', () => {
+  // ABSENT, not null: an omitted key falls through to DEFAULT_BOT_CONFIG's own
+  // `resetRequestPath: null`, which is what keeps the training path untouched.
+  assert.deepEqual(parseBridgeConfig([], {}), {});
+  assert.deepEqual(parseBridgeConfig([], { RESET_REQUEST_PATH: '' }), {});
+});
+
+test('parseBridgeConfig wires --reset-request-path through to ArenaBots', () => {
+  const requestPath = '/repo/server/logs/exhibition/reset.request';
+
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', '--reset-request-path', requestPath], {}),
+    { opponentMode: 'human', resetRequestPath: requestPath },
+  );
+  // The env form and the CLI-wins precedence, matching every other spec.
+  assert.deepEqual(
+    parseBridgeConfig([], { OPPONENT_MODE: 'human', RESET_REQUEST_PATH: requestPath }),
+    { opponentMode: 'human', resetRequestPath: requestPath },
+  );
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', '--reset-request-path', requestPath], {
+      RESET_REQUEST_PATH: '/somewhere/else/reset.request',
+    }),
+    { opponentMode: 'human', resetRequestPath: requestPath },
+  );
+  // Surrounding whitespace is a launcher's formatting, not part of the path.
+  assert.deepEqual(
+    parseBridgeConfig(['--opponent-mode', 'human', `--reset-request-path= ${requestPath} `], {}),
+    { opponentMode: 'human', resetRequestPath: requestPath },
+  );
+});
+
+test('a RELATIVE --reset-request-path is refused: the two processes have different cwds', () => {
+  // THE SILENT FAILURE THIS PREVENTS. exhibition.py spawns the bridge with
+  // cwd=REPO_ROOT while the launcher keeps the operator's own directory, so a
+  // relative path has them name the same string and open two different files:
+  // every chat reset would be filed where nobody is polling, the keyword would
+  // still answer "reset armed" in game, and nothing would ever happen.
+  for (const bad of ['logs/reset.request', './reset.request', '../reset.request', 'reset.request']) {
+    assert.throws(
+      () => parseBridgeConfig(['--opponent-mode', 'human', '--reset-request-path', bad], {}),
+      /--reset-request-path must be an ABSOLUTE path/,
+      `--reset-request-path ${bad} must be rejected`,
+    );
+  }
+  // An all-whitespace value is not a path either.
+  assert.throws(
+    () => parseBridgeConfig(['--opponent-mode', 'human', '--reset-request-path', '   '], {}),
+    /--reset-request-path must be an ABSOLUTE path/,
+  );
+});
+
+test('a reset request path with no --opponent-mode human is refused, not silently ignored', () => {
+  // The chat-reset handler is gated on 'human' mode, so this combination is
+  // INERT: the operator believes the in-game keyword is armed and every `reset`
+  // typed into that server does nothing. It is also the guard that keeps a
+  // fleet launcher from copying one flag too many out of the exhibition's argv
+  // and arming an in-game reset across 25 training arenas.
+  const requestPath = '/repo/server/logs/exhibition/reset.request';
+  assert.throws(
+    () => parseBridgeConfig(['--reset-request-path', requestPath], {}),
+    /requires --opponent-mode human/,
+  );
+  assert.throws(
+    () => parseBridgeConfig(['--opponent-mode', 'bot', '--reset-request-path', requestPath], {}),
+    /requires --opponent-mode human/,
+  );
+  assert.throws(
+    () => parseBridgeConfig([], { RESET_REQUEST_PATH: requestPath }),
+    /requires --opponent-mode human/,
+  );
+});
+
+test('parseAbsolutePath is exported and returns the trimmed path', () => {
+  assert.equal(parseAbsolutePath('/a/b/reset.request', '--reset-request-path'), '/a/b/reset.request');
+  assert.equal(parseAbsolutePath('  /a/b  ', '--reset-request-path'), '/a/b');
+  assert.throws(() => parseAbsolutePath('a/b', '--reset-request-path'), /ABSOLUTE path/);
+  assert.throws(() => parseAbsolutePath('', '--reset-request-path'), /ABSOLUTE path/);
+  assert.throws(() => parseAbsolutePath(7, '--reset-request-path'), /ABSOLUTE path/);
 });
