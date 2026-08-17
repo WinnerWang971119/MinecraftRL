@@ -78,10 +78,13 @@ accepts exactly ONE TCP client and a second connect DESTROYS the first, so a
 in-process triggers, a file beats the alternatives on this machine: a signal
 needs a pidfile, and a stale pidfile whose pid has been REUSED aims SIGUSR1 at
 an unrelated process (macOS has no ``/proc`` to validate it against); a signal
-handler is also asynchronous, and this module's teardown chain is carefully
-``BaseException``-proof for exactly one such interruption (Ctrl-C) — adding a
-second class of async delivery into it buys nothing here. stdin would tie the
-launcher to an interactive terminal it does not otherwise need. A file also
+handler is also asynchronous, and the only async deliveries this module accepts
+are the two that mean STOP — Ctrl-C and SIGTERM (see TEARDOWN below) — each of
+which unwinds straight out through the teardown chain and ends the process. A
+reset has to RESUME afterwards, so routing one through a signal would need the
+chain to survive an interruption it then continues past, which is a different
+and much weaker guarantee than the one that chain actually makes. stdin would
+tie the launcher to an interactive terminal it does not otherwise need. A file also
 gives the exact semantics the user asked for — "one command, one trigger" —
 because a duplicate ``--reset`` collapses onto the same single file rather than
 queueing a second match.
@@ -115,14 +118,25 @@ write failure is reported with the commands that did not run, and
 the slot, so an unpinned exhibition gets a warning at reset time instead of a
 heal.
 
-TEARDOWN IS ``BaseException``-PROOF, not ``Exception``-proof. Ctrl-C is the
-normal way an exhibition ends, so the teardown chain runs with an operator's
-finger still on the key: a SECOND Ctrl-C lands inside the first one's grace
-wait, and ``KeyboardInterrupt`` derives from ``BaseException``. Every helper
-the ``finally`` chain calls absorbs it, and the chain itself is nested so each
-link still runs when the one before it raises — otherwise a double-tap orphans
-the Paper JVM on port 25565 and the NEXT launch refuses on its own mc-port
-gate.
+TEARDOWN IS ``BaseException``-PROOF, not ``Exception``-proof, AND IT IS WHERE
+BOTH STOP SIGNALS LAND. Ctrl-C is the normal way an exhibition ends, so the
+teardown chain runs with an operator's finger still on the key: a SECOND Ctrl-C
+lands inside the first one's grace wait, and ``KeyboardInterrupt`` derives from
+``BaseException``. Every helper the ``finally`` chain calls absorbs it, and the
+chain itself is nested so each link still runs when the one before it raises —
+otherwise a double-tap orphans the Paper JVM on port 25565 and the NEXT launch
+refuses on its own mc-port gate.
+``kill <pid>`` is the OTHER way an exhibition ends, and it is the one that had
+to be taught: SIGTERM's default disposition tears this process down instantly
+with no ``finally`` chain at all, so both children outlive their supervisor and
+the orphaned JVM keeps the Minecraft port bound — the next launch then refuses
+on that gate with nothing visibly running. :func:`install_sigterm_handler`
+gives SIGTERM a handler that does nothing but raise
+:class:`ExhibitionTerminated` (a ``BaseException``, for exactly the reason
+``KeyboardInterrupt`` is one), so a ``kill`` unwinds through the same chain and
+returns 143 (128 + 15) rather than Ctrl-C's 130. The handler stays installed
+for the whole teardown, so a second ``kill`` is absorbed by the same helpers
+that absorb a second Ctrl-C.
 
 Every side-effecting step (spawning a process, probing a port, sleeping) is
 behind an injectable seam so :mod:`tests.test_exhibition` can drive the real
@@ -150,6 +164,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -164,11 +179,13 @@ from env.observation_spec import Obs
 
 __all__ = [
     "ExhibitionLaunchError",
+    "ExhibitionTerminated",
     "CheckpointError",
     "build_bridge_argv",
     "drain_reset_request",
     "find_toolchain_problems",
     "human_reset_commands",
+    "install_sigterm_handler",
     "is_port_free",
     "load_greedy_policy",
     "play_one_match",
@@ -289,6 +306,34 @@ class CheckpointError(ExhibitionLaunchError):
     """Checkpoint missing or unloadable. `run()` never catches this to retry —
     the whole point is to refuse loudly instead of falling back to a
     randomly-initialized agent."""
+
+
+class ExhibitionTerminated(BaseException):
+    """SIGTERM was delivered; :func:`run` must tear down and exit.
+
+    Derives from ``BaseException``, not ``Exception``, for the same reason
+    ``KeyboardInterrupt`` does: it is raised ASYNCHRONOUSLY out of a signal
+    handler, at whatever line the main thread happens to be on. An ``Exception``
+    subclass would be caught by the blanket ``except Exception`` :func:`run`
+    uses to keep a mid-match fault off the projector — and by any other blanket
+    handler between the raise and there — so a ``kill`` would print "fatal
+    error" and, worse, could be swallowed entirely by library code that catches
+    broadly around its own I/O. Being a ``BaseException`` also puts it in the
+    SAME teardown the Ctrl-C path uses: every helper that chain calls already
+    absorbs ``BaseException`` precisely so an async interrupt cannot strand a
+    child (module docstring, TEARDOWN).
+
+    Not an :class:`ExhibitionLaunchError`: nothing refused and nothing failed —
+    the operator asked this process to stop.
+    """
+
+
+#: Exit code for a launcher stopped by SIGTERM: 128 + 15, the shell convention,
+#: and deliberately NOT the 130 (128 + 2) that Ctrl-C returns. They are two
+#: different events — a person at the console versus `kill` from a script or
+#: whatever supervises this process — and an operator reading a wrapper's log
+#: after a demo must be able to tell them apart.
+SIGTERM_EXIT_CODE = 143
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +929,101 @@ def _close_paper_console(proc: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SIGTERM — the other way an exhibition is stopped (see the module docstring's
+# TEARDOWN section). Ctrl-C already reaches the teardown chain because CPython
+# installs its own SIGINT handler; SIGTERM has to be given one.
+# ---------------------------------------------------------------------------
+
+
+def _sigterm_handler(signum: int, _frame: Any) -> None:
+    """Turn SIGTERM into :class:`ExhibitionTerminated`, and do NOTHING else.
+
+    A signal handler runs in the main thread between two bytecodes, with the
+    interpreter left in whatever state the interrupted line was mid-way
+    through — possibly a ``write`` on the very console pipe the teardown is
+    about to close, possibly ``subprocess``'s own bookkeeping for a child it is
+    about to stop. So this stops the children by RAISING, which unwinds into
+    :func:`run`'s existing ``finally`` chain and lets the normal path do the
+    work: no process control, no I/O and no logging happen in here.
+    """
+    raise ExhibitionTerminated(f"terminated by SIGTERM (signal {signum})")
+
+
+def install_sigterm_handler(
+    *, log: Callable[[str], None] = _ascii_log
+) -> Optional[Callable[[], None]]:
+    """Route SIGTERM into :func:`run`'s teardown. Returns a callable that puts
+    the inherited disposition back, or ``None`` when no handler was installed.
+
+    Reuses the teardown rather than duplicating it — the handler only raises,
+    and the ``finally`` chain that Ctrl-C already unwinds through stops both
+    children. A second teardown written for this path could drift out of step
+    with that one, and the failure mode of the drift is a stranded child.
+
+    Two dispositions are deliberately left ALONE:
+
+    * ``SIG_IGN``. A process that inherited "SIGTERM ignored" got it from a
+      parent that meant it (POSIX: ``nohup``, a job-control shell backgrounding
+      a child, a supervisor that manages its tree some other way), and that is
+      the same convention under which CPython declines to install a SIGINT
+      handler over an inherited ``SIG_IGN`` — the reason a ``nohup``-ed
+      launcher looks like it ignores Ctrl-C. Overriding it would make this
+      process killable by a signal something above it masked on purpose.
+    * Any interpreter that will not take a handler: ``signal.signal`` raises
+      ``ValueError`` outside the main thread, and a platform with no SIGTERM
+      raises ``AttributeError`` on the constant. A launcher running in a worker
+      thread is otherwise completely functional, and crashing it over a
+      teardown nicety would be the worse trade.
+
+    Neither is silent. A machine where ``kill`` will orphan the Paper JVM on
+    the Minecraft port is exactly what the operator needs told BEFORE the
+    exhibition, not discovered at the next launch's port gate.
+    """
+    try:
+        previous = signal.getsignal(signal.SIGTERM)
+    except (AttributeError, ValueError, OSError) as exc:  # no usable SIGTERM here
+        log(
+            f"this platform has no usable SIGTERM ({exc!r}); end the exhibition "
+            "with Ctrl-C."
+        )
+        return None
+    if previous is signal.SIG_IGN:
+        log(
+            "SIGTERM is inherited as IGNORED, so this launcher leaves it that "
+            "way -- something above it (nohup, a job-control shell, a "
+            "supervisor) masked it on purpose. `kill <pid>` will NOT stop this "
+            "process; end the exhibition with Ctrl-C, and if you must `kill -9` "
+            "it, stop the Paper JVM and the bridge by hand afterwards."
+        )
+        return None
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    except (ValueError, OSError, RuntimeError) as exc:
+        log(
+            f"could not install a SIGTERM handler ({exc!r}), so `kill <pid>` "
+            "would orphan the Paper JVM on the Minecraft port. End the "
+            "exhibition with Ctrl-C instead."
+        )
+        return None
+
+    def restore() -> None:
+        """Put the inherited disposition back. Cannot raise — it is the last
+        link of a chain whose entire purpose is that nothing in it strands a
+        child."""
+        try:
+            # `getsignal` reports None for a handler installed from C, which
+            # `signal.signal` will not accept back; SIG_DFL is the honest
+            # approximation, and this process is on its way out regardless.
+            signal.signal(
+                signal.SIGTERM, signal.SIG_DFL if previous is None else previous
+            )
+        except BaseException:  # noqa: BLE001 — teardown's last link must not raise.
+            pass
+
+    return restore
+
+
+# ---------------------------------------------------------------------------
 # Small side-effecting helpers, each taking its I/O behind a keyword seam.
 # ---------------------------------------------------------------------------
 
@@ -1379,7 +1519,10 @@ def run(
     Returns the process exit code: 0 for a clean ``--dry-run`` or an armed
     ``--reset``, 130 for a Ctrl-C (SIGINT) — the NORMAL way to end an
     exhibition, whether it interrupts the live boot or the wait between
-    matches — and non-zero for any refusal or boot failure.
+    matches — ``SIGTERM_EXIT_CODE`` (143, i.e. 128 + 15) for a ``kill <pid>``,
+    which runs exactly the same teardown as the Ctrl-C path but is a distinct
+    event and so gets a distinct code, and non-zero for any refusal or boot
+    failure.
 
     ``--reset`` (T6) is handled first and returns before every gate below: it
     is a different program that happens to share this entry point, and it must
@@ -1485,6 +1628,14 @@ def run(
     paper_proc: Optional[subprocess.Popen] = None
     bridge_proc: Optional[subprocess.Popen] = None
     env: Optional[MCPvPEnv] = None
+
+    # --- From here on this process owns children, so SIGTERM has to reach the
+    # teardown below instead of killing the supervisor outright and leaving them
+    # behind (module docstring, TEARDOWN). Installed HERE, after every branch
+    # that returns early -- `--reset`, `--dry-run` and every refusal -- so those
+    # modes leave this process's inherited signal behavior exactly as they found
+    # it, and their exit codes cannot change. ---------------------------------
+    restore_sigterm = install_sigterm_handler(log=log)
 
     try:
         # --- Paper ----------------------------------------------------------
@@ -1595,6 +1746,13 @@ def run(
     except KeyboardInterrupt:
         log("interrupted.")
         return 130
+    except ExhibitionTerminated as exc:
+        # `kill <pid>`, or whatever supervises this process stopping it. The
+        # teardown below is the same one Ctrl-C gets -- only the code differs,
+        # because reporting 130 would tell whoever reads the log that somebody
+        # pressed Ctrl-C at a console nobody was sitting at.
+        log(f"{exc}; shutting down.")
+        return SIGTERM_EXIT_CODE
     except Exception as exc:  # noqa: BLE001 — a mid-match fault (e.g. a dropped
         # bridge connection) must not crash with a raw traceback in front of a
         # live audience; the step contract forbids a silent retry, so tear
@@ -1611,24 +1769,35 @@ def run(
         # The order is fixed: the agent's connection, then the bridge, then
         # Paper. Stopping Paper first would leave the bridge's mineflayer bots
         # thrashing against a dead server while it shuts down.
+        #
+        # Restoring SIGTERM is the OUTERMOST link, so the handler stays live for
+        # the whole chain: a second `kill` arriving during the grace wait then
+        # raises into the helpers that already absorb a second Ctrl-C, instead
+        # of hitting SIG_DFL and killing this supervisor mid-teardown with a
+        # child still up -- the exact orphan this handler exists to prevent.
         try:
-            if env is not None:
-                _close_env(env, log=log)
-        finally:
             try:
-                if bridge_proc is not None:
-                    _stop_process(bridge_proc, "bridge", log=log)
+                if env is not None:
+                    _close_env(env, log=log)
             finally:
                 try:
-                    if paper_proc is not None:
-                        _stop_process(paper_proc, "Paper", log=log)
+                    if bridge_proc is not None:
+                        _stop_process(bridge_proc, "bridge", log=log)
                 finally:
-                    # Last link, and deliberately after Paper is already down:
-                    # there is nothing left to say to the console, and an
-                    # unclosed pipe finalized at interpreter exit prints an
-                    # "Exception ignored in ..." that reads like a crash.
-                    if paper_proc is not None:
-                        _close_paper_console(paper_proc)
+                    try:
+                        if paper_proc is not None:
+                            _stop_process(paper_proc, "Paper", log=log)
+                    finally:
+                        # Last of the child-facing links, and deliberately after
+                        # Paper is already down: there is nothing left to say to
+                        # the console, and an unclosed pipe finalized at
+                        # interpreter exit prints an "Exception ignored in ..."
+                        # that reads like a crash.
+                        if paper_proc is not None:
+                            _close_paper_console(paper_proc)
+        finally:
+            if restore_sigterm is not None:
+                restore_sigterm()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

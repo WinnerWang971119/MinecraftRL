@@ -37,11 +37,21 @@ built from (``is_port_free``, ``find_checkpoints``, ``build_bridge_argv``,
 helpers) plus the --checkpoint-missing/unloadable "never random-init"
 guarantee, the --challenger-username help-text requirement from the spec, and
 the ``BaseException``-proof teardown a second Ctrl-C depends on.
+
+  * W2 — ``kill <pid>``. Ctrl-C reaches that teardown for free; SIGTERM's
+    default disposition reaches nothing at all and leaves BOTH children running
+    behind a dead supervisor, with the Paper JVM still holding port 25565.
+    ``TestSigtermTeardown`` drives the real ``run()`` and delivers the signal
+    the way CPython does — by calling the installed disposition — rather than
+    with ``os.kill``, which under the "no handler" regression would kill the
+    pytest process itself and report a green session.
 """
 
 from __future__ import annotations
 
+import signal
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +65,7 @@ from deploy.exhibition import (
     DEFAULT_LOG_DIR,
     DEFAULT_MC_PORT,
     RESET_REQUEST_FILENAME,
+    SIGTERM_EXIT_CODE,
     CheckpointError,
     build_bridge_argv,
     checkpoint_missing_message,
@@ -63,6 +74,7 @@ from deploy.exhibition import (
     find_checkpoints,
     find_toolchain_problems,
     human_reset_commands,
+    install_sigterm_handler,
     is_port_free,
     load_greedy_policy,
     main,
@@ -200,6 +212,46 @@ class SlowStoppingProc(FakeProc):
         if self.waits == 1:
             raise KeyboardInterrupt
         return self._exit_code
+
+
+class SigtermNotRouted(BaseException):
+    """The harness's own failure signal for a SIGTERM that would NOT have
+    reached the teardown chain (W2).
+
+    Derives from ``BaseException`` for the same reason
+    ``deploy.exhibition.ExhibitionTerminated`` does: ``run()`` catches
+    ``Exception`` around the whole supervised block, so an ``AssertionError``
+    raised from inside a seam would come back as a tidy "fatal error: ..." and
+    exit 1, hiding what actually went wrong behind an exit-code mismatch. This
+    escapes to ``ExhibitionRun.escaped`` instead, carrying its message.
+    """
+
+
+def deliver_sigterm():
+    """Do to the launcher exactly what CPython does when SIGTERM arrives: call
+    whatever disposition is installed, in the main thread, at whatever line the
+    launcher has reached.
+
+    NOT ``os.kill(os.getpid(), signal.SIGTERM)``. Under the very mutation these
+    tests exist to kill -- ``run()`` installing no handler -- a real signal finds
+    ``SIG_DFL`` and terminates the whole pytest process: "N passed", no
+    failures, which is the green-for-the-wrong-reason trap
+    ``call_capturing_escape`` above exists for. Reading the disposition and
+    calling it keeps the miss as a FAILING test.
+    """
+    handler = signal.getsignal(signal.SIGTERM)
+    if not callable(handler):
+        raise SigtermNotRouted(
+            f"run() left SIGTERM at {handler!r} while both children were "
+            "running: a real `kill <pid>` would end the launcher with no "
+            "teardown at all and orphan BOTH of them, with the Paper JVM still "
+            "holding the Minecraft port."
+        )
+    handler(signal.SIGTERM, None)
+    raise SigtermNotRouted(
+        "the SIGTERM handler returned instead of raising, so nothing unwound "
+        "into run()'s teardown chain and the launcher just kept waiting."
+    )
 
 
 class RefusingPopen:
@@ -1246,6 +1298,10 @@ class ExhibitionRun:
         self.transports = []
         self.policy = None
         self.request_path = None
+        #: SIGTERM's disposition as observed FROM INSIDE the run, while both
+        #: children were up -- the only moment at which it matters. Read through
+        #: the real ``signal`` module, so it is what a real ``kill`` would find.
+        self.sigterm_disposition = None
 
     @property
     def console_lines(self):
@@ -1273,6 +1329,7 @@ def drive_exhibition(
     console_fails=False,
     on_step=None,
     opponent_visible=None,
+    stop_with="ctrl-c",
 ):
     """Drive the REAL ``run()`` through a complete exhibition and record it.
 
@@ -1301,7 +1358,15 @@ def drive_exhibition(
     script the REAL ``MCPvPEnv``/``PerceptionFilter`` into gating the opponent
     out of view for specific decisions, exactly as a human circling behind the
     agent would.
+
+    ``stop_with`` picks which of the two stop signals ends the exhibition once
+    the scripted resets are used up: ``"ctrl-c"`` (the default, and every test
+    that predates W2) raises ``KeyboardInterrupt`` from the idle wait, while
+    ``"sigterm"`` delivers a SIGTERM through :func:`deliver_sigterm` — the
+    ``kill <pid>`` case. Both land at the same line of ``run()``, which is what
+    makes their recorded event lists directly comparable.
     """
+    assert stop_with in ("ctrl-c", "sigterm"), f"unknown stop_with: {stop_with!r}"
     proc_classes = dict(proc_classes or {})
     result = ExhibitionRun()
     record = result.events.append
@@ -1360,6 +1425,11 @@ def drive_exhibition(
     pending = {"resets": resets, "wakeups": idle_wakeups}
 
     def interrupting_sleep(seconds):
+        # The launcher is between matches with both children up, which is the
+        # only state in which SIGTERM's disposition matters. Recorded on every
+        # sleep, so the value a test reads is the one that was live at the
+        # moment the exhibition ended.
+        result.sigterm_disposition = signal.getsignal(signal.SIGTERM)
         if pending["wakeups"] > 0:
             # A poll that found nothing: the launcher woke up, nobody had run
             # the reset command, and it must go straight back to waiting.
@@ -1373,6 +1443,8 @@ def drive_exhibition(
             result.reset_codes.append(code)
             record(("reset_command", code))
             return
+        if stop_with == "sigterm":
+            deliver_sigterm()
         raise KeyboardInterrupt
 
     real_env_cls = MCPvPEnv
@@ -1641,6 +1713,231 @@ class TestStopProcessInterruptProofing:
         _close_env(BrokenEnv(), log=log)
 
         assert any("socket already gone" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# W2 — `kill <pid>` must get the teardown Ctrl-C already gets.
+#
+# Ctrl-C reaches the finally chain for free: CPython installs its own SIGINT
+# handler and KeyboardInterrupt unwinds. SIGTERM's default disposition does NOT
+# unwind anything -- it ends the process where it stands, and BOTH children
+# outlive it. The observed failure was exactly that: `java ... paper-1.21.1.jar`
+# and `node bridge/run.js` still running with the launcher gone, port 25565 held
+# by a JVM nobody could see, and the next launch refusing on its own mc-port
+# gate.
+# ---------------------------------------------------------------------------
+
+
+class SigtermDuringGraceWait(FakeProc):
+    """A child that does not die on SIGTERM, whose 20-second grace wait is cut
+    short by a SECOND ``kill``.
+
+    The SIGTERM counterpart of :class:`SlowStoppingProc`, and it asserts one
+    thing that one cannot: the second signal is delivered through whatever
+    disposition is installed AT THAT MOMENT, i.e. mid-teardown. Restoring the
+    inherited disposition before the chain instead of after it would put
+    ``SIG_DFL`` back with Paper still running, and the second ``kill`` would
+    then take the supervisor out and orphan it.
+    """
+
+    #: SIGTERM's disposition at the moment the second signal arrived, i.e. with
+    #: the teardown chain half-run. RECORDED rather than merely acted on:
+    #: ``_stop_process`` absorbs ``BaseException`` by design, so a failure
+    #: raised from in here would be swallowed by the very helper under test and
+    #: the mutation would survive.
+    disposition_mid_teardown = None
+
+    def terminate(self):
+        # SIGTERM delivered, process still alive -- the reason _stop_process
+        # waits rather than returning.
+        self.terminated = True
+        self._emit("terminate")
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.waits == 1:
+            self.disposition_mid_teardown = signal.getsignal(signal.SIGTERM)
+            deliver_sigterm()
+        return self._exit_code
+
+
+class TestSigtermTeardown:
+    @pytest.fixture(autouse=True)
+    def _sigterm_disposition_is_restored(self):
+        """Snapshot and restore SIGTERM around every test in this class.
+
+        These tests install real dispositions in the pytest process. A failing
+        one must not leak SIG_IGN (or a stale handler) into the rest of the
+        session, where it would be invisible right up until something tried to
+        stop the test run.
+        """
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_a_sigterm_stops_both_children(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, stop_with="sigterm")
+
+        # THE assertion, and it takes BOTH halves. A test that checked only
+        # Paper would stay green while the Node bridge orphaned, and one that
+        # checked only the bridge would stay green while a JVM kept port 25565
+        # -- which is the failure that was actually observed.
+        assert result.procs["bridge"].terminated is True
+        assert result.procs["paper"].terminated is True
+        assert result.escaped is None
+
+    def test_the_handler_is_installed_while_the_children_are_running(
+        self, tmp_path, monkeypatch
+    ):
+        from deploy.exhibition import _sigterm_handler
+
+        # An ordinary Ctrl-C exhibition: the handler is installed for the whole
+        # run, not only when a SIGTERM happens to be coming.
+        result = drive_exhibition(tmp_path, monkeypatch)
+
+        assert result.sigterm_disposition is _sigterm_handler
+        assert result.code == 130
+
+    def test_it_routes_into_exactly_the_same_teardown_as_ctrl_c(
+        self, tmp_path, monkeypatch
+    ):
+        by_signal = drive_exhibition(tmp_path, monkeypatch, stop_with="sigterm")
+        by_keyboard = drive_exhibition(tmp_path, monkeypatch)
+
+        # Same seams, same order, same stop calls: SIGTERM reuses the chain
+        # rather than running a second teardown of its own that could drift out
+        # of step with it.
+        assert by_signal.events == by_keyboard.events
+        assert by_signal.events[-2:] == [("terminate", "bridge"), ("terminate", "paper")]
+
+    def test_it_exits_143_and_the_docstring_says_so(self, tmp_path, monkeypatch):
+        result = drive_exhibition(tmp_path, monkeypatch, stop_with="sigterm")
+
+        # 128 + SIGTERM(15). Not 130: that is 128 + SIGINT(2), and reporting it
+        # would tell whoever reads a wrapper script's log that somebody pressed
+        # Ctrl-C at a console nobody was sitting at.
+        assert SIGTERM_EXIT_CODE == 143
+        assert result.code == SIGTERM_EXIT_CODE
+        assert result.code != 130
+        assert result.escaped is None
+        # The exit-code list an operator actually reads has to name it too.
+        assert str(SIGTERM_EXIT_CODE) in run.__doc__
+        assert any("SIGTERM" in m for m in result.messages)
+
+    def test_a_second_kill_during_the_grace_wait_still_stops_paper(
+        self, tmp_path, monkeypatch
+    ):
+        from deploy.exhibition import _sigterm_handler
+
+        result = drive_exhibition(
+            tmp_path,
+            monkeypatch,
+            stop_with="sigterm",
+            proc_classes={"bridge": SigtermDuringGraceWait},
+        )
+
+        # The handler is STILL installed with the chain half-run -- restoring
+        # it before the teardown instead of after would put SIG_DFL back with
+        # Paper still up, and the second `kill` would take this supervisor out
+        # and orphan the JVM on 25565.
+        assert result.procs["bridge"].disposition_mid_teardown is _sigterm_handler
+        # So the second signal is absorbed by _stop_process exactly like a
+        # second Ctrl-C, and Paper is stopped rather than orphaned.
+        assert result.procs["paper"].terminated is True
+        assert result.procs["bridge"].killed is True
+        assert result.escaped is None
+        assert result.code == SIGTERM_EXIT_CODE
+
+    def test_an_inherited_sig_ign_is_left_alone(self, tmp_path, monkeypatch):
+        # POSIX: a process started with SIGTERM ignored (nohup, a job-control
+        # shell, a supervisor managing its tree another way) inherited that on
+        # purpose. Overriding it would make this launcher killable by a signal
+        # something above it deliberately masked -- the same convention under
+        # which CPython declines to install a SIGINT handler over an inherited
+        # SIG_IGN.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+        result = drive_exhibition(tmp_path, monkeypatch)
+
+        assert result.sigterm_disposition is signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+        # Respecting it must not degrade the run: Ctrl-C still ends the
+        # exhibition cleanly and still stops both children.
+        assert result.code == 130
+        assert result.procs["bridge"].terminated is True
+        assert result.procs["paper"].terminated is True
+        # And it is said out loud, because on that machine `kill <pid>` will
+        # not stop the launcher at all.
+        assert any("IGNORED" in m for m in result.messages)
+
+    def test_the_inherited_disposition_is_put_back_afterwards(
+        self, tmp_path, monkeypatch
+    ):
+        def inherited_handler(signum, frame):  # pragma: no cover - never called
+            raise AssertionError("the launcher's own handler should have run")
+
+        signal.signal(signal.SIGTERM, inherited_handler)
+
+        result = drive_exhibition(tmp_path, monkeypatch, stop_with="sigterm")
+
+        # The exact object that was there before, not merely SIG_DFL: run() is
+        # a function, and a caller that had its own SIGTERM handling must get
+        # it back when the exhibition ends.
+        assert signal.getsignal(signal.SIGTERM) is inherited_handler
+        assert result.code == SIGTERM_EXIT_CODE
+
+    def test_installing_outside_the_main_thread_declines_instead_of_crashing(self):
+        # signal.signal() raises ValueError off the main thread. A launcher
+        # embedded in a worker thread is otherwise perfectly functional, so this
+        # reports and carries on rather than taking the process down.
+        before = signal.getsignal(signal.SIGTERM)
+        messages, log = collector()
+        outcome = {"returned": "never ran", "escaped": None}
+
+        def worker():
+            try:
+                outcome["returned"] = install_sigterm_handler(log=log)
+            except BaseException as exc:  # noqa: BLE001 — that is the thing under test.
+                # A thread's exception does not fail the test on its own; it
+                # prints and the thread dies. Carry it out by hand.
+                outcome["escaped"] = exc
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert outcome["escaped"] is None
+        # No handler, so nothing to restore -- and the MAIN thread's own
+        # disposition was not touched on the way past.
+        assert outcome["returned"] is None
+        assert signal.getsignal(signal.SIGTERM) is before
+        assert any("could not install a SIGTERM handler" in m for m in messages)
+
+    def test_reset_mode_installs_nothing_and_keeps_its_exit_codes(self, tmp_path):
+        def inherited_handler(signum, frame):  # pragma: no cover - never called
+            raise AssertionError("--reset must not touch SIGTERM at all")
+
+        signal.signal(signal.SIGTERM, inherited_handler)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        messages, log = collector()
+
+        # --reset spawns nothing, so it has no children to protect and no
+        # business rewriting its caller's signal handling. Both of its exit
+        # codes are unchanged: 0 armed, 1 refused.
+        armed = run(
+            ["--reset", "--log-dir", str(log_dir)], popen=RefusingPopen(), log=log
+        )
+        assert armed == 0
+        assert signal.getsignal(signal.SIGTERM) is inherited_handler
+
+        refused = run(
+            ["--reset", "--log-dir", str(log_dir)], popen=RefusingPopen(), log=log
+        )
+        assert refused == 1
+        assert signal.getsignal(signal.SIGTERM) is inherited_handler
 
 
 # ===========================================================================
