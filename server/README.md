@@ -92,9 +92,22 @@ rewrites the config files it owns. **Neither script runs git, and you must run
 **`server.properties` and `bukkit.yml` are regenerated on every setup run.** A
 hand edit to either is silently overwritten — change the script instead.
 
-`ops.json` is **committed** (it is the source of truth for the opped bots).
-`setup` does not generate it; `start-pads.sh` rewrites it for a fleet of 2N bots
-before Paper boots, because Paper reads the op list only at startup.
+`ops.json` is **generated, not committed** — it is git-ignored (issue #29). Paper
+owns the file as much as we do: it reads the op list only at startup and rewrites
+it on shutdown, and its contents depend on the pad count, so tracking it left the
+tree dirty after every boot-and-stop cycle. `setup` does not write it either (the
+op list depends on N). Two entry points do, before Paper boots:
+`start-pads.sh --pads N` (2N bots) and `deploy/exhibition.py` (one pad). Write it
+by hand with:
+
+```bash
+.venv/bin/python -m distributed.launcher --pads 1 --write-ops
+```
+
+**`start.sh` refuses to launch** unless that file opps `learner_bot` and
+`dummy_bot` at level 4, so a fresh clone cannot boot into unopped bots — a failure
+that is otherwise silent (an unopped bot cannot run `/function` at all, so the
+arena is never built and every reset quietly does nothing).
 
 ## `server.properties` rationale
 

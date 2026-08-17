@@ -242,7 +242,8 @@ LOG_TAIL_LINES = 40
 #: The one-shot request file ``--reset`` creates and the launcher consumes. It
 #: lives in the log dir, which is already this launcher's own runtime directory
 #: and is git-ignored (``server/logs/``), so a stray request can never dirty the
-#: tree the way ``server/ops.json`` can (issue #29).
+#: tree. Every runtime file this launcher writes is ignored, ``server/ops.json``
+#: included (issue #29 untracked it).
 RESET_REQUEST_FILENAME = "reset.request"
 
 #: How often the idle launcher looks for a request. Deliberately shorter than a
@@ -1616,11 +1617,11 @@ def run(
     drain_reset_request(request_path, "left over from an earlier launch", log=log)
 
     # --- ops.json BEFORE Paper boots: Paper reads the op list at startup and
-    # will not re-read a file written into an already-running server. At N=1
-    # this is byte-identical to the committed server/ops.json, so it both ops
-    # this pad's bots and self-heals a tree a training sweep left dirty
-    # (issue #29 -- see server/setup/start-pads.sh's docstring; this is the
-    # same rewrite, not a new one). -------------------------------------------
+    # will not re-read a file written into an already-running server. The file is
+    # generated, never committed (issue #29), so this write is also what makes a
+    # fresh clone bootable at all -- and it narrows a fleet-sized op list a
+    # training sweep left behind back to this one pad's two bots. It must happen
+    # before start.sh, which refuses to launch on an op list without them. ------
     write_ops(1, str(OPS_JSON_PATH))
 
     paper_log = log_dir / "paper.log"

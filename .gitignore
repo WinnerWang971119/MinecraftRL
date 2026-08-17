@@ -46,6 +46,14 @@ server/usercache.json
 server/eula.txt
 server/.console_history
 
+# The op list is GENERATED, not committed (issue #29). Paper owns this file too --
+# it reads the op list at boot and rewrites it on shutdown, dropping the trailing
+# newline our generator writes -- and its contents depend on N: a 25-pad fleet opps
+# 50 bots. Tracking it made every boot-and-stop cycle dirty the tree. Written by
+# `python -m distributed.launcher --pads N --write-ops` (start-pads.sh step 1,
+# deploy/exhibition.py), and start.sh refuses to launch without it.
+server/ops.json
+
 # Paper-generated / setup-script-generated config (server.properties is written
 # by server/setup/setup.ps1; the rest Paper regenerates on first boot). The
 # source of truth is the setup script + the committed arena datapack, not these.

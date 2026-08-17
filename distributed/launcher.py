@@ -172,7 +172,7 @@ def pad_usernames(index: int) -> Tuple[str, str]:
     """Return ``(learner_username, dummy_username)`` for pad ``index``.
 
     ``i == 0`` is DELIBERATELY ``learner_bot`` / ``dummy_bot`` and not
-    ``learner_0``, so the committed ``server/ops.json``, the datapack's single-arena
+    ``learner_0``, so the generated ``server/ops.json``, the datapack's single-arena
     wrapper and every existing runbook step stay byte-identical. This is the same
     policy as ``usernamesForPad`` in ``bridge/run.js``; the two must agree, and
     ``tests/test_pad_launcher.py`` pins both literals.
@@ -201,8 +201,9 @@ def offline_uuid(username: str) -> str:
 
     Mirrors Java's ``UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(UTF_8))``:
     an MD5 digest with the version nibble forced to 3 (name-based) and the IETF
-    variant bits forced to ``10``. Verified against the two UUIDs already committed
-    in ``server/ops.json``.
+    variant bits forced to ``10``. Verified against the two UUIDs a live Paper
+    server wrote for ``learner_bot`` / ``dummy_bot``, which
+    ``tests/test_pad_launcher.py`` pins as literals.
     """
     if not isinstance(username, str) or username.strip() == "":
         raise ValueError(f"username must be a non-empty string, got {username!r}")
@@ -240,8 +241,11 @@ def ops_entries(n_pads: int) -> List[Dict[str, object]]:
 def ops_json(n_pads: int) -> str:
     """Render :func:`ops_entries` as the exact ``ops.json`` file text.
 
-    Two-space indent plus a trailing newline: at ``n_pads == 1`` this is
-    byte-identical to the committed ``server/ops.json`` (pinned by a test).
+    Two-space indent plus a trailing newline. THIS is the contract for
+    ``server/ops.json`` — the file is generated, never committed (issue #29), so
+    ``tests/test_pad_launcher.py`` pins this text at ``n_pads == 1`` rather than
+    comparing against a file on disk. Paper rewrites the file without the trailing
+    newline; readers must not depend on that byte.
     """
     return json.dumps(ops_entries(n_pads), indent=2) + "\n"
 

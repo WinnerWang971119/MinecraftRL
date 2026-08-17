@@ -1,7 +1,7 @@
 """tests/test_exhibition.py — T5 launcher + T6 reset command.
 
 Offline only: no socket is opened, no subprocess is spawned, no live Paper
-server or Node bridge is touched, and the git-tracked ``server/ops.json`` is
+server or Node bridge is touched, and the real ``server/ops.json`` is
 never written to (every test that reaches the file-mutation point in
 ``run()`` mocks ``write_ops_json`` or never reaches that far).
 
@@ -283,10 +283,12 @@ def recording_write_ops(sink):
 
     The refusal tests assert "nothing was written" by asserting this recorded
     nothing. Byte-comparing ``server/ops.json`` cannot make that assertion on
-    its own: at ``n_pads == 1`` the write is byte-identical to the committed
-    file BY DESIGN, so a refusing run that wrongly rewrote it would still
-    compare equal. The byte-compare stays as a cheap belt-and-braces check that
-    the real file was not touched by some other route.
+    its own: at ``n_pads == 1`` the write reproduces whatever a one-pad file
+    already holds BY DESIGN, so a refusing run that wrongly rewrote it would
+    still compare equal. The byte-compare stays as a cheap belt-and-braces check
+    that the real file was not touched by some other route — and it is skipped
+    when the file is absent, which is a normal fresh-clone state now that it is
+    generated rather than committed (issue #29).
     """
 
     def write_ops(n_pads, path):
@@ -343,7 +345,10 @@ class TestTC20BridgePortInUse:
             return object()
 
         ops_writes = []
-        ops_json_before = OPS_JSON.read_bytes()
+        # None when the file is absent, which is a legitimate state: it is
+        # generated at boot, not committed (issue #29). "Still absent afterwards"
+        # is the same assertion as "still byte-identical afterwards".
+        ops_json_before = OPS_JSON.read_bytes() if OPS_JSON.is_file() else None
 
         code = run(
             ["--challenger-username", "Steve"],
@@ -358,10 +363,11 @@ class TestTC20BridgePortInUse:
         assert popen.calls == []
         assert (DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT) in probed
         # The binding half of "nothing has been started": the write was never
-        # ATTEMPTED. See recording_write_ops -- an N=1 write is byte-identical
-        # to the committed file, so the byte-compare below cannot detect one.
+        # ATTEMPTED. See recording_write_ops -- an N=1 write reproduces a one-pad
+        # file exactly, so the byte-compare below cannot detect one on its own.
         assert ops_writes == []
-        assert OPS_JSON.read_bytes() == ops_json_before  # not touched either
+        ops_json_after = OPS_JSON.read_bytes() if OPS_JSON.is_file() else None
+        assert ops_json_after == ops_json_before  # not touched either
 
         text = "\n".join(messages)
         assert "already in use" in text
@@ -928,8 +934,8 @@ class TestBootFailureTeardown:
             return proc
 
         def fake_write_ops(n_pads, path):
-            # The git-tracked server/ops.json must never be touched by a test;
-            # this seam is exactly what keeps this test from writing to it.
+            # The developer's real server/ops.json must never be touched by a
+            # test; this seam is exactly what keeps this test from writing to it.
             ops_writes.append((n_pads, path))
             return path
 
