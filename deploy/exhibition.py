@@ -12,6 +12,12 @@ command (T6): it heals, repositions and re-arms both sides (one iron sword
 each), hands the slot to the next challenger and re-drives play — once per
 invocation, never by itself. See "THE RESET COMMAND" below.
 
+A PLAYER CAN DO THE SAME THING WITHOUT A TERMINAL by typing ``reset`` (or
+``!reset``) in Minecraft chat. That is not a second reset implementation: the
+bridge writes the very same request file this module's ``--reset`` writes, and
+the launcher's poll below cannot tell the two apart. See "THE IN-GAME
+TRIGGER".
+
 This module deliberately does the ORDERING ``server/setup/start-pads.sh``
 already gets right — preflight gates before anything is spawned, write
 ``ops.json`` before Paper boots, wait for the Minecraft port, THEN start the
@@ -88,6 +94,21 @@ tie the launcher to an interactive terminal it does not otherwise need. A file a
 gives the exact semantics the user asked for — "one command, one trigger" —
 because a duplicate ``--reset`` collapses onto the same single file rather than
 queueing a second match.
+
+THE IN-GAME TRIGGER. Everything above is why a FILE, and the file is exactly
+what makes the in-game keyword cheap: any process that can write one path can
+arm a match. So the bridge — which is already in game, already reading chat, and
+already holding the arena's only command channel — writes it when a player types
+``reset``. :func:`build_bridge_argv` hands it ``--reset-request-path``, the same
+:func:`reset_request_path` value this launcher polls, so the two cannot name
+different files. The bridge connects to nothing to do this (it must not: one TCP
+client, and a second connect evicts the live agent) and everything downstream —
+the discard rules below, the heal, the re-arm, the one-trigger-one-match rule —
+is untouched and cannot tell which trigger fired. The keyword is gated on
+``--opponent-mode human``, so a training fleet reading the same chat does
+nothing; the bridge-side details (case-insensitive whole-message match, own-bot
+filter, debounce, the in-chat confirmation) live in ``bridge/bot.js`` under
+"IN-GAME CHAT RESET".
 
 ONE TRIGGER, ONE MATCH, AND NEVER A DEATH. The request is honored ONLY while
 the launcher is idle between matches. A request filed while a match is still
@@ -549,15 +570,27 @@ def build_bridge_argv(
     learner_username: str,
     dummy_username: str,
     challenger_username: Optional[str],
+    reset_request_path: Path,
     pad_index: int = PAD_INDEX,
 ) -> List[str]:
     """The exact argv that launches this pad's bridge in HUMAN opponent mode.
 
     Mirrors ``distributed.launcher.SubprocessArenaLauncher.spec_for`` (the
     training bridge argv — same flags, same order for the shared subset) plus
-    the two exhibition-only flags: ``--opponent-mode human`` always, and
-    ``--challenger-username`` when pinned. Pure: no subprocess, no filesystem,
-    no network, so tests/test_exhibition.py exercises it directly.
+    the three exhibition-only flags: ``--opponent-mode human`` always,
+    ``--challenger-username`` when pinned, and ``--reset-request-path`` so a
+    player can arm the next match by typing ``reset`` in Minecraft chat instead
+    of the operator alt-tabbing to a terminal.
+
+    ``reset_request_path`` is a PARAMETER and not something derived here, and
+    that is the whole guarantee: :func:`reset_request_path` is the one
+    derivation, and :func:`run` hands this function the SAME value it goes on to
+    poll. Deriving it a second time inside here would be a second
+    implementation, free to drift from the first. (It also shadows that
+    function's name for the body below, which nothing here needs.)
+
+    Pure: no subprocess, no filesystem, no network, so tests/test_exhibition.py
+    exercises it directly.
     """
     argv = [
         node,
@@ -576,6 +609,8 @@ def build_bridge_argv(
         dummy_username,
         "--opponent-mode",
         "human",
+        "--reset-request-path",
+        str(reset_request_path),
     ]
     if challenger_username is not None:
         argv.extend(["--challenger-username", challenger_username])
@@ -594,8 +629,19 @@ def reset_request_path(log_dir: Path) -> Path:
     The ONE place this path is derived, so the ``--reset`` process and the
     launcher process cannot disagree about it — they are separate invocations
     of this module and have nothing else in common but their ``--log-dir``.
+
+    ALWAYS ABSOLUTE, because there is now a THIRD process reading it: the bridge
+    files the same request when a player types the keyword in game (``bridge/
+    bot.js``), and :func:`run` spawns that bridge with ``cwd=REPO_ROOT`` while
+    keeping whatever directory the operator launched from. A relative
+    ``--log-dir`` would therefore have the launcher poll one file and the bridge
+    write another while both agreed character-for-character about the string —
+    an in-game reset that confirms in chat and never happens. Anchored to the
+    caller's cwd rather than ``resolve()``-d, so a symlinked log dir (``/tmp`` is
+    one on macOS) keeps the name the operator typed.
     """
-    return Path(log_dir) / RESET_REQUEST_FILENAME
+    path = Path(log_dir) / RESET_REQUEST_FILENAME
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def reset_command_hint(log_dir: Path) -> str:
@@ -1407,8 +1453,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "learning) from a checkpoint. Runs in the foreground for the "
             "whole exhibition; Ctrl-C tears Paper and the bridge down. It "
             "plays ONE match and then waits: nothing restarts a match by "
-            "itself. Arm the next challenger with the separate --reset "
-            "command (T6), run from another terminal."
+            "itself. To arm the next challenger, anyone can type `reset` in "
+            "Minecraft chat; the separate --reset command, run from another "
+            "terminal, is the same trigger for an operator who has one."
         ),
     )
     parser.add_argument(
@@ -1590,6 +1637,12 @@ def run(
 
     anchor = pad_anchor(PAD_INDEX)
     learner_username, dummy_username = pad_usernames(PAD_INDEX)
+    # ONE derivation, THREE readers: the bridge argv below (a player typing
+    # `reset` in chat writes this file), the drain at startup, and the idle poll
+    # between matches. Computed here, before the argv that carries it, so the
+    # launcher cannot end up polling a path it did not hand the bridge --
+    # deriving it twice would be two implementations free to drift.
+    request_path = reset_request_path(log_dir)
     bridge_argv = build_bridge_argv(
         node=args.node,
         mc_port=args.mc_port,
@@ -1598,6 +1651,7 @@ def run(
         learner_username=learner_username,
         dummy_username=dummy_username,
         challenger_username=args.challenger_username,
+        reset_request_path=request_path,
     )
 
     if args.dry_run:
@@ -1612,8 +1666,8 @@ def run(
 
     # --- A request left over from an earlier launch must never arm a match
     # nobody asked for. Drained here, before anything is running, so the first
-    # thing the idle loop sees below is genuinely this operator's request. -----
-    request_path = reset_request_path(log_dir)
+    # thing the idle loop sees below is genuinely this operator's request.
+    # `request_path` is the value already baked into bridge_argv above. --------
     drain_reset_request(request_path, "left over from an earlier launch", log=log)
 
     # --- ops.json BEFORE Paper boots: Paper reads the op list at startup and
@@ -1718,8 +1772,9 @@ def run(
             )
             log(
                 "no auto-restart: a death ends the match and nothing starts "
-                f"another one by itself. To arm the next challenger, run `{hint}` "
-                "in another terminal. Ctrl-C here ends the exhibition."
+                "another one by itself. To arm the next challenger, anyone can "
+                "type `reset` in Minecraft chat -- no terminal needed -- or run "
+                f"`{hint}` in another terminal. Ctrl-C here ends the exhibition."
             )
             # A request filed while that match was still running is discarded:
             # honoring it would make the death the proximate cause of the
@@ -1727,8 +1782,9 @@ def run(
             drain_reset_request(
                 request_path,
                 "that was filed while the match was still running -- a death "
-                f"must never restart the match by itself, so run `{hint}` again "
-                "now that this one has ended",
+                "must never restart the match by itself, so trigger it again "
+                "now that this one has ended (type `reset` in Minecraft chat, "
+                f"or run `{hint}`)",
                 log=log,
             )
             wait_for_reset_request(request_path, sleep=sleep)

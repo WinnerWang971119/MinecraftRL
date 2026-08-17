@@ -25,6 +25,9 @@
 
 'use strict';
 
+// Only for isAbsolute() on --reset-request-path; nothing here builds a path.
+const nodePath = require('node:path');
+
 const {
   ArenaBots,
   assertMacroUsername,
@@ -110,6 +113,18 @@ const CONFIG_SPECS = Object.freeze([
     flag: '--dummy-knockback-immune',
     env: 'DUMMY_KNOCKBACK_IMMUNE',
     kind: 'boolean',
+  },
+  // IN-GAME CHAT RESET (demo day). Where deploy/exhibition.py's launcher polls
+  // for a reset request, so a player typing the keyword in chat files exactly
+  // the request `python -m deploy.exhibition --reset` files from a terminal.
+  // Process-local like the rest; it never reaches the wire. Omitting it — which
+  // every training launcher does — leaves bot.js at `resetRequestPath: null`
+  // and the feature simply does not exist for that run.
+  {
+    key: 'resetRequestPath',
+    flag: '--reset-request-path',
+    env: 'RESET_REQUEST_PATH',
+    kind: 'absolutePath',
   },
 ]);
 
@@ -274,6 +289,35 @@ function parseBoolean(raw, source) {
 }
 
 /**
+ * Parse a `--reset-request-path`: an ABSOLUTE filesystem path, and nothing else.
+ *
+ * The absoluteness is the entire point of validating this one. The launcher and
+ * the bridge are two processes with DIFFERENT working directories — exhibition.py
+ * spawns the bridge with `cwd=REPO_ROOT` while the launcher itself keeps
+ * whatever directory the operator ran it from — so a relative path would have
+ * them resolve two different files while agreeing character-for-character about
+ * the string. The bridge would then file every chat reset into a file nobody
+ * polls, with no error at either end and nothing in either log: a demo-day
+ * keyword that answers "reset armed" in chat and does nothing at all. Refuse it
+ * at the boundary instead, where the message can name the flag.
+ *
+ * @param {string} raw The raw flag/env value.
+ * @param {string} source Human label for the error.
+ * @returns {string} The path, trimmed.
+ */
+function parseAbsolutePath(raw, source) {
+  const text = typeof raw === 'string' ? raw.trim() : raw;
+  if (typeof text !== 'string' || text.length === 0 || !nodePath.isAbsolute(text)) {
+    throw new Error(
+      `${source} must be an ABSOLUTE path (the launcher and the bridge run in ` +
+        `different working directories, so a relative one would name two ` +
+        `different files), got ${showRaw(raw)}`,
+    );
+  }
+  return text;
+}
+
+/**
  * The bot usernames implied by a pad index.
  *
  * `i == 0` is DELIBERATELY `learner_bot` / `dummy_bot` and not `learner_0`, so
@@ -399,6 +443,8 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
       config[spec.key] = parseChallengerUsername(raw, source);
     } else if (spec.kind === 'boolean') {
       config[spec.key] = parseBoolean(raw, source);
+    } else if (spec.kind === 'absolutePath') {
+      config[spec.key] = parseAbsolutePath(raw, source);
     } else {
       // Hosts / usernames pass through as trimmed strings. Reject an
       // all-whitespace value rather than connecting a blank username.
@@ -468,6 +514,24 @@ function parseBridgeConfig(argv = process.argv.slice(2), env = process.env) {
   // Only `false` is refused. `true` is the default: passing it explicitly in
   // 'human' mode is redundant rather than a misunderstanding, and refusing it
   // would break a launcher that always exports DUMMY_KNOCKBACK_IMMUNE=true.
+  // Third of the same family, and inert in the same silent way. The chat-reset
+  // handler is gated on 'human' mode (bot.js `_onChatMessage`), so a request
+  // path handed to a TRAINING bridge is read by nothing: the operator would
+  // believe the in-game keyword is armed while every `reset` typed into that
+  // server did nothing. Refusing here is also the guard that keeps a future
+  // fleet launcher from arming an in-game reset across 25 training arenas by
+  // copying one flag too many out of the exhibition's argv.
+  if (
+    config.resetRequestPath !== undefined &&
+    (config.opponentMode === undefined || config.opponentMode === OPPONENT_MODE_BOT)
+  ) {
+    throw new Error(
+      `--reset-request-path "${config.resetRequestPath}" requires ` +
+        `--opponent-mode ${OPPONENT_MODE_HUMAN} (the in-game chat reset is an ` +
+        `exhibition feature and is read by nothing in "${OPPONENT_MODE_BOT}" mode)`,
+    );
+  }
+
   if (config.dummyKnockbackImmune === false && config.opponentMode === OPPONENT_MODE_HUMAN) {
     throw new Error(
       `--dummy-knockback-immune false is read by nothing in "${OPPONENT_MODE_HUMAN}" mode ` +
@@ -505,6 +569,14 @@ async function main() {
     `[bridge] pad ${bots.padIndex} @ anchor ${bots.padOrigin.x},${bots.padOrigin.z} ` +
       `(${bots.config.learnerUsername} vs ${opponent})`,
   );
+  // Said at startup, because the alternative is an operator discovering in
+  // front of a room that the keyword was never armed. Silence means off.
+  if (bots.resetRequestPath !== null) {
+    console.error(
+      `[bridge] in-game chat reset armed: a player typing "reset" files ` +
+        `${bots.resetRequestPath}`,
+    );
+  }
 
   bots.transport.on('error', (err) => console.error('[bridge] transport error:', err));
   bots.transport.on('connection', () => console.error('[bridge] env connected'));
@@ -565,5 +637,6 @@ module.exports = {
   parseOpponentMode,
   parseChallengerUsername,
   parseBoolean,
+  parseAbsolutePath,
   usernamesForPad,
 };

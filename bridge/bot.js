@@ -74,6 +74,10 @@
 //   - The EventAggregator counts each window's damage/death exactly once at the
 //     boundary (TC7, actions.test.js); the macro->control-state mapping and the
 //     cooldown-gated single swing (actions.test.js).
+//   - The IN-GAME CHAT RESET files deploy/exhibition.py's request file for a
+//     player who types `reset`, and does NOTHING for our own bots' chat, a
+//     sentence merely containing the word, a burst inside the cooldown, a
+//     training-mode arena, or an unwritable path (bot.test.js).
 // LIVE-ONLY (requires the Paper 1.21.1 server, per server/compat_check.md):
 //   - The Mineflayer handshake itself (createBot, spawn, plugin load).
 //   - TC7b  the real damage exchange (real health-event timing on each bot's
@@ -87,6 +91,10 @@
 // Owner: T7a (Environment/bridge track) / T7b (Environment/bridge track)
 
 'use strict';
+
+// The in-game chat reset writes deploy/exhibition.py's request file directly
+// (see the IN-GAME CHAT RESET block below). Node core, always available.
+const fs = require('node:fs');
 
 // validateInbound is the ONE implementation of the Python -> Node command
 // contract; handleStep calls it instead of re-checking `action` inline (T11b).
@@ -329,6 +337,123 @@ const RL_DEATHS_DISPLAY_SLOT = 'list';
 const RL_DEATHS_READBACK_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
+// IN-GAME CHAT RESET — the demo-day trigger.
+//
+// Arming the next challenger is deploy/exhibition.py's job and stays that way.
+// All this does is file the SAME request the operator's terminal command files:
+// `deploy.exhibition --reset` writes <log-dir>/reset.request and the running
+// launcher polls for it; the bridge writes that identical file when a player
+// types the keyword. There is exactly one reset implementation and this is not
+// it — the heal/reposition/re-arm path is untouched, and the launcher cannot
+// tell the two triggers apart.
+//
+// WHY CHAT AND NOT A COMMAND. An unknown `/reset` is never broadcast to other
+// clients, so the learner bot would never see it; and vanilla `/trigger` needs a
+// scoreboard objective, which is the exact surface that is broken here (see the
+// rl_deaths raw-packet workaround above, which exists only because mineflayer's
+// `scoreUpdated` never fires on 1.21.1). Chat is the one channel this bridge is
+// already known to receive on.
+//
+// WHY THE BRIDGE AND NOT A SECOND PYTHON PROCESS. BridgeServer accepts exactly
+// ONE TCP client and resolves a second connection by destroying the incumbent,
+// so anything that CONNECTED to trigger a reset would evict the live agent
+// mid-exhibition. The bridge is already in-game and already reading chat; it
+// writes the file directly and opens no socket of its own.
+//
+// EXHIBITION ONLY, and gated twice on purpose: `opponentMode === 'human'` AND a
+// configured resetRequestPath. A training fleet is 25 pads all reading chat, and
+// a classmate typing the keyword into a training server must never perturb a
+// run. The mode gate is the load-bearing one — see _onChatMessage.
+// ---------------------------------------------------------------------------
+
+/**
+ * What a player types. Both forms, because an audience that has seen one person
+ * type `!reset` will type `!reset`, and an audience that has seen `reset` will
+ * type `reset`. Compared case-insensitively against the TRIMMED WHOLE message —
+ * never as a substring, or "how do I reset?" would end somebody's match.
+ */
+const CHAT_RESET_KEYWORDS = Object.freeze(['reset', '!reset']);
+
+/**
+ * What the bridge says back. This IS the feature's UX: a trigger that produced
+ * no visible response would be typed five more times by a person who cannot see
+ * a terminal.
+ */
+const CHAT_RESET_CONFIRMATION = 'reset armed - next match starting';
+
+/**
+ * Cooldown between two accepted keywords, in milliseconds.
+ *
+ * Sized against the three things that share this window:
+ *   - a QUEUE of classmates all typing `reset` the moment a match ends is a
+ *     burst two or three seconds wide, and it must arm ONE match, not five;
+ *   - the launcher polls the request file every 1 s (RESET_POLL_SECONDS in
+ *     deploy/exhibition.py) and then spends a beat healing and repositioning, so
+ *     the window has to outlast the poll for the collapse to mean anything;
+ *   - a request filed while a match is still RUNNING is discarded by the
+ *     launcher when that match ends, and the player then has to type the keyword
+ *     again. That retry is the reason this is 5 s and not 30: a suppressed
+ *     keyword is silent, so every second of the window is a second in which a
+ *     genuine retry looks broken to the person typing it.
+ * 5 s covers the burst and the poll with room to spare, and costs a retrying
+ * player at most one re-type.
+ */
+const CHAT_RESET_DEBOUNCE_MS = 5000;
+
+/**
+ * Whether a chat line IS the reset keyword. PURE, exported, and the single
+ * matcher.
+ *
+ * WHOLE-MESSAGE, case-insensitive, surrounding whitespace trimmed. The
+ * whole-message rule is the load-bearing half: chat during a demo is full of
+ * sentences containing the word ("how do I reset?", "can we reset after this"),
+ * and a substring match would end a live match mid-fight on any of them.
+ *
+ * @param {*} text A chat message body. Anything non-string is not a keyword.
+ * @returns {boolean}
+ */
+function matchesChatResetKeyword(text) {
+  if (typeof text !== 'string') {
+    return false;
+  }
+  const normalized = text.trim().toLowerCase();
+  return CHAT_RESET_KEYWORDS.includes(normalized);
+}
+
+/**
+ * The one line a chat-triggered request writes.
+ *
+ * The launcher CONSUMES this file with `unlink` and never reads a byte of it
+ * (deploy/exhibition.py `take_reset_request`), so the content is purely for
+ * whoever is reading the log dir afterwards. It says who and by which route,
+ * which is the only thing the terminal command's own line ("reset requested
+ * <time>") cannot tell them apart by.
+ *
+ * @param {string} username Who typed the keyword.
+ * @param {string} timestamp When, as an ISO-8601 string.
+ * @returns {string}
+ */
+function formatChatResetRequest(username, timestamp) {
+  return `reset requested by ${username} in Minecraft chat ${timestamp}\n`;
+}
+
+/**
+ * An ISO-8601 stamp from an epoch-millisecond reading, TOTAL by construction.
+ *
+ * `new Date(x).toISOString()` throws a RangeError on a non-finite or
+ * out-of-range reading, and this is called on the path that files the reset —
+ * a throw there would cost the reset itself, which is the one thing this
+ * feature exists to deliver. An unusable clock degrades the log line instead.
+ *
+ * @param {number} ms
+ * @returns {string}
+ */
+function isoTimestamp(ms) {
+  const when = new Date(ms);
+  return Number.isNaN(when.getTime()) ? 'at an unknown time' : when.toISOString();
+}
+
+// ---------------------------------------------------------------------------
 // EXHIBITION MODE (T3) — THE FIRST-CLAIMANT LATCH.
 //
 // `_resolveChallengerEntity()` used to scan the learner's whole entity view and
@@ -439,6 +564,12 @@ const DEFAULT_BOT_CONFIG = Object.freeze({
   // undoes BOTH pins: the name follows OpponentConfig's field, but the flag
   // means "this opponent is a mobile combatant, not the M2 stationary target".
   dummyKnockbackImmune: true,
+  // IN-GAME CHAT RESET. Absolute path of deploy/exhibition.py's reset request
+  // file (<log-dir>/reset.request), handed down by --reset-request-path. null —
+  // the default, and what every training launcher leaves it at — means the
+  // keyword handler files nothing and the feature does not exist for that run.
+  // See the IN-GAME CHAT RESET block above.
+  resetRequestPath: null,
 });
 
 // ---------------------------------------------------------------------------
@@ -1298,6 +1429,29 @@ class ArenaBots {
     /** @type {string|null} Pinned challenger name, or null for "first here". */
     this.challengerUsername = challengerUsername;
 
+    // IN-GAME CHAT RESET. TYPE-CHECKED ONLY, deliberately: this constructor does
+    // NOT refuse a path in 'bot' mode. The refusal belongs to run.js, at the
+    // argv boundary, where an operator can be told which flag to drop; refusing
+    // it here would instead make the combination unconstructible, and the mode
+    // gate inside _onChatMessage — the thing that actually keeps 25 training
+    // arenas inert — would become untestable and unfalsifiable. The value is
+    // handed to fs.writeFileSync and never to a datapack macro or the wire, so
+    // there is nothing here to validate beyond "a usable path or nothing".
+    const resetRequestPath =
+      this.config.resetRequestPath === undefined || this.config.resetRequestPath === null
+        ? null
+        : this.config.resetRequestPath;
+    if (
+      resetRequestPath !== null &&
+      (typeof resetRequestPath !== 'string' || resetRequestPath.length === 0)
+    ) {
+      throw new Error(
+        `resetRequestPath must be a non-empty string or null, got ${showValue(resetRequestPath)}`,
+      );
+    }
+    /** @type {string|null} Where a chat keyword files its reset request. */
+    this.resetRequestPath = resetRequestPath;
+
     // The reset template the read-back gate checks against — the bridge's
     // independent VERIFICATION of what the datapack's arena:reset_pad macro
     // APPLIES. It must mirror server/arena/.../spawn_learner_pad.mcfunction:
@@ -1388,6 +1542,22 @@ class ArenaBots {
     this._boundOnDummyDeath = null;
     this._boundOnLearnerMessage = null;
     this._boundOnDummyMessage = null;
+    // The chat keyword rides the LEARNER's connection and only the learner's:
+    // both bots hear every chat line, so binding this on the dummy too would
+    // file two requests and say the confirmation twice for one person typing
+    // once. (In exhibition mode this.dummy is null anyway — that is a second
+    // reason, not the reason.)
+    this._boundOnLearnerChat = null;
+
+    // IN-GAME CHAT RESET: when the last keyword was ACCEPTED (ms on the clock
+    // below), or null while none has been. Only a successful file write stamps
+    // it, so a write that failed never locks out the retry that follows.
+    this._lastChatResetMs = null;
+
+    // Injectable clock for the chat-reset debounce. Same reason the read-back
+    // gate takes one: a unit test must be able to step past a 5 s window
+    // without spending 5 s of wall clock inside it.
+    this._nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
 
     // HUMAN DEATH DETECTION (T2). All 'human'-mode only; inert in 'bot' mode.
     //
@@ -1673,6 +1843,13 @@ class ArenaBots {
       if (this._boundOnLearnerMessage !== null) {
         this.learner.off('message', this._boundOnLearnerMessage);
       }
+      // Removed unconditionally, exactly like the handlers above and for the
+      // same reason: it is removed from where it was ADDED. Keying the removal
+      // on the feature being enabled would leak a listener per re-wire on any
+      // run whose config changed between two wires.
+      if (this._boundOnLearnerChat !== null) {
+        this.learner.off('chat', this._boundOnLearnerChat);
+      }
     }
     // Removal is keyed on this.dummy, NOT on _opponentBot(): the dummy is the
     // only bot these handlers can ever have been added to, and if the opponent
@@ -1718,11 +1895,23 @@ class ArenaBots {
     // Reset causality beacons, one per bot, each addressed to that bot by name.
     this._boundOnLearnerMessage = (jsonMsg) => this._onBotMessage('learner', jsonMsg);
     this._boundOnDummyMessage = (jsonMsg) => this._onBotMessage('dummy', jsonMsg);
+    // Mineflayer's `chat` event, not `message`: it hands over the SENDER'S
+    // USERNAME and the raw message body already split apart, which is what the
+    // own-bot filter needs. The `message` channel above carries the sender only
+    // as a UUID, so filtering there would mean re-parsing "<name> text" out of a
+    // rendered string — a second, worse copy of what mineflayer already did.
+    this._boundOnLearnerChat = (username, message) => this._onChatMessage(username, message);
 
     if (this.learner && typeof this.learner.on === 'function') {
       this.learner.on('health', this._boundOnSelfHealth);
       this.learner.on('death', this._boundOnLearnerDeath);
       this.learner.on('message', this._boundOnLearnerMessage);
+      // Bound UNCONDITIONALLY, in every opponent mode, so that the one thing
+      // keeping a training run inert is the explicit gate at the top of
+      // _onChatMessage rather than an accident of registration. A handler that
+      // returns immediately costs a training arena nothing; a gate nothing
+      // exercises is a gate nobody can prove works.
+      this.learner.on('chat', this._boundOnLearnerChat);
     }
     // The reset causality BEACON is lifecycle, not a behavioral opponent read:
     // it proves the datapack's reset ran for the dummy bot, and
@@ -1862,6 +2051,140 @@ class ArenaBots {
     // only while _confirmAttributeOverrides is waiting.
     if (role === 'dummy' && this._attributeReadback !== null) {
       this._captureAttributeReadback(jsonMsg);
+    }
+  }
+
+  /**
+   * A PLAYER typed something, heard on the learner's connection. The ONLY thing
+   * read here is the in-game reset keyword; every other line is ignored.
+   *
+   * NOTHING MAY ESCAPE THIS METHOD. It runs as a Mineflayer event listener, so a
+   * throw would surface inside the client's packet dispatch with no handler
+   * above it — process-fatal, mid-demo, on a bridge that is otherwise serving
+   * the RL wire perfectly. Everything is inside the try, including the gates:
+   * a crashed bridge is far worse than a missed reset.
+   *
+   * @param {string} username Who typed it (mineflayer's own `(\w+)` capture).
+   * @param {string} message The message body, without the "<name> " prefix.
+   */
+  _onChatMessage(username, message) {
+    try {
+      // GATE 1 — EXHIBITION ONLY, and the load-bearing one. Training is 25 pads
+      // in one JVM all hearing the same chat; a classmate typing the keyword
+      // into a training server must perturb nothing. Stated as its own check
+      // rather than left implicit in "no path was configured" so that removing
+      // it breaks a test instead of breaking an overnight run.
+      if (this.opponentMode !== OPPONENT_MODE_HUMAN) {
+        return;
+      }
+      // GATE 2 — no request file, no feature. Nothing to write to.
+      if (this.resetRequestPath === null) {
+        return;
+      }
+      // OUR OWN BOTS ARE NOT PLAYERS. The server echoes chat back to everyone
+      // including the sender, so the confirmation below returns on this very
+      // channel; a bot that reacted to its own line would loop. Compared
+      // against the RESOLVED usernames, never the literals — pad 4's bots are
+      // learner_4/dummy_4, and the exhibition can rename either.
+      if (typeof username !== 'string' || this._isOwnBotName(username)) {
+        return;
+      }
+      if (!matchesChatResetKeyword(message)) {
+        return;
+      }
+      // DEBOUNCE. A queue of people all typing `reset` at once, or one person
+      // typing it four times, is ONE reset — not a burst of file writes and
+      // four identical lines of chat spam. A backwards clock jump (NTP) or a
+      // non-finite reading falls through as "accepted", which is the safe
+      // direction: an extra reset is recoverable in a way a swallowed one,
+      // during a demo, is not.
+      const now = this._nowMs();
+      if (
+        this._lastChatResetMs !== null &&
+        Number.isFinite(now) &&
+        now >= this._lastChatResetMs &&
+        now - this._lastChatResetMs < CHAT_RESET_DEBOUNCE_MS
+      ) {
+        return;
+      }
+      // THE WRITE IS THE WHOLE MECHANISM: this is byte-for-byte the same
+      // request `python -m deploy.exhibition --reset` files, so the launcher's
+      // existing poll does exactly what the terminal command does today. The
+      // bridge does NOT reset anything itself and opens no socket — a second
+      // connection would evict the live agent (BridgeServer takes one client).
+      try {
+        fs.writeFileSync(
+          this.resetRequestPath,
+          formatChatResetRequest(username, isoTimestamp(now)),
+          { encoding: 'ascii' },
+        );
+      } catch (err) {
+        // A bad path or a read-only log dir must cost this feature and nothing
+        // else. Loud in bridge.log, and NOT debounce-stamped: the next keyword
+        // gets a fresh attempt rather than being swallowed for 5 s on the
+        // strength of a write that never happened. No confirmation either — a
+        // "reset armed" for a request that was never filed is the one lie this
+        // handler must not tell.
+        console.error(
+          `[bridge] chat reset: could not file the request at ${this.resetRequestPath}:`,
+          err,
+        );
+        return;
+      }
+      this._lastChatResetMs = Number.isFinite(now) ? now : null;
+      console.error(
+        `[bridge] chat reset: ${username} armed a reset -> ${this.resetRequestPath}`,
+      );
+      // Last, and after the request is already on disk: the player has to see
+      // that it worked, or they will type it five more times.
+      this._sayInChat(CHAT_RESET_CONFIRMATION);
+    } catch (err) {
+      console.error('[bridge] chat reset handler failed (continuing):', err);
+    }
+  }
+
+  /**
+   * Whether a name belongs to one of THIS pad's own bots.
+   *
+   * Both names, not just the learner's: in 'bot' mode the dummy also talks, and
+   * a rename via --dummy-username must not turn our own bot into an eligible
+   * trigger.
+   *
+   * @param {string} name
+   * @returns {boolean}
+   */
+  _isOwnBotName(name) {
+    return name === this.config.learnerUsername || name === this.config.dummyUsername;
+  }
+
+  /**
+   * Say one line in game from the learner, absorbing every failure.
+   *
+   * `bot.chat()` throws on a disconnected client (the same hazard handleReset
+   * documents), and an unhandled rejection is process-fatal in this codebase —
+   * one killed the bridge mid-episode during the first live run. So the call is
+   * wrapped AND any thenable it returns is given a catch. The message is
+   * cosmetic; the reset it confirms is already filed, so nothing here may
+   * unwind past this method.
+   *
+   * @param {string} text
+   */
+  _sayInChat(text) {
+    const bot = this.learner;
+    if (!bot || typeof bot.chat !== 'function') {
+      return;
+    }
+    let sent;
+    try {
+      sent = bot.chat(text);
+    } catch (err) {
+      console.error('[bridge] chat reset: could not say the confirmation:', err);
+      return;
+    }
+    if (sent !== null && typeof sent === 'object' && typeof sent.then === 'function') {
+      sent.catch((err) =>
+        console.error('[bridge] chat reset: confirmation rejected (continuing):', err),
+      );
     }
   }
 
@@ -3850,7 +4173,12 @@ module.exports = {
   ATTRIBUTE_GET_TRANSLATE_KEY,
   KNOCKBACK_RESISTANCE_NAME_KEY,
   MOVEMENT_SPEED_NAME_KEY,
+  CHAT_RESET_KEYWORDS,
+  CHAT_RESET_CONFIRMATION,
+  CHAT_RESET_DEBOUNCE_MS,
   // Pure, unit-testable logic.
+  matchesChatResetKeyword,
+  formatChatResetRequest,
   assertMacroInt,
   assertMacroUsername,
   isInsidePad,
