@@ -64,6 +64,8 @@ from deploy.exhibition import (
     DEFAULT_BRIDGE_PORT,
     DEFAULT_LOG_DIR,
     DEFAULT_MC_PORT,
+    REFLEX_COOLOFF_STEPS,
+    REFLEX_MAX_CONSECUTIVE_OVERRIDES,
     RESET_REQUEST_FILENAME,
     SIGTERM_EXIT_CODE,
     CheckpointError,
@@ -2720,13 +2722,96 @@ class TestReflexShieldPureDecision:
             True,
         )
 
-    def test_stays_overridden_for_every_further_blind_step(self):
+    def test_the_override_is_bounded_and_hands_control_back(self):
+        # WAS: `test_stays_overridden_for_every_further_blind_step`, which
+        # asserted this exact call still fired at streak 10 -- i.e. it pinned
+        # the LATCH as intended behaviour. It is not: once armed, the old
+        # predicate (`new_streak >= reflex_blind_steps`) could never go false
+        # again, so the policy's macro was discarded for the rest of the match
+        # and the agent's yaw froze (measured: 190 fires in 196 steps, 90
+        # seconds motionless). Deep into a blind streak the shield must be in
+        # its cool-off phase, letting the policy's action 4 through untouched.
         obs = _obs_vec(visible=False)
-        assert self._shield(obs, 4, 10, reflex_blind_steps=3) == (
-            int(Macro.TURN_TO_LAST_SEEN),
-            11,
-            True,
+        assert self._shield(obs, 4, 10, reflex_blind_steps=3) == (4, 11, False)
+
+    def test_it_keeps_firing_through_the_capped_burst(self):
+        # The two steps after the first fire are still inside the burst, so the
+        # bound must not be so tight that the shield stops being a shield.
+        obs = _obs_vec(visible=False)
+        for streak_before in (3, 4):
+            assert self._shield(obs, 4, streak_before, reflex_blind_steps=3) == (
+                int(Macro.TURN_TO_LAST_SEEN),
+                streak_before + 1,
+                True,
+            )
+
+    def test_the_override_can_never_run_unbounded(self):
+        """THE BOUND. No reachable input makes the shield fire forever.
+
+        Driven through the real function for a blind stretch far longer than
+        any match, counting the longest run of consecutive overrides rather
+        than spot-checking individual steps -- a spot check is exactly what
+        missed the latch the first time.
+        """
+        obs = _obs_vec(visible=False)
+        threshold = 8  # the shipped ExhibitionConfig default
+
+        streak = 0
+        longest_run = 0
+        current_run = 0
+        fires = 0
+        for _ in range(1000):
+            action, streak, fired = self._shield(
+                obs, 4, streak, reflex_blind_steps=threshold
+            )
+            if fired:
+                fires += 1
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+                assert action == int(Macro.TURN_TO_LAST_SEEN)
+            else:
+                current_run = 0
+                assert action == 4, "the policy's own macro must go through"
+
+        assert longest_run <= REFLEX_MAX_CONSECUTIVE_OVERRIDES, (
+            f"the shield fired on {longest_run} consecutive steps; the bound is "
+            f"{REFLEX_MAX_CONSECUTIVE_OVERRIDES}. An unbounded override freezes "
+            "the agent for the rest of the match."
         )
+        # ...and it is still a shield: it must not have quietly disarmed itself
+        # for the whole blind stretch either.
+        assert fires > 0
+
+    def test_the_cool_off_gives_the_policy_a_full_uninterrupted_run(self):
+        # The other half of the bound: not just "it stops firing" but "the
+        # policy gets a real, contiguous stretch of control" -- long enough to
+        # actually steer out of whatever blinded it.
+        obs = _obs_vec(visible=False)
+        threshold = 8
+        streak = threshold + REFLEX_MAX_CONSECUTIVE_OVERRIDES - 1  # last fire of the burst
+
+        policy_controlled = 0
+        for _ in range(REFLEX_COOLOFF_STEPS):
+            action, streak, fired = self._shield(
+                obs, 4, streak, reflex_blind_steps=threshold
+            )
+            assert fired is False
+            assert action == 4
+            policy_controlled += 1
+
+        assert policy_controlled == REFLEX_COOLOFF_STEPS
+        # ...and then, still blind, the shield is allowed to help again.
+        _action, streak, fired = self._shield(obs, 4, streak, reflex_blind_steps=threshold)
+        assert fired is True, "the cool-off must expire, not disarm the shield"
+
+    def test_the_first_fire_is_still_exactly_at_the_threshold(self):
+        # The bound changes the TAIL of the shield, never its arming point --
+        # the shipped T7 behaviour up to the first override is untouched.
+        obs = _obs_vec(visible=False)
+        streak = 0
+        for step in range(1, 9):
+            _action, streak, fired = self._shield(obs, 4, streak, reflex_blind_steps=8)
+            assert fired is (step == 8), f"step {step} fired={fired}"
 
     def test_fired_is_false_even_when_the_policy_already_chose_turn_to_last_seen(self):
         # `fired` must mean "the shield substituted this", not merely "the
@@ -2818,8 +2903,12 @@ class TestPlayOneMatchReflexShield:
 
         play_one_match(env, policy, reflex_blind_steps=3, log=lambda m: None)
 
+        # WAS: `[1, 1] + [ttls] * 8` -- every step from the third onward
+        # overridden, forever. That asserted the latch. The shield now fires a
+        # capped burst (REFLEX_MAX_CONSECUTIVE_OVERRIDES == 3) and then hands
+        # the remaining steps back to the policy for the cool-off.
         ttls = int(Macro.TURN_TO_LAST_SEEN)
-        assert env.actions_sent == [1, 1] + [ttls] * 8
+        assert env.actions_sent == [1, 1] + [ttls] * 3 + [1] * 5
 
     def test_unchanged_for_the_whole_match_while_visible(self):
         env = VisibilityScriptedEnv([True] * 10)
@@ -2869,7 +2958,10 @@ class TestPlayOneMatchReflexShield:
         play_one_match(env, policy, reflex_blind_steps=2, log=messages.append)
 
         text = "\n".join(messages)
-        assert "reflex shield overrode the action on 4/5 decision step(s)" in text
+        # WAS: "on 4/5". With the threshold at 2 the old shield overrode steps
+        # 2, 3, 4 AND 5 -- every step once armed. The capped burst stops at
+        # three, so the fifth step is the policy's own.
+        assert "reflex shield overrode the action on 3/5 decision step(s)" in text
         assert "reflex_blind_steps=2" in text
 
     def test_no_summary_log_line_when_the_shield_never_fires(self):

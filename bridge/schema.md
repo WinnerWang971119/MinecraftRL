@@ -142,8 +142,8 @@ post-`reset` first observation once the episode is running).
 | Field             | Type        | Meaning                                                       |
 |-------------------|-------------|---------------------------------------------------------------|
 | `pos`             | `[x,y,z]` floats | World-frame position.                                    |
-| `yaw`             | float       | Yaw in radians.                                               |
-| `pitch`           | float       | Pitch in radians.                                             |
+| `yaw`             | float       | Yaw in radians, **protocol convention**, range `(-pi, pi]`. See [the angle convention](#the-angle-convention). |
+| `pitch`           | float       | Pitch in radians, **positive looking DOWN**, range `[-pi/2, pi/2]`. See [the angle convention](#the-angle-convention). |
 | `velocity`        | `[x,y,z]` floats | World-frame velocity.                                    |
 | `on_ground`       | bool        | Whether the bot is on the ground.                             |
 | `health`          | float       | Self current health (`0..MAX_HEALTH`). Allowed in the obs.    |
@@ -155,10 +155,64 @@ post-`reset` first observation once the episode is running).
 | Field      | Type        | Meaning                                                              |
 |------------|-------------|----------------------------------------------------------------------|
 | `pos`      | `[x,y,z]` floats | World-frame position. Gated upstream.                           |
-| `yaw`      | float       | Yaw in radians. Gated upstream.                                      |
-| `pitch`    | float       | Pitch in radians. Gated upstream.                                   |
+| `yaw`      | float       | Yaw in radians, **same protocol convention and range as `self.yaw`**. Gated upstream. See [the angle convention](#the-angle-convention). |
+| `pitch`    | float       | Pitch in radians, **same convention as `self.pitch`**. Gated upstream.  |
 | `velocity` | `[x,y,z]` floats | World-frame velocity. Gated upstream.                          |
 | `health`   | float       | **RAW true opponent health. PRIVILEGED → reward only, NEVER the observation.** |
+
+<a id="the-angle-convention"></a>
+**The angle convention — `yaw` and `pitch` are PROTOCOL-convention, not
+mineflayer's.** This paragraph is part of the contract, not a note. It was
+missing once, and the omission is exactly what let a mirrored field of view ship
+to a live demo.
+
+Minecraft world axes: `+x` east, `+y` up, `+z` south.
+
+* **`yaw`** — radians. **`0` looks toward `+z` (south)** and **increases turning
+  clockwise seen from above**, i.e. toward `-x` (west). So `+pi/2` faces `-x`
+  (west), `-pi/2` faces `+x` (east), and `±pi` faces `-z` (north). The bridge
+  emits it folded into **`(-pi, pi]`** — half-open at the bottom, so the wrap
+  boundary has exactly one representation (`-pi` is emitted as `+pi`).
+* **`pitch`** — radians, **positive looking DOWN**, range `[-pi/2, pi/2]`. Not
+  wrapped: the game bounds it already.
+* The unit **look vector** implied by the pair is therefore
+
+  ```
+  look = ( -cos(pitch) * sin(yaw),   # x
+           -sin(pitch),              # y
+            cos(pitch) * cos(yaw) )  # z
+  ```
+
+  which is what `env/perception_filter.py::_look_vector` computes, and what the
+  FOV cone and `in_crosshair` are measured against.
+
+**Mineflayer does NOT use this convention, and the bridge converts.**
+`entity.yaw` is `atan2(-dx, -dz)` (`mineflayer/lib/plugins/physics.js`), so
+mineflayer's yaw `0` looks toward `-z` — the `z` axis is **mirrored** relative to
+the protocol frame — and its pitch is positive looking **up**. `bot.js`'s
+`_snapshotSelf` / `_snapshotOpponent` apply the conversion at the mineflayer
+boundary, so nothing downstream ever sees a mineflayer-frame angle:
+
+```
+protocol_yaw   = normalizeYaw(pi - mineflayer_yaw)   # folded into (-pi, pi]
+protocol_pitch = -mineflayer_pitch
+```
+
+Verified live against all four cardinal directions:
+
+| `bot.lookAt` toward | `entity.yaw` (mineflayer) | wire `yaw` (protocol) | `look` |
+|---------------------|---------------------------|-----------------------|--------|
+| `+z` (south)        | `-pi`                     | `0`                   | `[0, 0, +1]` |
+| `-z` (north)        | `0`                       | `pi`                  | `[0, 0, -1]` |
+| `+x` (east)         | `-pi/2`                   | `-pi/2`               | `[+1, 0, 0]` |
+| `-x` (west)         | `+pi/2`                   | `+pi/2`               | `[-1, 0, 0]` |
+
+Both fighters are converted or neither is: the perception filter derives the
+opponent's agent-relative facing as `opponent.yaw - self.yaw`, and a
+half-converted pair leaves that difference in no frame at all. When a bot has no
+entity (absent opponent, human challenger who left) the whole block is the
+zeroed placeholder and `yaw`/`pitch` are a literal `0` — that is "no reading",
+not "facing south".
 
 **`events`** (aggregated over the interval; source of the reward's damage anchors):
 

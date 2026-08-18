@@ -388,6 +388,13 @@ class TcpBridgeClient:
 # PerceptionFilter uses for the opponent). The yaw rotation convention is the
 # single one documented in env/perception_filter (yaw 0 looks toward +z;
 # +Z_local forward, +X_local right, +Y_local world-up).
+#
+# That convention is now GUARANTEED at the wire, not merely assumed here: the
+# bridge converts mineflayer's mirrored frame (its yaw 0 looks toward -z) into
+# the protocol one inside `_snapshotSelf` / `_snapshotOpponent`, and
+# bridge/schema.md states it as part of the contract. Feeding a raw mineflayer
+# yaw into this rotation mirrors the agent's forward axis front-to-back — which
+# is precisely the perception bug this convention note exists to prevent.
 # ---------------------------------------------------------------------------
 
 
@@ -971,7 +978,14 @@ class MCPvPEnv:
 
         Yaw is converted to **degrees**: the wire carries radians, and
         ``OpponentView`` documents its ``self_yaw`` / ``target_yaw`` as degrees.
-        This method is the only place that conversion happens.
+        This method is the only place that conversion happens. Only the UNIT
+        changes here — the *frame* is passed through untouched, so both yaws
+        stay in the wire's protocol convention (``0`` faces ``+z``, increasing
+        clockwise toward ``-x``; see ``bridge/schema.md``) and land in
+        ``(-180, 180]``. ``ScriptedBot`` reads neither field — they are carried
+        on ``OpponentView`` for a future policy that steers by facing — so this
+        is the frame that policy inherits, and it must not be re-mirrored here
+        to match some other module's idea of yaw.
 
         ``attack_cooldown`` is clamped to **exactly** ``1.0`` (never ``1.0``
         minus a float hair) because ``ScriptedBot`` tests readiness with a

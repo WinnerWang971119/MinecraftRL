@@ -187,6 +187,21 @@ OutboundMessage = "ResetMsg | StepMsg | CloseMsg"  # typing alias (string form)
 # Nested raw-state blocks are typed dataclasses so callers read fields by name.
 # Vector fields (``pos``/``velocity``) are kept as plain length-3 lists of
 # floats — the same world-frame triples that are on the wire.
+#
+# ANGLE CONVENTION (contract; see bridge/schema.md "the angle convention").
+# Every ``yaw`` / ``pitch`` parsed here is PROTOCOL-convention, because the
+# bridge converts out of mineflayer's frame at the snapshot boundary
+# (``bot.js::_snapshotSelf`` / ``_snapshotOpponent``):
+#
+#   * ``yaw`` — radians, ``0`` looks toward ``+z`` (south), increasing clockwise
+#     seen from above (toward ``-x``, west); folded into ``(-pi, pi]``.
+#   * ``pitch`` — radians, POSITIVE looking DOWN, range ``[-pi/2, pi/2]``.
+#
+# This is exactly the convention ``env/perception_filter.py`` documents and its
+# ``_look_vector`` assumes. Mineflayer's own ``entity.yaw`` is
+# ``atan2(-dx, -dz)`` — mirrored along ``z``, with pitch positive looking UP —
+# and must never reach these dataclasses unconverted: it silently mirrors the
+# FOV cone front-to-back.
 # ---------------------------------------------------------------------------
 
 
@@ -196,8 +211,10 @@ class SelfState:
 
     Attributes:
         pos: ``[x, y, z]`` world-frame position.
-        yaw: Yaw in radians.
-        pitch: Pitch in radians.
+        yaw: Yaw in radians, protocol convention (``0`` looks toward ``+z``,
+            increasing clockwise toward ``-x``), folded into ``(-pi, pi]``.
+            See the ANGLE CONVENTION note above.
+        pitch: Pitch in radians, POSITIVE looking DOWN, in ``[-pi/2, pi/2]``.
         velocity: ``[x, y, z]`` world-frame velocity.
         on_ground: Whether the bot is on the ground.
         health: Self current health (``0..MAX_HEALTH``); allowed in the obs.
@@ -252,8 +269,11 @@ class OpponentState:
 
     Attributes:
         pos: ``[x, y, z]`` world-frame position.
-        yaw: Yaw in radians.
-        pitch: Pitch in radians.
+        yaw: Yaw in radians, the SAME protocol convention and ``(-pi, pi]``
+            range as :attr:`SelfState.yaw` — both fighters are converted at the
+            same boundary, because the filter derives the agent-relative facing
+            as ``opponent.yaw - self.yaw``. See the ANGLE CONVENTION note above.
+        pitch: Pitch in radians, POSITIVE looking DOWN, in ``[-pi/2, pi/2]``.
         velocity: ``[x, y, z]`` world-frame velocity.
         health: RAW true opponent health. PRIVILEGED -> reward only, NEVER obs.
     """

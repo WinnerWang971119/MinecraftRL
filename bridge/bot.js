@@ -1068,6 +1068,107 @@ function computeAttackCooldown(currentTick, lastSwingTick, weaponAttackSpeedTick
 }
 
 // ---------------------------------------------------------------------------
+// THE YAW/PITCH WIRE CONVENTION (read this before touching a snapshot).
+//
+// Mineflayer and the Minecraft protocol do NOT agree on how an angle is
+// measured, and the wire carries the PROTOCOL one. This block is the single
+// place the two frames meet; everything downstream (bridge/schema.md, the
+// Python `bridge.messages` dataclasses, env/perception_filter.py's look vector
+// and local-frame rotation) reads protocol values and nothing else.
+//
+//   PROTOCOL (what the wire carries, what schema.md documents):
+//     yaw 0 looks toward +z (south) and increases turning CLOCKWISE seen from
+//     above, i.e. toward -x (west). The unit look vector is
+//         ( -cos(pitch)*sin(yaw), -sin(pitch), cos(pitch)*cos(yaw) ).
+//     pitch is POSITIVE looking DOWN.
+//
+//   MINEFLAYER (what `entity.yaw` / `entity.pitch` carry):
+//     yaw = atan2(-dx, -dz) (see node_modules/mineflayer/lib/plugins/physics.js),
+//     so yaw 0 looks toward -z (north) — the +z/-z axis is MIRRORED relative to
+//     the protocol frame. pitch is POSITIVE looking UP.
+//
+// The conversion, verified live against all four cardinal directions:
+//
+//     protocol_yaw   = normalizeYaw(PI - mineflayer_yaw)
+//     protocol_pitch = -mineflayer_pitch
+//
+//     lookAt +z (south): entity.yaw = -PI    -> protocol  0     -> look [0,0,+1]
+//     lookAt -z (north): entity.yaw =  0     -> protocol  PI    -> look [0,0,-1]
+//     lookAt +x (east) : entity.yaw = -PI/2  -> protocol -PI/2  -> look [+1,0,0]
+//     lookAt -x (west) : entity.yaw =  PI/2  -> protocol  PI/2  -> look [-1,0,0]
+//
+// Shipping the raw mineflayer yaw mirrored the FOV cone front-to-back, so the
+// perception filter reported `visible == 1` exactly when the agent was facing
+// 180 degrees AWAY from the opponent. Do not remove the conversion; do not
+// "simplify" it to a sign flip.
+// ---------------------------------------------------------------------------
+
+/** Two pi, hoisted so the wrap arithmetic below reads as one idea. */
+const TWO_PI = Math.PI * 2;
+
+/**
+ * Fold any finite angle into the canonical wire range `(-PI, PI]`.
+ *
+ * Half-open at the BOTTOM: `-PI` maps to `+PI`, so the wrap boundary has one
+ * representation and `normalizeYaw` is idempotent. A non-finite input yields
+ * `0` — the same zeroed placeholder a missing entity produces, and the value
+ * `finiteOr` would substitute downstream anyway.
+ *
+ * @param {number} yaw Angle in radians (any magnitude).
+ * @returns {number} The same direction expressed in `(-PI, PI]`.
+ */
+function normalizeYaw(yaw) {
+  if (typeof yaw !== 'number' || !Number.isFinite(yaw)) {
+    return 0;
+  }
+  // JS `%` keeps the sign of the dividend, so this lands in (-2PI, 2PI) and a
+  // single conditional shift is enough to reach (-PI, PI].
+  let folded = yaw % TWO_PI;
+  if (folded <= -Math.PI) {
+    folded += TWO_PI;
+  } else if (folded > Math.PI) {
+    folded -= TWO_PI;
+  }
+  // Never emit -0: it is JSON-identical to 0 but NOT `deepStrictEqual` to it,
+  // which would make an assertion fail for a reason that has nothing to do
+  // with the angle.
+  return folded === 0 ? 0 : folded;
+}
+
+/**
+ * Mineflayer yaw -> protocol yaw, normalized into `(-PI, PI]`.
+ *
+ * Self-inverse for a canonical input: `toProtocolYaw(toProtocolYaw(y)) === y`
+ * for every `y` already in `(-PI, PI]`.
+ *
+ * @param {number} yaw `entity.yaw` as mineflayer reports it, in radians.
+ * @returns {number} The protocol-convention yaw for the wire.
+ */
+function toProtocolYaw(yaw) {
+  if (typeof yaw !== 'number' || !Number.isFinite(yaw)) {
+    return 0;
+  }
+  return normalizeYaw(Math.PI - yaw);
+}
+
+/**
+ * Mineflayer pitch -> protocol pitch (positive looking DOWN).
+ *
+ * No wrapping: pitch is bounded to `[-PI/2, PI/2]` by the game itself, so a
+ * plain negation is the whole conversion and is its own inverse.
+ *
+ * @param {number} pitch `entity.pitch` as mineflayer reports it, in radians.
+ * @returns {number} The protocol-convention pitch for the wire.
+ */
+function toProtocolPitch(pitch) {
+  if (typeof pitch !== 'number' || !Number.isFinite(pitch)) {
+    return 0;
+  }
+  const converted = -pitch;
+  return converted === 0 ? 0 : converted;
+}
+
+// ---------------------------------------------------------------------------
 // PURE state-message assembly (unit-testable without a live server).
 //
 // Given a RAW per-bot snapshot (self/opponent kinematics + health), the drained
@@ -1125,11 +1226,17 @@ function buildEventsBlock(agg) {
  * read off the bots, the drained events, the arena probe, the end-of-window
  * tick, and the code_version stamp.
  *
+ * `yaw`/`pitch` are passed through UNCHANGED: the caller's snapshot already
+ * carries them in the protocol convention (`_snapshotSelf` /
+ * `_snapshotOpponent` convert at the mineflayer boundary). Converting here too
+ * would double-apply it and mirror the frame straight back.
+ *
  * @param {object} parts
  * @param {object} parts.self Raw self snapshot {pos, yaw, pitch, velocity,
- *   on_ground, health, held_item, attack_cooldown}.
+ *   on_ground, health, held_item, attack_cooldown}; yaw/pitch protocol-convention.
  * @param {object} parts.opponent Raw opponent snapshot {pos, yaw, pitch,
- *   velocity, health} (health is PRIVILEGED — reward-only downstream).
+ *   velocity, health} (health is PRIVILEGED — reward-only downstream);
+ *   yaw/pitch protocol-convention.
  * @param {object} parts.events Drained EventAggregator block.
  * @param {number[]} parts.wallDistances Arena wall-distance probe (fixed order).
  * @param {number} parts.tick End-of-window server tick (>= 0 integer).
@@ -4010,14 +4117,22 @@ class ArenaBots {
     }
   }
 
-  /** Snapshot the learner's raw self state for the `state` message (LIVE). */
+  /**
+   * Snapshot the learner's raw self state for the `state` message (LIVE).
+   *
+   * `yaw`/`pitch` leave here in the PROTOCOL convention, converted out of
+   * mineflayer's mirrored frame by `toProtocolYaw`/`toProtocolPitch` — see THE
+   * YAW/PITCH WIRE CONVENTION block above `finiteOr`. With no entity the block
+   * stays the zeroed placeholder (an unconverted literal `0`), because "no
+   * reading" must not be dressed up as "facing north".
+   */
   _snapshotSelf() {
     const bot = this.learner;
     const entity = bot && bot.entity ? bot.entity : null;
     return {
       pos: entity ? entity.position : null,
-      yaw: entity ? entity.yaw : 0,
-      pitch: entity ? entity.pitch : 0,
+      yaw: entity ? toProtocolYaw(entity.yaw) : 0,
+      pitch: entity ? toProtocolPitch(entity.pitch) : 0,
       velocity: entity ? entity.velocity : null,
       on_ground: entity ? Boolean(entity.onGround) : false,
       health: bot && typeof bot.health === 'number' ? bot.health : 0,
@@ -4034,6 +4149,12 @@ class ArenaBots {
    *   and last-seen memory used. Only an OMITTED argument re-resolves (that is
    *   handleReset's post-reset first observation, which is outside any window);
    *   an explicit `null` yields the zeroed opponent block.
+   *
+   * `yaw`/`pitch` leave here in the PROTOCOL convention, exactly as
+   * `_snapshotSelf` does — see THE YAW/PITCH WIRE CONVENTION block above
+   * `finiteOr`. Both sides must be converted or not at all: the filter derives
+   * the opponent's agent-relative facing as `opp.yaw - self.yaw`, and
+   * converting one term alone would leave that difference in neither frame.
    */
   _snapshotOpponent(handle = this._opponentHandle()) {
     const entity = handle !== null && handle.entity ? handle.entity : null;
@@ -4055,8 +4176,8 @@ class ArenaBots {
     const bot = this._opponentBot();
     return {
       pos: entity ? entity.position : null,
-      yaw: entity ? entity.yaw : 0,
-      pitch: entity ? entity.pitch : 0,
+      yaw: entity ? toProtocolYaw(entity.yaw) : 0,
+      pitch: entity ? toProtocolPitch(entity.pitch) : 0,
       velocity: entity ? entity.velocity : null,
       // PRIVILEGED raw true health — reward-only downstream, never the obs.
       health: bot && typeof bot.health === 'number' ? bot.health : 0,
@@ -4193,6 +4314,9 @@ module.exports = {
   readbackMatchesTemplate,
   computeAttackCooldown,
   snapshotBotState,
+  normalizeYaw,
+  toProtocolYaw,
+  toProtocolPitch,
   buildEventsBlock,
   assembleStateMsg,
   // Live gate loop + arena owner (structure for the live handshake).

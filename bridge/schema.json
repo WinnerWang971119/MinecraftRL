@@ -66,8 +66,8 @@
           "description": "Learner-bot raw state (FULL; always real, never gated).",
           "properties": {
             "pos": { "$ref": "#/definitions/vec3" },
-            "yaw": { "type": "number", "description": "Yaw in radians." },
-            "pitch": { "type": "number", "description": "Pitch in radians." },
+            "yaw": { "type": "number", "description": "Yaw in radians, PROTOCOL convention: 0 looks toward +z (south) and yaw increases turning clockwise seen from above (toward -x, west); folded into (-pi, pi]. NOT mineflayer's frame (its yaw 0 looks toward -z); bot.js converts at the snapshot boundary via protocol_yaw = normalizeYaw(pi - mineflayer_yaw). See bridge/schema.md \"the angle convention\"." },
+            "pitch": { "type": "number", "description": "Pitch in radians, POSITIVE looking DOWN, range [-pi/2, pi/2]. NOT mineflayer's frame (its pitch is positive looking up); bot.js converts via protocol_pitch = -mineflayer_pitch. See bridge/schema.md \"the angle convention\"." },
             "velocity": { "$ref": "#/definitions/vec3" },
             "on_ground": { "type": "boolean" },
             "health": { "type": "number", "description": "Self current health (0..MAX_HEALTH). Self health is allowed in the observation." },
@@ -82,8 +82,8 @@
           "description": "Opponent RAW true state. PRIVILEGED: opponent.health is true health carried for FUTURE stages; the reward may read it but it MUST NEVER reach the observation (gated out by the PerceptionFilter). Position/facing/velocity are also gated upstream before they reach the obs.",
           "properties": {
             "pos": { "$ref": "#/definitions/vec3" },
-            "yaw": { "type": "number", "description": "Opponent yaw in radians." },
-            "pitch": { "type": "number", "description": "Opponent pitch in radians." },
+            "yaw": { "type": "number", "description": "Opponent yaw in radians, SAME protocol convention and (-pi, pi] range as state.self.yaw (both fighters are converted at the same boundary, because the filter derives facing as opponent.yaw - self.yaw). See bridge/schema.md \"the angle convention\"." },
+            "pitch": { "type": "number", "description": "Opponent pitch in radians, SAME convention as state.self.pitch (positive looking DOWN). See bridge/schema.md \"the angle convention\"." },
             "velocity": { "$ref": "#/definitions/vec3" },
             "health": { "type": "number", "description": "RAW true opponent health. PRIVILEGED -> reward only, NEVER the observation." }
           },

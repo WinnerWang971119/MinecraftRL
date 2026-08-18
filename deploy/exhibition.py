@@ -172,7 +172,11 @@ the frozen ``env.observation_spec.Obs.VISIBLE`` accessor) has been ``0``; once
 that streak reaches ``ExhibitionConfig.reflex_blind_steps``, this module
 overrides the policy's chosen macro with ``TURN_TO_LAST_SEEN`` instead of
 sending it — one ``env.step()`` call either way. The streak resets the instant
-the opponent is visible again. **This is a demo crutch, not a policy change**,
+the opponent is visible again, and the override is BOUNDED: it fires for at
+most ``REFLEX_MAX_CONSECUTIVE_OVERRIDES`` consecutive steps, then yields
+``REFLEX_COOLOFF_STEPS`` steps back to the policy before it may fire again, so
+it cannot latch on and hold the agent's yaw frozen for the rest of a match.
+**This is a demo crutch, not a policy change**,
 and it is structurally confined to exhibitions: ``play_one_match`` defaults
 ``reflex_blind_steps`` to ``0`` (the shield never even looks at ``obs`` in
 that case), only ``run()`` here passes the nonzero value from
@@ -1260,6 +1264,25 @@ def _paper_env(xms: Optional[str], xmx: Optional[str]) -> Optional[Dict[str, str
     return env
 
 
+#: THE SHIELD'S BOUND (see :func:`_reflex_shield_action`). The shield may fire
+#: on at most this many CONSECUTIVE decision steps before it must hand control
+#: back to the policy. Without a bound the override latches: once the streak
+#: passes the threshold every later blind step is also past it, so the policy's
+#: choice is discarded forever and the agent's yaw freezes. That is not
+#: hypothetical -- it was measured firing on 190 of 196 consecutive steps, yaw
+#: frozen for 90 seconds.
+REFLEX_MAX_CONSECUTIVE_OVERRIDES = 3
+
+#: ...and this many consecutive steps of pure policy control follow each capped
+#: burst, before the shield is allowed to fire again. A COOL-OFF rather than a
+#: one-shot cap on purpose: a hard cap would disarm the shield for the rest of
+#: an arbitrarily long blind stretch, which is the opposite failure. Cycling
+#: keeps the crutch available while guaranteeing the policy drives the majority
+#: of steps (8 of every 11) and is never locked out for more than
+#: ``REFLEX_MAX_CONSECUTIVE_OVERRIDES`` steps in a row.
+REFLEX_COOLOFF_STEPS = 8
+
+
 def _reflex_shield_action(
     obs: Any,
     action: int,
@@ -1296,6 +1319,15 @@ def _reflex_shield_action(
             number of consecutive blind steps that must elapse before the
             override fires.
 
+    THE BOUND. Once armed, the shield runs a duty cycle rather than latching:
+    it fires for at most ``REFLEX_MAX_CONSECUTIVE_OVERRIDES`` consecutive steps,
+    then hands the policy ``REFLEX_COOLOFF_STEPS`` steps of uncontested control,
+    then repeats for as long as the agent stays blind. So the policy can never
+    be locked out for an unbounded run of steps, which is what previously froze
+    the agent's yaw for 90 seconds. The FIRST fire is unchanged — still exactly
+    at ``reflex_blind_steps`` consecutive blind steps — so the shield's armed
+    behaviour is the same one T7 shipped; only its tail is bounded.
+
     Returns:
         ``(actual_action, new_blind_streak, fired)``. ``new_blind_streak`` is
         always the correct ``blind_streak`` to pass on the NEXT call, whether
@@ -1311,8 +1343,22 @@ def _reflex_shield_action(
         # — including on the very step visibility returns, per spec.
         return action, 0, False
     new_streak = blind_streak + 1
-    if new_streak >= reflex_blind_steps:
+    if new_streak < reflex_blind_steps:
+        return action, new_streak, False
+    # ARMED. Which of the two phases of the duty cycle this step falls in is a
+    # pure function of the streak -- no extra state to thread, so this function
+    # stays stateless across calls exactly as documented above.
+    #
+    # `fire_index` counts armed steps from 0 (the step that first reaches the
+    # threshold). The cycle is REFLEX_MAX_CONSECUTIVE_OVERRIDES firing steps
+    # followed by REFLEX_COOLOFF_STEPS steps the policy owns outright, repeating
+    # for as long as the agent stays blind.
+    fire_index = new_streak - reflex_blind_steps
+    period = REFLEX_MAX_CONSECUTIVE_OVERRIDES + REFLEX_COOLOFF_STEPS
+    if fire_index % period < REFLEX_MAX_CONSECUTIVE_OVERRIDES:
         return int(Macro.TURN_TO_LAST_SEEN), new_streak, True
+    # Cool-off: still blind, still counting, but the policy's macro goes through
+    # untouched. This is the branch that makes the override impossible to latch.
     return action, new_streak, False
 
 
@@ -1345,7 +1391,11 @@ def play_one_match(
             in it. The policy is asked for its action on every step regardless
             (so any recurrent state it carries keeps advancing); only the
             macro actually sent may change. The streak resets to zero the
-            instant the opponent is visible again. Defaults to ``0``, which
+            instant the opponent is visible again, and while it is armed the
+            override is BOUNDED — at most
+            ``REFLEX_MAX_CONSECUTIVE_OVERRIDES`` consecutive steps before
+            ``REFLEX_COOLOFF_STEPS`` steps of pure policy control — so it can
+            never latch on for the rest of a match. Defaults to ``0``, which
             disables the shield: only :func:`run` (below) passes the nonzero
             value from ``ExhibitionConfig``, so a caller must opt in
             explicitly — see the module docstring's REFLEX SHIELD section for

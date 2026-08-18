@@ -87,6 +87,10 @@ const {
   CHAT_RESET_DEBOUNCE_MS,
   matchesChatResetKeyword,
   formatChatResetRequest,
+  normalizeYaw,
+  toProtocolYaw,
+  toProtocolPitch,
+  assembleStateMsg,
 } = require('./bot');
 // The REAL executor and the REAL weapon period drive the cooldown tests below:
 // MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
@@ -4024,4 +4028,246 @@ test('re-wiring does not double-register the chat handler', () => {
 
   say(arena, 'classmate_1', 'reset');
   assert.deepEqual(arena.learner.chatLog, [CHAT_RESET_CONFIRMATION]);
+});
+
+// ===========================================================================
+// THE YAW/PITCH WIRE CONVENTION.
+//
+// Mineflayer measures yaw as atan2(-dx, -dz) (its yaw 0 looks toward -z) with
+// pitch positive looking UP. The wire carries the PROTOCOL convention: yaw 0
+// looks toward +z, increasing clockwise seen from above, folded into (-pi, pi];
+// pitch positive looking DOWN. bot.js converts at the snapshot boundary.
+//
+// Shipping the raw mineflayer values mirrored the perception filter's FOV cone
+// front-to-back, so `visible == 1` held exactly when the agent faced 180
+// degrees AWAY from the opponent. NOTHING in either suite covered this seam,
+// which is how it reached a live demo. These tests are that coverage.
+//
+// If a change turns these red, the frame has flipped back. Do NOT update the
+// expected values to match the new output — fix the conversion.
+// ===========================================================================
+
+/** Half of a float comparison's worth of slack; the conversion is exact. */
+const YAW_EPS = 1e-12;
+
+/**
+ * The unit look vector env/perception_filter.py::_look_vector computes for a
+ * PROTOCOL yaw/pitch pair. Written out here rather than imported because it
+ * lives in the other language — this is the contract the wire owes Python, so
+ * the Node side has to state it to be able to check it. tests/
+ * test_yaw_convention.py pins the same table against the real Python function.
+ */
+function protocolLookVector(yaw, pitch) {
+  const cp = Math.cos(pitch);
+  return [-cp * Math.sin(yaw), -Math.sin(pitch), cp * Math.cos(yaw)];
+}
+
+/**
+ * REAL MEASURED DATA — one `bot.lookAt` per row on a live bot. Literals, not
+ * derivations: an expectation computed from the code under test cannot catch
+ * that code being wrong.
+ */
+const CARDINALS = [
+  { label: '+z (south)', mineflayer: -Math.PI, protocol: 0, look: [0, 0, 1] },
+  { label: '-z (north)', mineflayer: 0, protocol: Math.PI, look: [0, 0, -1] },
+  { label: '+x (east)', mineflayer: -Math.PI / 2, protocol: -Math.PI / 2, look: [1, 0, 0] },
+  { label: '-x (west)', mineflayer: Math.PI / 2, protocol: Math.PI / 2, look: [-1, 0, 0] },
+];
+
+/** assert.deepEqual on floats is useless; compare component-wise with slack. */
+function assertVecClose(actual, expected, message) {
+  assert.equal(actual.length, expected.length, message);
+  for (let i = 0; i < expected.length; i += 1) {
+    assert.ok(
+      Math.abs(actual[i] - expected[i]) < 1e-9,
+      `${message}: component ${i} was ${actual[i]}, expected ${expected[i]}`,
+    );
+  }
+}
+
+for (const { label, mineflayer, protocol, look } of CARDINALS) {
+  test(`YAW CONVENTION: facing ${label} converts to the measured wire yaw and looks the right way`, () => {
+    const converted = toProtocolYaw(mineflayer);
+
+    assert.ok(
+      Math.abs(converted - protocol) < YAW_EPS,
+      `mineflayer yaw ${mineflayer} (facing ${label}) must convert to ${protocol}, got ${converted}`,
+    );
+    assertVecClose(
+      protocolLookVector(converted, 0),
+      look,
+      `the converted yaw for ${label} must aim the perception filter's look vector at ${JSON.stringify(look)}`,
+    );
+  });
+
+  test(`YAW CONVENTION: the RAW mineflayer yaw for ${label} mirrors z (the shipped bug)`, () => {
+    // TEETH. Without this, a conversion that quietly became a no-op would still
+    // satisfy the test above for any direction whose z component is 0.
+    assertVecClose(
+      protocolLookVector(mineflayer, 0),
+      [look[0], look[1], -look[2]],
+      `feeding the raw mineflayer yaw for ${label} must mirror the z axis`,
+    );
+  });
+}
+
+test('YAW CONVENTION: pitch is negated (mineflayer looks up where the protocol looks down)', () => {
+  assert.equal(toProtocolPitch(0), 0);
+  assert.ok(Math.abs(toProtocolPitch(0.5) - -0.5) < YAW_EPS);
+  assert.ok(Math.abs(toProtocolPitch(-0.5) - 0.5) < YAW_EPS);
+  // A bot looking UP in mineflayer (positive pitch) must read as looking up in
+  // the protocol frame too — which there means a NEGATIVE pitch.
+  assert.ok(protocolLookVector(0, toProtocolPitch(Math.PI / 4))[1] > 0);
+  // ...and the conversion is its own inverse.
+  assert.equal(toProtocolPitch(toProtocolPitch(0.31)), 0.31);
+  // Never -0: JSON-identical to 0 but NOT deepStrictEqual to it.
+  assert.ok(Object.is(toProtocolPitch(0), 0), 'must not emit -0');
+});
+
+test('YAW CONVENTION: normalizeYaw folds every input into the canonical (-pi, pi]', () => {
+  const inputs = [
+    0, Math.PI, -Math.PI, 7, -7, 3 * Math.PI, -3 * Math.PI, 100, -100, 1e-15, -1e-15,
+  ];
+
+  for (const yaw of inputs) {
+    const folded = normalizeYaw(yaw);
+    assert.ok(
+      folded > -Math.PI && folded <= Math.PI,
+      `normalizeYaw(${yaw}) = ${folded} escaped the canonical (-pi, pi] range`,
+    );
+    // Folding must never change which way the bot is facing.
+    assertVecClose(
+      protocolLookVector(folded, 0),
+      protocolLookVector(yaw, 0),
+      `normalizeYaw(${yaw}) changed the look direction`,
+    );
+  }
+});
+
+test('YAW CONVENTION: the wrap boundary has exactly ONE representation (-pi maps to +pi)', () => {
+  // Half-open at the BOTTOM. Both ends of the wrap name the same direction, so
+  // without a rule the same heading can arrive as two different numbers, and
+  // `pi - yaw` can emit a value outside the range the schema advertises.
+  assert.equal(normalizeYaw(-Math.PI), Math.PI);
+  assert.equal(normalizeYaw(Math.PI), Math.PI);
+  assert.equal(normalizeYaw(normalizeYaw(-Math.PI)), Math.PI, 'idempotent');
+  // The conversion itself must never escape the range either — including at the
+  // boundary, where `pi - (-pi)` is a full 2pi before folding.
+  for (const yaw of [-Math.PI, Math.PI, Math.PI - 1e-12, -Math.PI + 1e-12, 0, 2, -2]) {
+    const converted = toProtocolYaw(yaw);
+    assert.ok(
+      converted > -Math.PI && converted <= Math.PI,
+      `toProtocolYaw(${yaw}) = ${converted} escaped the canonical wire range`,
+    );
+  }
+});
+
+test('YAW CONVENTION: converting twice returns the original (round trip)', () => {
+  for (const yaw of [0, 0.1, -0.1, 1.5, -1.5, 3, -3, Math.PI, Math.PI / 2, -Math.PI / 2]) {
+    const roundTripped = toProtocolYaw(toProtocolYaw(yaw));
+    assert.ok(
+      Math.abs(roundTripped - yaw) < 1e-12,
+      `toProtocolYaw is self-inverse on canonical input: ${yaw} -> ${roundTripped}`,
+    );
+  }
+});
+
+test('YAW CONVENTION: a non-finite angle degrades to 0 rather than poisoning the wire', () => {
+  for (const bad of [NaN, Infinity, -Infinity, undefined, null, 'north']) {
+    assert.equal(toProtocolYaw(bad), 0, `toProtocolYaw(${String(bad)})`);
+    assert.equal(toProtocolPitch(bad), 0, `toProtocolPitch(${String(bad)})`);
+    assert.equal(normalizeYaw(bad), 0, `normalizeYaw(${String(bad)})`);
+  }
+});
+
+test('YAW CONVENTION: _snapshotSelf puts the CONVERTED angles on the wire', () => {
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+
+  for (const { label, mineflayer, protocol } of CARDINALS) {
+    bots.learner = {
+      entity: {
+        position: { x: 0.5, y: 64, z: 0.5 },
+        yaw: mineflayer,
+        pitch: 0.25,
+        velocity: { x: 0, y: 0, z: 0 },
+        onGround: true,
+      },
+      health: MAX_HEALTH,
+    };
+
+    const snapshot = bots._snapshotSelf();
+
+    assert.ok(
+      Math.abs(snapshot.yaw - protocol) < YAW_EPS,
+      `_snapshotSelf must emit the protocol yaw for ${label}: expected ${protocol}, got ${snapshot.yaw}`,
+    );
+    assert.ok(
+      Math.abs(snapshot.pitch - -0.25) < YAW_EPS,
+      `_snapshotSelf must negate mineflayer's pitch, got ${snapshot.pitch}`,
+    );
+  }
+});
+
+test('YAW CONVENTION: _snapshotOpponent converts too (both fighters or neither)', () => {
+  // The filter derives the opponent's agent-relative facing as
+  // `opponent.yaw - self.yaw`. Converting one side alone leaves that difference
+  // in NEITHER frame, which is worse than not converting at all.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  const handle = {
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: -Math.PI / 2,
+      pitch: -0.25,
+      velocity: { x: 0, y: 0, z: 0 },
+    },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  const snapshot = bots._snapshotOpponent(handle);
+
+  assert.ok(Math.abs(snapshot.yaw - -Math.PI / 2) < YAW_EPS, 'opponent yaw is converted');
+  assert.ok(Math.abs(snapshot.pitch - 0.25) < YAW_EPS, 'opponent pitch is converted');
+});
+
+test('YAW CONVENTION: a bot with NO entity keeps the zeroed placeholder, not a converted 0', () => {
+  // `yaw: 0` from a missing entity means "no reading". Converting it would emit
+  // pi — an absent opponent confidently reported as facing north — and would
+  // break the zeroed-block contract the absent-opponent and challenger-left
+  // paths depend on.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  bots.learner = { health: MAX_HEALTH };
+
+  assert.equal(bots._snapshotSelf().yaw, 0);
+  assert.equal(bots._snapshotSelf().pitch, 0);
+  assert.equal(bots._snapshotOpponent(null).yaw, 0);
+  assert.equal(bots._snapshotOpponent(null).pitch, 0);
+});
+
+test('YAW CONVENTION: assembleStateMsg passes angles through UNCHANGED (converted once, upstream)', () => {
+  // Double-applying the conversion mirrors the frame straight back, so the
+  // assembler must stay a pure pass-through for these two fields.
+  const msg = assembleStateMsg({
+    self: {
+      pos: [0, 64, 0],
+      yaw: 1.25,
+      pitch: -0.5,
+      velocity: [0, 0, 0],
+      on_ground: true,
+      health: MAX_HEALTH,
+      held_item: 'iron_sword',
+      attack_cooldown: 1,
+    },
+    opponent: { pos: [0, 64, 5], yaw: -2.5, pitch: 0.5, velocity: [0, 0, 0], health: MAX_HEALTH },
+    events: {},
+    wallDistances: [],
+    tick: 1,
+    codeVersion: 'test',
+  });
+
+  assert.equal(msg.self.yaw, 1.25);
+  assert.equal(msg.self.pitch, -0.5);
+  assert.equal(msg.opponent.yaw, -2.5);
+  assert.equal(msg.opponent.pitch, 0.5);
+  assert.equal(validateOutbound(msg), msg, 'and the result is still schema-valid');
 });
