@@ -174,7 +174,9 @@ def _state(
                 "yaw": opp_yaw,
                 "pitch": opp_pitch,
                 "velocity": list(opp_vel),
+                "on_ground": True,
                 "health": opp_health,
+                "held_item": "iron_sword",
             },
             "events": {
                 "damage_dealt": damage_dealt,
@@ -428,6 +430,38 @@ def test_timeout_ends_episode_at_max_steps():
     assert info["step"] == 3
     # Timeout terminal reward is the configured timeout penalty (anti-kiting).
     assert info["r_terminal"] == pytest.approx(RewardConfig().R_terminal_timeout)
+
+
+def test_tc34_max_episode_steps_is_600_and_drives_truncation():
+    """TC34 / AC11: the frozen cap is 600, and the DEFAULT env truncates there.
+
+    ``test_timeout_ends_episode_at_max_steps`` above exercises the truncation
+    LOGIC with a tiny override for speed; it never touches the real cap, so a
+    revert of the 400 -> 600 bump (armor stretches hits-to-kill ~1.75x, 7 vs
+    4, per ``CombatRules.getDamageAfterAbsorb`` — see
+    ``agent/contract_config.py``) would not fail it. This test pins the literal
+    value AND drives the DEFAULT (unoverridden) env through the full 600
+    decisions, so both a wrong constant and a truncation path that ignores it
+    get caught.
+    """
+    assert MAX_EPISODE_STEPS == 600
+
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env = _env(bridge)  # no max_episode_steps override: exercises the real cap
+    env.reset(seed=0)
+
+    done = False
+    info = {}
+    for i in range(MAX_EPISODE_STEPS):
+        bridge.push(_state(tick=2 + i))
+        _, _, done, info = env.step(Macro.IDLE)
+        if i < MAX_EPISODE_STEPS - 1:
+            assert done is False, f"truncated early, at step {i + 1}"
+
+    assert done is True
+    assert info["timeout"] is True
+    assert info["won"] is False and info["lost"] is False
+    assert info["step"] == MAX_EPISODE_STEPS
 
 
 # ---------------------------------------------------------------------------
