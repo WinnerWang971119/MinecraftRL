@@ -48,6 +48,12 @@ future stages need it. It **MUST NEVER reach the observation.**
   the observation builder.
 - The opponent's `pos`/`yaw`/`pitch`/`velocity` are also raw here and are gated
   upstream (FOV cone + raycast LoS + memory) before any of them reach the obs.
+- `opponent.on_ground` and `opponent.held_item` are neither privileged nor
+  gated, because the learner's observation never carries them at all —
+  `env/observation_spec.py`'s opponent block has no slot for either. They are
+  on the wire for the M4 self-play mirror, which consumes them as the opponent
+  seat's OWN `self` block, and self state is by definition ungated. Distinct
+  from `health`, which IS privileged: reward-only, never any observation.
 
 The same discipline applies to anything else privileged the bridge ever adds:
 raw → reward only, gated → observation.
@@ -150,7 +156,7 @@ post-`reset` first observation once the episode is running).
 | `held_item`       | string      | Held-item identifier (e.g. `"iron_sword"`); resolved to a vocab id by `observation_spec`. |
 | `attack_cooldown` | float       | Bridge-computed swing progress in `[0, 1]` (`1.0` == ready).  |
 
-**`opponent`** (RAW; gated upstream before reaching the obs):
+**`opponent`** (RAW; gating is per-field — see each row):
 
 | Field      | Type        | Meaning                                                              |
 |------------|-------------|----------------------------------------------------------------------|
@@ -158,7 +164,44 @@ post-`reset` first observation once the episode is running).
 | `yaw`      | float       | Yaw in radians, **same protocol convention and range as `self.yaw`**. Gated upstream. See [the angle convention](#the-angle-convention). |
 | `pitch`    | float       | Pitch in radians, **same convention as `self.pitch`**. Gated upstream.  |
 | `velocity` | `[x,y,z]` floats | World-frame velocity. Gated upstream.                          |
+| `on_ground` | bool       | Whether the opponent is on the ground. Not in the learner's observation — consumed by the self-play mirror as the opponent seat's own self state, so no gate applies. Read from the opponent's **own connection** — see [opponent provenance](#opponent-provenance). |
 | `health`   | float       | **RAW true opponent health. PRIVILEGED → reward only, NEVER the observation.** |
+| `held_item` | string     | Opponent held-item identifier, same vocabulary as `self.held_item`. `""` when the hand is empty or there is no connection to read from. Not in the learner's observation — consumed by the self-play mirror as the opponent seat's own self state, so no gate applies. See [opponent provenance](#opponent-provenance). |
+
+<a id="opponent-provenance"></a>
+**Opponent provenance — `on_ground`, `held_item` and `health` come from the
+opponent's OWN connection.** This paragraph is part of the contract, not a note.
+Mineflayer maintains real state only for the bot whose connection you hold, and
+for two of these three fields a read through another client does not even yield
+stale data — it yields something that was never a reading at all.
+`entity.health` is never populated for a non-self entity, and reading the
+dummy's health through the learner's client is precisely why `damage_dealt` was
+a flat `0` for the entire life of this project before it was found.
+`entity.onGround` is the starker case: prismarine-entity sets it to `true` in
+the entity constructor, and nothing ever writes a non-self entity's value again
+— no mineflayer packet handler touches it, and the physics engine updates it
+only for the simulated self. A cross-client read there returns a fabricated
+constant, not a degraded measurement. (`held_item` is the mild one: a non-self
+entity's equipment IS kept current by broadcast `entity_equipment` packets, but
+it follows the same single-source rule rather than being carved out as the one
+exception.)
+
+So `bot.js`'s `_snapshotOpponent` reads these three fields through
+`_opponentBot()` — the opponent's own Mineflayer connection — and never through
+the handle entity that the learner's client resolved. When the opponent has a
+connection but no entity yet, `on_ground` is `false`: that is **"no reading"**,
+not "airborne".
+
+There is no human-challenger exception. A human (`opponentMode: 'human'`) has
+no bot connection, and — per the constructor-constant mechanic above — the
+handle view holds nothing to fall back to: an earlier revision of this contract
+fell back to it for `on_ground`, which would have put a hardcoded `true` on the
+wire for as long as the match lasted, a value that looked like a measurement
+and never was one. That branch was removed. A human opponent carries the same
+no-reading values as a missing entity: `on_ground` `false`, `held_item` `""`,
+`health` `0`. No signal is lost: the only consumer of `on_ground`/`held_item`
+is the self-play mirror, which seats bot opponents only, and a human's death is
+sourced from the `rl_deaths` scoreboard (T2), never from this block.
 
 <a id="the-angle-convention"></a>
 **The angle convention — `yaw` and `pitch` are PROTOCOL-convention, not
@@ -232,7 +275,8 @@ not "facing south".
 <a id="the-swing-report"></a>
 **`opp_action_executed` — the swing report.** The opponent has **no
 `attack_cooldown` channel on the wire**: `self.attack_cooldown` is the
-*learner's*, and the `opponent` block carries only pos/yaw/pitch/velocity/health.
+*learner's*, and the `opponent` block carries every field the self block does
+**except** the cooldown — pos/yaw/pitch/velocity/on_ground/health/held_item.
 Python therefore **shadow-tracks** the opponent's swing meter
 (`MCPvPEnv.raw_opponent_view()`), counting **decision windows** since the last
 `opp_action == ATTACK` that actually fired — and this field is the only way it
@@ -261,7 +305,7 @@ It is threaded onto the wire, not recomputed.
 {"type":"state",
  "self":{"pos":[0.5,64.0,0.5],"yaw":0.0,"pitch":0.0,"velocity":[0.0,0.0,0.0],
          "on_ground":true,"health":20.0,"held_item":"iron_sword","attack_cooldown":1.0},
- "opponent":{"pos":[3.5,64.0,1.5],"yaw":3.14,"pitch":0.0,"velocity":[0.0,0.0,0.0],"health":20.0},
+ "opponent":{"pos":[3.5,64.0,1.5],"yaw":3.14,"pitch":0.0,"velocity":[0.0,0.0,0.0],"on_ground":true,"health":20.0,"held_item":"iron_sword"},
  "events":{"damage_dealt":0.0,"damage_taken":0.0,"i_died":false,"opponent_died":false},
  "arena":{"wall_distances":[8.0,8.0,8.0,8.0]},
  "tick":12345,"code_version":"abc123"}
