@@ -96,8 +96,9 @@ ASSUMED_RUN_HOURS: float = 12.0
 #: MEASURED (smoke run, 2026-08-16). Mean decisions per TRAINING episode: 25
 #: pads against the SCRIPTED opponent, warm-started from ``runs/m2_multi.pt``,
 #: eval off, clean exit at 400 grad steps with ``episodes=519`` over 1212 s.
-#: That is 285 steps/episode against a cap of ``MAX_EPISODE_STEPS`` = 400 — most
-#: episodes run most of the way to the timeout.
+#: That is 285 steps/episode against a cap of ``MAX_EPISODE_STEPS`` that was 400
+#: AT MEASUREMENT TIME (it is 600 now, see ``agent/contract_config.py``) — most
+#: episodes ran most of the way to that timeout.
 #:
 #: CROSS-CHECK, because a mean episode length is easy to mis-derive: 519 x 285 /
 #: 1212 s = 122.0 transitions/s, which closes to within 0.1% of the 121.955/s
@@ -111,6 +112,33 @@ ASSUMED_RUN_HOURS: float = 12.0
 #: figure. That makes 285 the right basis for sizing a TRAINING run specifically
 #: — which is the only thing this constant feeds — and the wrong basis for
 #: reasoning about eval episodes.
+#:
+#: WHICH GEAR THIS IS MEASURED AGAINST — the other axis the number is not
+#: universal on, and it is ASYMMETRIC. This run predates M4: neither fighter
+#: wore armor, the learner held an iron sword, and the opponent held NOTHING.
+#: ``bridge/bot.js`` builds ``dummyResetTemplate`` with ``inventory: []`` ("the
+#: datapack gives the dummy no weapon"), so the scripted HARD policy named above
+#: was steering an EMPTY-HANDED body.
+#:
+#: M4 changes both halves at once. Full iron is 15 armor points at 0 toughness,
+#: and per ``CombatRules.getDamageAfterAbsorb`` in the pinned jar the reduction
+#: is ``g / 25`` with
+#: ``g = clamp(armor - damage / (2 + toughness / 4), armor * 0.2, 20)``: for a
+#: 6.0-damage iron sword ``g = clamp(15 - 3, 3, 20) == 12``, so 48% is absorbed,
+#: ~3.1 lands, and 20 HP takes ~7 hits instead of ~4 — a ~1.75x stretch, not the
+#: doubling a flat 4%-per-point model predicts. M4 ALSO arms the opponent.
+#:
+#: Those two changes move 285 in OPPOSITE directions, which is why no scaling
+#: factor rescues it: armor lengthens fights, while an armed opponent kills the
+#: learner sooner and pushes 285 DOWN. So 285 is doubly unrepresentative of the
+#: armored self-play regime — no armor on either side, AND no weapon on one —
+#: and the armored mean is a DIFFERENT number that is NOT YET MEASURED. Do not
+#: extrapolate it from 285 — that is exactly the mistake the section below
+#: documents happening once already, in the other direction. The real armored
+#: figure has to come from T19's smoke run; until it does, pass
+#: ``--eps-decay-episodes`` explicitly for the armored run instead of trusting
+#: ``eps_decay_episodes_for``'s default, which is still sized off the bare-handed
+#: value below.
 #:
 #: WHY THE OLD VALUE WAS WRONG, so nobody restores it. This shipped as
 #: ``ASSUMED_MEAN_EPISODE_STEPS = 30.0``, obtained by doubling

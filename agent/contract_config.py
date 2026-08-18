@@ -132,14 +132,38 @@ DECISION_INTERVAL_MS: int = ACTION_REPEAT * 1000 // SERVER_TPS
 
 #: Max decisions (NOT ticks) per episode before truncation.
 #:
-#: TUNE — sizing math: at a sword DPS of ~5 health/s and a 20-health opponent, a
-#: kill takes ~4 s of *landed* hits; allowing for missed swings, repositioning,
-#: and a stationary/evasive dummy, a comfortable episode horizon is ~80 s. At
-#: DECISION_INTERVAL_MS == 200 ms (5 decisions/s), 80 s == 400 decisions.
-#:   400 decisions * 0.200 s/decision == 80 s of wall-clock combat.
+#: TUNE — sizing math, revised for M4 armor. Both fighters now wear full iron:
+#: 15 armor points (boots 2 + leggings 5 + chestplate 6 + helmet 2, per
+#: ``ArmorMaterials``) at 0 toughness. Armor has NOT been a flat 4%-per-point
+#: since 1.9 — per ``CombatRules.getDamageAfterAbsorb`` in the pinned jar the
+#: reduction is ``g / 25``, where
+#: ``g = clamp(armor - damage / (2 + toughness / 4), armor * 0.2, 20)``. For a
+#: 6.0-damage iron sword that is ``g = clamp(15 - 3, 3, 20) == 12``, i.e. **48%**
+#: absorbed and ~3.1 damage landing, so 20 HP takes ~7 hits instead of the
+#: bare-handed ~4 — a ~1.75x stretch, NOT the doubling a flat model predicts.
+#:
+#: Where the numbers come from: 400 was a DPS ESTIMATE (~5 health/s against
+#: 20 HP, so a ~80 s horizon). The regime that cap was sized for LATER measured
+#: a mean of 285 steps/episode (2026-08-16, against the already-shipped 400 —
+#: ``MEASURED_MEAN_EPISODE_STEPS`` in ``agent/train_config.py``). Stretching 285
+#: by ~1.75x puts armored fights near ~500 decisions, which would truncate
+#: against 400 constantly. A truncated episode is a timeout, not a kill —
+#: timeouts carry no win/loss signal, so routine truncation would destroy the
+#: reward the rest of self-play depends on.
+#:
+#: Note the direction of the arithmetic this replaces: it claimed ~60% (the
+#: pre-1.9 flat ``15 x 4%`` model), which OVERSTATES how long armored fights
+#: run. The real reduction is smaller, so armored episodes are SHORTER and 600
+#: has MORE headroom than that justification implied — the cap was never at
+#: risk, only the reasoning behind it.
+#:
+#: Wall clock: 600 decisions x 0.200 s/decision == 120 s per episode; downstream
+#: operator time budgets (``RUNBOOK.md``, ``docs/spectate.md``) derive from that
+#: figure. The armored mean is still an ESTIMATE and is NOT YET MEASURED; T19's
+#: smoke run supplies it and may retune this further.
 #: Raise this if early curricula time out before a kill; lower it once the agent
 #: reliably wins fast, to keep episodes short and throughput high.
-MAX_EPISODE_STEPS: int = 400
+MAX_EPISODE_STEPS: int = 600
 
 
 # ---------------------------------------------------------------------------
