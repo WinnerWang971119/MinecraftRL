@@ -23,7 +23,11 @@
 #   facing   : -X toward the learner (yaw 90, pitch 0)  <- 90, see the teleport
 #   health   : full (20)
 #   food     : full (20) + full saturation
-#   inventory: empty (a passive target, no weapon)
+#   inventory: one iron_sword HELD, plus a full iron set WORN in the four
+#              armor slots. NO LONGER EMPTY — the M4 iron loadout (issue #33)
+#              arms this bot for the first time. The re-gear block below
+#              explains why armor without a sword would have been strictly
+#              worse than neither.
 #   effects  : none active. The instant_health/saturation instances below last
 #              ONE GAMETICK (~50 ms) — /effect give's duration is in gameticks,
 #              not seconds, for instant_health, instant_damage and saturation
@@ -100,7 +104,13 @@
 # If you ever bump the pinned Paper version to 1.21.2+, these two ids must be
 # flattened in the same commit.
 
-# --- Clear inventory: the dummy carries nothing ---
+# --- Clear inventory, then re-gear below ------------------------------------
+#     The blanket `$clear` stays exactly as it was: it is what makes the
+#     re-gear below exact rather than cumulative. It is safe here because
+#     this is a bot whose whole inventory this function owns — a human
+#     challenger gets a clear SCOPED to the gear instead (deploy/exhibition.py
+#     deliberately does not copy this line), because emptying a person's
+#     inventory is not "heal and reposition".
 $clear $(dummy)
 
 # --- Teleport to the fixed spawn, facing the learner (-X, yaw 90) -----------
@@ -162,6 +172,63 @@ $effect clear $(dummy)
 $effect give $(dummy) minecraft:instant_health 1 9 true
 $effect give $(dummy) minecraft:saturation 1 19 true
 
+# --- Re-gear: one iron sword HELD, a full iron set WORN ---------------------
+#     THE SWORD IS THE MOST CONSEQUENTIAL LINE IN THIS FILE (M4, issue #33).
+#     Until M4 this function handed the opponent a `$clear`, two one-gametick
+#     effects, two attributes and a spawnpoint — AND NO WEAPON. It has been
+#     punching for 1 damage for the life of the project, which was survivable
+#     only because it was also unarmored.
+#
+#     Armor without a sword is not a milder version of that; it is the run
+#     thrown away. The numbers come from the pinned jar, but the conclusion is
+#     ARITHMETIC, not a live measurement:
+#       - a full iron set is 15 armor points at 0 toughness
+#         (net/minecraft/world/item/ArmorMaterials in
+#         server/versions/1.21.1/paper-1.21.1.jar: boots 2, leggings 5,
+#         chestplate 6, helmet 2; both float arguments to register("iron", ...)
+#         are 0.0f, so iron adds neither toughness NOR knockback resistance);
+#       - net/minecraft/world/damagesource/CombatRules.getDamageAfterAbsorb is
+#         damage * (1 - clamp(armor - damage/(2 + toughness/4), armor/5, 20)/25);
+#       - a bare hand does 1, so 1 * (1 - 14.5/25) = 0.42 HP lands per punch:
+#         about 48 connected hits to take a fighter from 20 HP to 0, inside an
+#         episode capped at 600 steps. Nothing would ever terminate. Every
+#         episode a draw, the learner never shown a loss, PFSP flat on a
+#         win-rate of 1.0, Elo standing still — a whole training window spent
+#         on a fight nobody can lose;
+#       - an iron sword does 6 (the figure this repo has used throughout; see
+#         deploy/exhibition.py, "a barehanded human is 1 damage against 6"),
+#         so 6 * (1 - 12/25) = 3.12 HP a hit: about 7 hits. That is what puts
+#         a death back inside the cap.
+#
+#     ARMOR IS `item replace`, NOT `give`. `/give` fills an INVENTORY slot and
+#     equips nothing — four `$give`s would produce a bot CARRYING iron armor
+#     at zero armor points, which reads as "armored" in every log line and is
+#     naked in the fight. spawn_learner_pad.mcfunction's re-gear note carries
+#     the long version, including the itemised check of all four slot names
+#     and all five item ids against the pinned jar. Repeat that check before
+#     touching any id here: one bad id aborts this ENTIRE function at
+#     instantiation, silently, which is the exact hazard the header block
+#     above documents at length. `item replace` also overwrites rather than
+#     appends, so this block is idempotent across resets and hands out fresh
+#     pieces whose durability never accumulates.
+#
+#     BOTH FIGHTERS MUST CARRY THE SAME LOADOUT. This is a self-play opponent
+#     now, not a punching bag: the learner's kit and this one are the same
+#     matchup seen from two seats, and any asymmetry here is an asymmetry the
+#     policy would learn to exploit and then lose to on demo day.
+#
+#     PLACED BEFORE THE TWO `$attribute base set` LINES on purpose, so the
+#     attribute pins are written last. Iron contributes a 0.0f
+#     knockback-resistance modifier (verified above), so `base set 1.0`
+#     survives the armor either way — but there is no reason to make that
+#     ordering question load-bearing. Nothing in this block is an effect, so
+#     it cannot disturb the clear-then-give ordering above either.
+$give $(dummy) minecraft:iron_sword 1
+$item replace entity $(dummy) armor.head with minecraft:iron_helmet
+$item replace entity $(dummy) armor.chest with minecraft:iron_chestplate
+$item replace entity $(dummy) armor.legs with minecraft:iron_leggings
+$item replace entity $(dummy) armor.feet with minecraft:iron_boots
+
 # --- Knockback immunity (attribute) ---
 #     Re-applied every reset so a respawn that re-rolls base values cannot
 #     silently un-pin the dummy.
@@ -184,21 +251,29 @@ $attribute $(dummy) minecraft:generic.movement_speed base set 0.0
 #     above, so this records (x+3, 64, z) — inside this pad, never pad 0.
 $execute as $(dummy) at @s run spawnpoint @s ~ ~ ~
 
-# DEBUG LINE — DO NOT READ `kb_resist=1.0` AS THE FINAL VALUE (T11c).
-#     It is a hard-coded literal, printed unconditionally. It is accurate about
-#     what THIS function just did, and misleading about what the opponent ends
-#     up with: on a scripted-opponent run the bridge's override lands moments
-#     later and sets knockback_resistance to 0.0 and movement_speed to 0.1. The
-#     same caveat applies to the word "idle". Verify knockback by HITTING the
-#     opponent and watching it move, never from this line.
-$tellraw @a[tag=arena_debug] {"text":"[arena] dummy $(dummy) reset @ anchor $(x),$(z) +3.5X (kb_resist=1.0, idle, spawnpoint pinned).","color":"gold"}
+# DEBUG LINE — DO NOT READ `kb_resist=1.0` AS THE FINAL VALUE (T11c), AND DO
+# NOT READ THE LOADOUT AS CONFIRMATION.
+#     Everything after the anchor is a hard-coded literal, printed
+#     unconditionally. It is accurate about what THIS function just did, and
+#     misleading about what the opponent ends up with: on a scripted-opponent
+#     run the bridge's override lands moments later and sets
+#     knockback_resistance to 0.0 and movement_speed to 0.1. The same caveat
+#     applies to the word "idle".
+#     The gear half is the same species of claim: it says the `give` and the
+#     four `item replace`s were ISSUED, not that the armor is on the bot. The
+#     reset read-back gate cannot see armor either — mineflayer's
+#     inventory.items() spans slots 9-44 and the armor slots are 5-8 — so the
+#     only thing that proves this loadout is the fail-closed
+#     server-authoritative read (T3, AC9). Verify knockback by HITTING the
+#     opponent and watching it move, and armor by that read; never from here.
+$tellraw @a[tag=arena_debug] {"text":"[arena] dummy $(dummy) reset @ anchor $(x),$(z) +3.5X (iron_sword + full iron armor, kb_resist=1.0, idle, spawnpoint pinned).","color":"gold"}
 
 # --- RESET CAUSALITY BEACON. MUST STAY THE LAST LINE OF THIS FILE. ----------
 #     See the twin block at the end of spawn_learner_pad.mcfunction for the full
 #     rationale. It matters MOST here: the dummy dies every episode, so its
-#     post-respawn state (full health, empty inventory, effects cleared by
-#     death, at the previously-pinned spawnpoint) is indistinguishable from a
-#     correct reset — and the `generic.` attribute ids above are the single
+#     post-respawn state (full health, effects cleared by death, gear intact
+#     because keepInventory is on — worn armor included, at the
+#     previously-pinned spawnpoint) is indistinguishable from a correct reset — and the `generic.` attribute ids above are the single
 #     likeliest line in this datapack to abort instantiation of this whole
 #     function. Addressed to $(dummy) by name; the bridge listens on the DUMMY's
 #     own connection for it and matches the text exactly.

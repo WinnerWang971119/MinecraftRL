@@ -27,7 +27,10 @@
 #   facing   : +X toward the dummy  (yaw -90, pitch 0)  <- -90, see the teleport
 #   health   : full (20)
 #   food     : full (20) + full saturation
-#   inventory: exactly { iron_sword }
+#   inventory: exactly { iron_sword } in the slots inventory.items() can see,
+#              PLUS a full iron set WORN in the four armor slots, which it
+#              cannot. The re-gear block below owns that distinction; it is
+#              the reason a green reset ack is not evidence of armor.
 #   effects  : none active. The instant_health/saturation instances granted
 #              below last ONE GAMETICK (~50 ms) — see the ordering note further
 #              down for why the `1` is ticks and not seconds — so they are gone
@@ -50,16 +53,18 @@
 # carries no yaw at all. So this correction cannot move that test.
 #
 # Do NOT read the expansion above as a claim about the whole sequence — it
-# differs from the pre-macro arena:spawn_learner in six ways, all deliberate:
+# differs from the pre-macro arena:spawn_learner in seven ways, all deliberate:
 #   1. no trailing `effect clear` (see the ordering note below);
 #   2. an added saturation restore (food/hunger stationarity, plan AC18);
 #   3. an added per-bot /spawnpoint (cross-pad respawn contamination);
 #   4. a different tellraw payload — HEAD emitted
 #      "[arena] learner reset @ 0.5 64 0.5 (iron_sword)."; this file emits the
-#      macro form carrying the username and "spawnpoint pinned";
+#      macro form carrying the username, the loadout and "spawnpoint pinned";
 #   5. every line here is `$`-prefixed, so it is the EXPANSION that matches
 #      HEAD's text, never the source line as written in this file;
-#   6. the spawn yaw is -90; HEAD's 90 was inverted (T22).
+#   6. the spawn yaw is -90; HEAD's 90 was inverted (T22);
+#   7. a full set of iron armor is EQUIPPED (M4 iron loadout, issue #33).
+#      HEAD armed the learner with a sword and dressed it in nothing.
 
 # --- Clear inventory so the read-back gate sees EXACTLY the template gear ---
 $clear $(learner)
@@ -154,8 +159,54 @@ $effect clear $(learner)
 $effect give $(learner) minecraft:instant_health 1 9 true
 $effect give $(learner) minecraft:saturation 1 19 true
 
-# --- Re-gear: exactly one iron sword (matches inventory:['iron_sword']) ---
+# --- Re-gear: one iron sword HELD, a full iron set WORN ---------------------
+#     ARMOR IS `item replace`, NOT `give`, AND THAT IS THE WHOLE POINT.
+#     `/give` pushes a stack into the first free slot of the INVENTORY and
+#     stops there; nothing in Minecraft moves a piece from a player's
+#     inventory onto their body. Four `$give`s would leave the learner
+#     CARRYING a full iron set at zero armor points — armored in the chat
+#     log, in the hotbar screenshot and in the run notes, naked in the fight.
+#     `item replace entity <target> armor.<slot> with <item>` writes the
+#     equipment slot itself, so the piece is worn the instant the command
+#     returns. It also OVERWRITES rather than appends, which makes these FOUR
+#     ARMOR LINES idempotent across resets whatever the `$clear` above left
+#     behind (the `$give` sword above is NOT independently idempotent — it
+#     relies on the `$clear`, and would stack a spare sword per reset without
+#     it), and
+#     hands out a FRESH piece every episode so armor durability never
+#     accumulates across a run. Four `give`s would instead pile a spare set
+#     into the inventory every reset.
+#
+#     ALL FIVE ITEM IDS AND ALL FOUR SLOT NAMES WERE READ OUT OF THE PINNED
+#     JAR, NOT RECALLED. Every line in this file is a macro line, parsed at
+#     INSTANTIATION, so ONE bad id aborts the WHOLE function — no teleport,
+#     no heal, no saturation, no spawnpoint, no gear — silently, with nothing
+#     in the boot log. spawn_dummy_pad.mcfunction's header carries the full
+#     writeup and the three consecutive boot failures that taught it. What
+#     was checked, in server/versions/1.21.1/paper-1.21.1.jar:
+#       - net/minecraft/world/inventory/SlotRanges carries the literals
+#         `armor.head`, `armor.chest`, `armor.legs`, `armor.feet` (alongside
+#         `armor.body`, `weapon.mainhand`, `weapon.offhand`), and
+#         net/minecraft/server/commands/ItemCommands carries `item`,
+#         `replace`, `entity` and `with` — so the grammar below is this
+#         build's, not a later one's.
+#       - net/minecraft/world/item/Items carries iron_helmet,
+#         iron_chestplate, iron_leggings, iron_boots and iron_sword, and
+#         minecraft-data's 1.21.1 registry agrees (864, 865, 866, 867, 833).
+#
+#     THE RESET READ-BACK GATE IS BLIND TO ARMOR. mineflayer's
+#     `inventory.items()` spans slots 9-44 (prismarine-windows/index.js:11,
+#     `minecraft:inventory` -> inventory {start: 9, end: 44}); the four armor
+#     slots are 5-8, outside that window entirely. A template check on
+#     `inventory` therefore reads ['iron_sword'] and PASSES on a fighter
+#     wearing nothing at all — which is why armor is proved by a
+#     server-authoritative read instead, and why that read is fail-closed
+#     (T3, AC9). Never take a green reset ack as evidence the armor is on.
 $give $(learner) minecraft:iron_sword 1
+$item replace entity $(learner) armor.head with minecraft:iron_helmet
+$item replace entity $(learner) armor.chest with minecraft:iron_chestplate
+$item replace entity $(learner) armor.legs with minecraft:iron_leggings
+$item replace entity $(learner) armor.feet with minecraft:iron_boots
 
 # --- Per-bot spawnpoint on THIS pad ----------------------------------------
 #     doImmediateRespawn is true and the world spawn is a single shared point.
@@ -168,18 +219,26 @@ $give $(learner) minecraft:iron_sword 1
 #     above, so this records (x, 64, z) — inside this pad, never pad 0.
 $execute as $(learner) at @s run spawnpoint @s ~ ~ ~
 
-$tellraw @a[tag=arena_debug] {"text":"[arena] learner $(learner) reset @ $(x).5 64 $(z).5 (iron_sword, spawnpoint pinned).","color":"aqua"}
+# DEBUG LINE — IT REPORTS WHAT WAS ASKED FOR, NOT WHAT LANDED.
+#     The loadout text is a hard-coded literal printed unconditionally, the
+#     same species of claim as the dummy's `kb_resist=1.0` (see that file's
+#     DEBUG LINE note). It is emitted from inside the very function that
+#     issues the gear commands, so at most it says they were SENT. The four
+#     armor slots are invisible to the reset gate on top of that. Confirm the
+#     loadout with the server-authoritative read (T3), never from this line.
+$tellraw @a[tag=arena_debug] {"text":"[arena] learner $(learner) reset @ $(x).5 64 $(z).5 (iron_sword + full iron armor, spawnpoint pinned).","color":"aqua"}
 
 # --- RESET CAUSALITY BEACON. MUST STAY THE LAST LINE OF THIS FILE. ----------
 #     The bridge's read-back gate verifies TEMPLATE MATCH, not causality, and
 #     after a kill the natural post-respawn state IS the template state (full
 #     health at the pinned spawnpoint, effects cleared by death, keepInventory
-#     preserving the gear). So if this function ever aborts at INSTANTIATION —
+#     preserving the gear, worn armor included). So if this function ever aborts at INSTANTIATION —
 #     the silent-at-boot, total-at-runtime macro hazard documented in
 #     spawn_dummy_pad's header, whose likeliest real trigger is a Paper 1.21.2
 #     bump or someone "fixing" the `generic.` attribute prefix from memory —
 #     the gate would pass and the bridge would ack a reset that never happened.
-#     No saturation restore (AC18 drifts), no attribute re-apply, invisibly.
+#     No saturation restore (AC18 drifts), no armor, no attribute re-apply,
+#     invisibly.
 #
 #     A bare respawn cannot produce this line, so observing it is proof the
 #     function ran. It is addressed to $(learner) BY NAME rather than @a so a
