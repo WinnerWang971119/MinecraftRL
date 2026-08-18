@@ -15,7 +15,7 @@ signal was designed. Current table:
     | c_dmg_out           | reward per HP dealt  (= +2 / heart)     | 1.0    |
     | c_dmg_in            | penalty per HP taken (= −1 / heart)     | 0.5    |
     | c_step              | per-step penalty (decisiveness)         | 0.005  |
-    | c_aim               | aim shaping, visibility-gated, tiny     | 0.01   |
+    | c_aim               | aim shaping, visibility-gated, tiny     | 0.002  |
     | R_terminal_win      | +W on win                               | 50.0   |
     | R_terminal_loss     | −L on loss (stored positive; negated)   | 30.0   |
     | R_terminal_timeout  | timeout penalty (mild, anti-kiting)     | -15.0  |
@@ -59,7 +59,29 @@ Anti-hacking notes for the tuner (T17):
     is strictly worse than engaging. Tune up only if the agent stalls/kites;
     tune down if it trades recklessly to end episodes.
   - ``c_aim`` is deliberately tiny and **visibility-gated** (see ``compute_reward``)
-    so the agent cannot spin in place to farm an always-on aim bonus.
+    so the agent cannot spin in place to farm an always-on aim bonus. It must also
+    stay **strictly below** ``c_step`` (enforced in ``__post_init__``; equality
+    is REJECTED, and the invariant therefore also implies ``c_step > 0``): the aim
+    bonus is paid whenever the opponent is visible and in the crosshair, while
+    the step penalty is paid on every step regardless, so a stationary agent
+    that simply stares at a visible opponent collects ``+c_aim − c_step`` per
+    step forever. At ``c_aim >= c_step`` that nets to zero or positive — a flat
+    or uphill degenerate equilibrium with no gradient pushing the agent back
+    toward engaging — which is exactly issue #25 (a mutually-staring pair of
+    self-play agents converges to an infinite draw). Keeping ``c_aim`` strictly
+    less than ``c_step`` makes staring net-negative **at the default
+    ``c_approach == 0``**, so standing still and aiming is never a rest state;
+    the agent still has to act to stop bleeding reward.
+
+    NOTE FOR THE T17 TUNER, measured not assumed: that guarantee is conditional
+    on the potential term being off. In a self-loop state the shaping term pays
+    ``γΦ − Φ = (1−γ)·c_approach·d`` per step, so enabling ``c_approach`` reopens
+    the stare bonus and reintroduces issue #25 even with ``c_aim < c_step``.
+    Measured against this code at normalized ``d = 1``: ``c_approach`` 0.0 →
+    −0.003/step, 0.3 → 0.000/step, 1.0 → +0.007/step. The break-even is
+    ``c_approach > (c_step − c_aim)/((1−γ)·d)``. The validator deliberately does
+    NOT couple ``c_approach`` into the ordering check — that is a new invariant,
+    not this one — so if you turn shaping on, re-derive this bound yourself.
   - ``R_terminal_win`` (50) is kept well above the loss penalty (30) on purpose:
     the agent should chase the win, not play it safe to avoid the loss. Raising
     the loss penalty back toward the win would re-teach the timid, avoid-combat
@@ -106,7 +128,14 @@ class RewardConfig:
             run-away.
         c_aim: Aim-shaping bonus, added only when the opponent is **visible AND**
             under the crosshair. Deliberately tiny and visibility-gated to block
-            spin-to-farm. ``TUNE`` (0.01).
+            spin-to-farm. ``TUNE`` (0.002). Must be strictly less than
+            ``c_step`` (enforced in ``__post_init__``, equality included): the
+            aim bonus and the step penalty are both paid every step a
+            stationary agent stares at a visible, in-crosshair opponent, so if
+            ``c_aim >= c_step`` that behavior nets to zero-or-positive reward
+            forever — a degenerate stable equilibrium with no gradient out of
+            it (issue #25). ``c_aim < c_step`` keeps staring strictly
+            net-negative.
         R_terminal_win: Terminal reward added on a win. ``TUNE`` (50.0). Kept
             large so winning dominates every other term. Must be strictly
             positive and strictly greater than ``R_terminal_timeout``.
@@ -138,7 +167,7 @@ class RewardConfig:
 
     # --- shaping ---
     c_step: float = 0.005
-    c_aim: float = 0.01
+    c_aim: float = 0.002
 
     # --- terminal (win > timeout > loss; a scored loss is always the worst
     # outcome so the agent never prefers dying to running out the clock) ---
@@ -151,7 +180,7 @@ class RewardConfig:
     c_approach: float = 0.0
 
     def __post_init__(self) -> None:
-        """Enforce the terminal-reward invariant: finiteness, signs, ordering.
+        """Enforce the terminal-reward invariant and the aim/step ordering.
 
         The three terminal fields interact (``R_terminal_loss`` is stored
         positive and negated at the call site in :func:`env.reward._terminal_reward`)
@@ -170,6 +199,23 @@ class RewardConfig:
           - ``-R_terminal_loss < R_terminal_timeout < R_terminal_win`` (a scored
             loss is always the worst terminal outcome, strictly worse than
             timing out; winning is always the best).
+
+        ``c_aim`` and ``c_step`` interact the same way (issue #25): both are
+        paid on the same step when the opponent is visible and in the
+        crosshair, so a config that passes each coefficient's own
+        finite/non-negative check in isolation can still make a stationary,
+        staring agent net zero-or-positive reward forever if ``c_aim`` is not
+        held strictly below ``c_step``. This guards that combined invariant
+        too:
+
+          - both finite (no inf/-inf/nan),
+          - both non-negative (a negative shaping coefficient would flip the
+            sign of the intended incentive),
+          - ``c_aim < c_step`` **strictly** — equality is rejected because at
+            ``c_aim == c_step`` staring is exactly free (net 0 per step): a
+            flat local optimum with no gradient pushing the agent back toward
+            engaging is just as much a degenerate equilibrium as a profitable
+            one.
         """
         for name in ("R_terminal_win", "R_terminal_loss", "R_terminal_timeout"):
             value = getattr(self, name)
@@ -203,4 +249,31 @@ class RewardConfig:
                 f"R_terminal_win={self.R_terminal_win!r} "
                 "(a scored loss must remain the worst outcome, and winning "
                 "must remain the best)"
+            )
+
+        for name in ("c_aim", "c_step"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"RewardConfig.{name} must be finite, got {value!r}"
+                )
+            # `not 0.0 <= value` (rather than `value < 0.0`) also rejects NaN,
+            # matching the idiom used elsewhere in this repo (train_config.py,
+            # dqn.py, scripted_bot.py) — belt-and-braces
+            # with the isfinite check above, since a coefficient that is
+            # merely negative would silently flip the sign of the intended
+            # incentive.
+            if not 0.0 <= value:
+                raise ValueError(
+                    f"RewardConfig.{name} must be non-negative, got {value!r}"
+                )
+        if not self.c_aim < self.c_step:
+            raise ValueError(
+                "RewardConfig aim/step ordering violated: require "
+                f"c_aim < c_step (strictly), got c_aim={self.c_aim!r}, "
+                f"c_step={self.c_step!r} (a stationary agent that stares at a "
+                "visible, in-crosshair opponent is paid c_aim every step it "
+                "does so and c_step every step regardless; at c_aim >= c_step "
+                "that nets to zero-or-positive reward forever — issue #25 — "
+                "so staring must remain strictly net-negative)"
             )
