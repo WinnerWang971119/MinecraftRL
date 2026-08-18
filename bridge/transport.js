@@ -268,15 +268,26 @@ function validateSelf(self) {
 }
 
 function validateOpponent(opp) {
-  requireExactKeys(opp, ['pos', 'yaw', 'pitch', 'velocity', 'health'], 'state.opponent');
+  // `requireExactKeys` is exact in BOTH directions: it rejects a missing key and
+  // an unexpected one. Adding a field to the wire without adding it here does
+  // not merely leave it unvalidated — it makes every state message throw on an
+  // unexpected property, so this list and schema.json's opponent `required`
+  // array move together or the bridge stops emitting at the first window.
+  requireExactKeys(
+    opp,
+    ['pos', 'yaw', 'pitch', 'velocity', 'on_ground', 'health', 'held_item'],
+    'state.opponent',
+  );
   validateVec3(opp.pos, 'state.opponent.pos');
   requireField(isFiniteNumber(opp.yaw), 'state.opponent.yaw must be a finite number');
   requireField(isFiniteNumber(opp.pitch), 'state.opponent.pitch must be a finite number');
   validateVec3(opp.velocity, 'state.opponent.velocity');
+  requireField(isBoolean(opp.on_ground), 'state.opponent.on_ground must be a boolean');
   // PRIVILEGED: opponent.health is RAW true health. It is on the wire (reward
   // may read it) but MUST NEVER reach the observation (gated by the
   // PerceptionFilter, T12). The transport only checks it is a number.
   requireField(isFiniteNumber(opp.health), 'state.opponent.health must be a finite number');
+  requireField(isString(opp.held_item), 'state.opponent.held_item must be a string');
 }
 
 function validateEvents(events) {

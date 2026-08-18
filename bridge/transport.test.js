@@ -86,7 +86,9 @@ function makeStateMsg() {
       yaw: 3.14,
       pitch: 0.0,
       velocity: [0.0, 0.0, 0.0],
+      on_ground: true,
       health: 20.0,
+      held_item: 'iron_sword',
     },
     events: { damage_dealt: 0.0, damage_taken: 0.0, i_died: false, opponent_died: false },
     arena: { wall_distances: [8.0, 8.0, 8.0, 8.0] },
@@ -335,6 +337,71 @@ test('validateOutbound still rejects OTHER unexpected state fields', () => {
     () => validateOutbound({ ...makeStateMsg(), opp_action_executed: true, extra: 1 }),
     WireError,
   );
+});
+
+// ===========================================================================
+// state.opponent.on_ground / .held_item — the mirrored-observation fields.
+//
+// `validateOpponent` uses `requireExactKeys`, which is exact in BOTH
+// directions. That makes this validator the surface most likely to take the
+// whole bridge down on a wire change: forget to ADD a field here and every
+// state message throws on an unexpected property at the first decision window;
+// forget to require it and a producer that silently dropped it ships a block
+// the mirrored observation reads as a fabricated default. TC2 covers the
+// missing direction, TC3 the extra one.
+// ===========================================================================
+
+for (const field of ['on_ground', 'held_item']) {
+  test(`validateOpponent REJECTS a state.opponent missing "${field}" (TC2)`, () => {
+    const msg = makeStateMsg();
+    delete msg.opponent[field];
+    assert.throws(() => validateOutbound(msg), WireError);
+    assert.throws(
+      () => validateOutbound(msg),
+      new RegExp(`state\\.opponent missing required field "${field}"`),
+    );
+  });
+}
+
+test('validateOpponent REJECTS an UNKNOWN extra opponent key (TC3)', () => {
+  // requireExactKeys must stay exact: widening the list for two new fields must
+  // not turn the opponent block into a free-form bag.
+  const msg = makeStateMsg();
+  msg.opponent.sprinting = true;
+  assert.throws(() => validateOutbound(msg), WireError);
+  assert.throws(() => validateOutbound(msg), /state\.opponent has unexpected field "sprinting"/);
+});
+
+test('validateOpponent REJECTS wrong-typed on_ground / held_item', () => {
+  // `1` is the dangerous one: truthy, and it would reach the mirrored
+  // observation as a number where a boolean is specified.
+  for (const bad of [1, 0, 'true', null]) {
+    const msg = makeStateMsg();
+    msg.opponent.on_ground = bad;
+    assert.throws(
+      () => validateOutbound(msg),
+      /state\.opponent\.on_ground must be a boolean/,
+      `on_ground must reject ${JSON.stringify(bad)}`,
+    );
+  }
+  for (const bad of [7, null, ['iron_sword']]) {
+    const msg = makeStateMsg();
+    msg.opponent.held_item = bad;
+    assert.throws(
+      () => validateOutbound(msg),
+      /state\.opponent\.held_item must be a string/,
+      `held_item must reject ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('validateOpponent ACCEPTS both new fields at their edge values', () => {
+  // An empty hand is "" (not absent) and a grounded-false reading is a real
+  // reading — neither may be mistaken for a missing field.
+  const msg = makeStateMsg();
+  msg.opponent.on_ground = false;
+  msg.opponent.held_item = '';
+  assert.equal(validateOutbound(msg), msg, 'returns the message unchanged');
 });
 
 // ===========================================================================

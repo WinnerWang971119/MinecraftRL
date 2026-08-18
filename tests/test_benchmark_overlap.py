@@ -93,7 +93,9 @@ def _make_state(tick: int = 1) -> StateMsg:
                 "yaw": 0.0,
                 "pitch": 0.0,
                 "velocity": [0.0, 0.0, 0.0],
+                "on_ground": True,
                 "health": 20.0,
+                "held_item": "iron_sword",
             },
             "events": {
                 "damage_dealt": 0.0,

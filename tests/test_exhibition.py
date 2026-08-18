@@ -1138,7 +1138,9 @@ def _state_msg(*, tick, opp_health=20.0, opponent_died=False, visible=True):
                 "yaw": 0.0,
                 "pitch": 0.0,
                 "velocity": [0.0, 0.0, 0.0],
+                "on_ground": True,
                 "health": opp_health,
+                "held_item": "iron_sword",
             },
             "events": {
                 "damage_dealt": 0.0,

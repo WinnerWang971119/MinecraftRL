@@ -1235,8 +1235,9 @@ function buildEventsBlock(agg) {
  * @param {object} parts.self Raw self snapshot {pos, yaw, pitch, velocity,
  *   on_ground, health, held_item, attack_cooldown}; yaw/pitch protocol-convention.
  * @param {object} parts.opponent Raw opponent snapshot {pos, yaw, pitch,
- *   velocity, health} (health is PRIVILEGED — reward-only downstream);
- *   yaw/pitch protocol-convention.
+ *   velocity, on_ground, health, held_item} (health is PRIVILEGED — reward-only
+ *   downstream); yaw/pitch protocol-convention. `on_ground`/`held_item` come
+ *   from the opponent's OWN connection upstream — see `_snapshotOpponent`.
  * @param {object} parts.events Drained EventAggregator block.
  * @param {number[]} parts.wallDistances Arena wall-distance probe (fixed order).
  * @param {number} parts.tick End-of-window server tick (>= 0 integer).
@@ -1269,8 +1270,15 @@ function assembleStateMsg(parts) {
       yaw: finiteOr(opponent.yaw, 0),
       pitch: finiteOr(opponent.pitch, 0),
       velocity: toVec3(opponent.velocity),
+      // This block is rebuilt FIELD BY FIELD, so anything the producer
+      // (_snapshotOpponent) emits that is not named here is silently dropped
+      // before validateOutbound ever sees the message — the failure looks like
+      // the producer never wrote the field at all. Every key in schema.json's
+      // opponent `required` list must therefore appear below.
+      on_ground: Boolean(opponent.on_ground),
       // PRIVILEGED raw true health — on the wire, reward-only downstream.
       health: finiteOr(opponent.health, 0),
+      held_item: typeof opponent.held_item === 'string' ? opponent.held_item : '',
     },
     events: buildEventsBlock(parts.events),
     arena: { wall_distances: wall.map((d) => finiteOr(d, 0)) },
@@ -4174,13 +4182,47 @@ class ArenaBots {
     // because unifying them is a cosmetic cleanup on a FROZEN training path,
     // and "byte-identical on the training path" is the bar for this change.
     const bot = this._opponentBot();
+    // PROVENANCE FOR `on_ground` — the same rule health follows one line down,
+    // and an uglier mechanic. Mineflayer maintains this field only for the bot
+    // whose connection you are holding: prismarine-physics writes
+    // `bot.entity.onGround` each simulated tick for the SELF entity, while for
+    // any OTHER entity it is a constructor constant — prismarine-entity sets
+    // `onGround = true` when the entity object is created and nothing (no
+    // mineflayer packet handler, no physics) ever writes it again. A read
+    // through another client is therefore not stale data; it is a hardcoded
+    // `true` that looks like a measurement and never was one — the same class
+    // of defect that left `damage_dealt` a flat 0 for the life of this
+    // project. So the opponent's own connection is the only source consulted
+    // here — never `entity`, the handle the learner's client resolved.
+    //
+    // `bot.entity` still missing means "no reading" and emits `false`, matching
+    // what _snapshotSelf does with no entity.
+    //
+    // A HUMAN challenger (`opponentMode === 'human'`) has no bot connection at
+    // all, and there is no reading to fall back to: an earlier revision read
+    // the handle view here, which per the above would have emitted the
+    // constructor constant `true` for as long as the match lasted. That branch
+    // was removed; a human emits the same no-reading `false`, next to the
+    // no-reading values this block already carries in that state (`health` 0,
+    // `held_item` ""). That "" is what the human path emits for `held_item`,
+    // because held items are read exclusively from the opponent's own
+    // connection (_heldItemName(bot), and bot is null for a human). Unlike
+    // `onGround`, a handle-view held item WOULD at least be backed by real
+    // entity_equipment broadcasts, but the field's only consumer is the
+    // self-play mirror, which seats bot opponents only, so the single-source
+    // rule stands and nothing is lost.
+    const ownEntity = bot !== null && bot.entity ? bot.entity : null;
     return {
       pos: entity ? entity.position : null,
       yaw: entity ? toProtocolYaw(entity.yaw) : 0,
       pitch: entity ? toProtocolPitch(entity.pitch) : 0,
       velocity: entity ? entity.velocity : null,
+      on_ground: ownEntity ? Boolean(ownEntity.onGround) : false,
       // PRIVILEGED raw true health — reward-only downstream, never the obs.
       health: bot && typeof bot.health === 'number' ? bot.health : 0,
+      // Same own-connection rule; "" when there is no bot to ask (human
+      // challenger) or its hand is empty, matching the zeroed-opponent block.
+      held_item: this._heldItemName(bot),
     };
   }
 

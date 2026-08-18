@@ -2180,7 +2180,13 @@ test('TC22: a challenger who leaves mid-match zeroes the opponent block, keeps t
     yaw: 0,
     pitch: 0,
     velocity: [0, 0, 0],
+    // "No reading" for the two mirrored-observation fields is `false` / `""`,
+    // never an absent key: the block still has to satisfy the schema's opponent
+    // `required` list while nobody is standing on the pad. A departed human
+    // challenger is also the one path with no bot connection to read from.
+    on_ground: false,
     health: 0,
+    held_item: '',
   });
   assert.equal(arena.learner.attacked.length, 0, 'nothing to swing at');
   assert.equal(arena.executor.lastSwingTick, null, 'a swing at nobody never starts the cooldown');
@@ -4270,4 +4276,179 @@ test('YAW CONVENTION: assembleStateMsg passes angles through UNCHANGED (converte
   assert.equal(msg.opponent.yaw, -2.5);
   assert.equal(msg.opponent.pitch, 0.5);
   assert.equal(validateOutbound(msg), msg, 'and the result is still schema-valid');
+});
+
+// ===========================================================================
+// state.opponent.on_ground / .held_item — the mirrored-observation fields.
+//
+// The opponent seat needs the same inputs the learner seat gets, and these two
+// had no wire channel. Both bot.js surfaces must change together:
+// `_snapshotOpponent` PRODUCES them, and `assembleStateMsg` — which rebuilds the
+// opponent block field by field — must name them or it strips them back off
+// before `validateOutbound` ever runs, a failure that reads exactly like the
+// producer never having emitted them.
+// ===========================================================================
+
+test('assembleStateMsg PRESERVES opponent on_ground and held_item end to end (TC4)', () => {
+  // NON-DEFAULT values on purpose — not because a falsy fixture would miss a
+  // revert (it would not: reverting the assembler edit deletes the keys, and
+  // `assert.equal(undefined, false)` THROWS, since `undefined` is loosely
+  // equal only to `null`/`undefined`), but because non-default values prove
+  // the assembler forwards the PRODUCER's value: a pass on `true` /
+  // `'iron_sword'` cannot be explained by an unconditionally emitted
+  // `false` / `''`.
+  const msg = assembleStateMsg({
+    self: {
+      pos: [0, 64, 0],
+      yaw: 0,
+      pitch: 0,
+      velocity: [0, 0, 0],
+      on_ground: true,
+      health: MAX_HEALTH,
+      held_item: 'iron_sword',
+      attack_cooldown: 1,
+    },
+    opponent: {
+      pos: [0, 64, 5],
+      yaw: 0,
+      pitch: 0,
+      velocity: [0, 0, 0],
+      on_ground: true,
+      health: MAX_HEALTH,
+      held_item: 'iron_sword',
+    },
+    events: {},
+    wallDistances: [],
+    tick: 1,
+    codeVersion: 'test',
+  });
+
+  assert.equal(msg.opponent.on_ground, true, 'on_ground survived the rebuild');
+  assert.equal(msg.opponent.held_item, 'iron_sword', 'held_item survived the rebuild');
+  assert.equal(validateOutbound(msg), msg, 'and the assembled message is schema-valid');
+});
+
+test('assembleStateMsg coerces a not-ready opponent to false / "" and still validates', () => {
+  // The zeroed-opponent block (absent opponent, challenger who left) must stay
+  // schema-valid: "no reading" is `false` / `""`, never a missing key.
+  const msg = assembleStateMsg({
+    self: {},
+    opponent: {},
+    events: {},
+    wallDistances: [],
+    tick: 0,
+    codeVersion: 'x',
+  });
+
+  assert.equal(msg.opponent.on_ground, false);
+  assert.equal(msg.opponent.held_item, '');
+  assert.doesNotThrow(() => validateOutbound(msg));
+});
+
+test('PROVENANCE: _snapshotOpponent reads on_ground from the opponent\'s OWN connection (TC5)', () => {
+  // THE failure this guards against, by name: `damage_dealt` was a flat 0 for
+  // the life of this project because the opponent's health was read from the
+  // LEARNER's view of the dummy entity, and mineflayer never populates state on
+  // a non-self entity. `on_ground` is the same class of field, so it must come
+  // from `_opponentBot().entity`, never from the handle the learner resolved.
+  //
+  // The two views below DISAGREE on purpose: the handle carries a stale
+  // `onGround: false` (what a learner-client read would produce), the dummy's
+  // own connection carries the truth.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  bots.dummy = {
+    health: MAX_HEALTH,
+    heldItem: { name: 'iron_sword' },
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 0, y: 0, z: 0 },
+      onGround: true,
+    },
+  };
+  const staleHandle = {
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 0, y: 0, z: 0 },
+      onGround: false, // the stale learner-view reading
+    },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  const snapshot = bots._snapshotOpponent(staleHandle);
+
+  assert.equal(
+    snapshot.on_ground,
+    true,
+    'on_ground must come from the dummy\'s own connection, not the stale handle entity',
+  );
+  assert.equal(snapshot.held_item, 'iron_sword', 'held_item comes from the same connection');
+
+  // And the reverse pairing, so the test cannot pass by always reporting true.
+  bots.dummy.entity.onGround = false;
+  staleHandle.entity.onGround = true;
+  assert.equal(
+    bots._snapshotOpponent(staleHandle).on_ground,
+    false,
+    'the handle view must not be able to flip the emitted value in either direction',
+  );
+});
+
+test('PROVENANCE: an opponent bot with no entity yet reports on_ground false, not the handle view', () => {
+  // A connection that exists but has not spawned its entity means "no reading".
+  // Falling back to the handle entity here would reintroduce exactly the stale
+  // cross-client read the rule above exists to forbid.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  bots.dummy = { health: MAX_HEALTH, entity: null };
+  const handle = {
+    entity: { position: { x: 0, y: 64, z: 5 }, yaw: 0, pitch: 0, velocity: { x: 0, y: 0, z: 0 }, onGround: true },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  assert.equal(bots._snapshotOpponent(handle).on_ground, false);
+  assert.equal(bots._snapshotOpponent(handle).held_item, '', 'an empty hand reads as ""');
+});
+
+test('PROVENANCE: a HUMAN challenger emits no-reading defaults — a non-self onGround is a constructor constant', () => {
+  // There is no handle-view fallback for a human, because there is nothing to
+  // fall back TO: prismarine-entity sets `onGround = true` in the entity
+  // constructor and nothing ever writes a non-self entity's value again, so a
+  // handle read would put that hardcoded `true` on the wire for the whole
+  // match — a fabricated value, the same class of defect as the damage_dealt
+  // outage. The handle below carries exactly that constructor constant; the
+  // snapshot must NOT forward it, and must emit this file's "no reading"
+  // convention instead (`false` / `""`, like the connection-with-no-entity
+  // case above).
+  const bots = new ArenaBots(
+    { opponentMode: 'human', challengerUsername: 'Steve' },
+    { transport: { send: () => {} } },
+  );
+  const handle = {
+    entity: { position: { x: 0, y: 64, z: 5 }, yaw: 0, pitch: 0, velocity: { x: 0, y: 0, z: 0 }, onGround: true },
+    isBot: false,
+    username: 'Steve',
+  };
+
+  const snapshot = bots._snapshotOpponent(handle);
+
+  assert.equal(bots._opponentBot(), null, 'a human challenger has no bot connection');
+  assert.equal(snapshot.on_ground, false, 'no connection means no reading, never the constructor constant');
+  assert.equal(snapshot.held_item, '', 'no connection to read a held item from');
+  // The broadcast-backed kinematics still come from the handle — the removed
+  // fallback is scoped to the own-connection fields, not the whole block.
+  assert.deepEqual(snapshot.pos, { x: 0, y: 64, z: 5 });
+});
+
+test('the zeroed opponent block (no opponent at all) carries both fields', () => {
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+
+  const snapshot = bots._snapshotOpponent(null);
+
+  assert.equal(snapshot.on_ground, false);
+  assert.equal(snapshot.held_item, '');
 });
