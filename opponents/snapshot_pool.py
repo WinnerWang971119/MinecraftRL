@@ -80,6 +80,7 @@ from agent.contract_config import code_version
 
 __all__ = [
     "DEFAULT_SAMPLING",
+    "DRAW_SCORE",
     "ELO_INITIAL",
     "ELO_K",
     "INDEX_FILENAME",
@@ -109,6 +110,15 @@ ELO_K = 24.0
 #: The learner's starting rating. Snapshot ratings are frozen at creation to the
 #: learner's rating at that moment and never move again.
 ELO_INITIAL = 1000.0
+
+#: The score a DRAW contributes, from the learner's side and the snapshot's
+#: alike: an episode in which neither fighter died is half a win. Named here
+#: rather than left as a literal because TWO places have to agree on it — the
+#: driver that WRITES it (``agent.train.SnapshotOpponentDriver.observe_outcome``)
+#: and :meth:`SnapshotPool.record_result`, which RECOGNIZES it to count
+#: ``selfplay/draw_rate``. Two independent literals could drift apart, and the
+#: symptom would be a draw rate reading 0.0 through a night of timeouts.
+DRAW_SCORE = 0.5
 
 #: Index file inside the pool directory (``runs/<run>/snapshots/pool.json``).
 INDEX_FILENAME = "pool.json"
@@ -598,6 +608,15 @@ class SnapshotPool:
         self._persisted_generation = -1
         self._learner_elo_online = self._elo_initial
         self._learner_elo_rated = self._elo_initial
+        # Match accounting behind ``selfplay/draw_rate`` and the "is the rated
+        # series about to come out empty?" tell. Pool-wide rather than folded
+        # into :class:`MatchStats`, because a draw is NOT recoverable from that
+        # pair of numbers: ``learner_wins`` sums 1.0/0.5/0.0 into one float, so
+        # two draws and one win plus one loss are both ``plays=2, wins=1.0``.
+        # All three are guarded by `_lock` and carried in the index.
+        self._matches_scored = 0
+        self._draws_scored = 0
+        self._rated_matches = 0
 
         os.makedirs(self.directory, exist_ok=True)
 
@@ -646,6 +665,52 @@ class SnapshotPool:
         """
         with self._lock:
             return self._learner_elo_rated
+
+    @property
+    def matches_scored(self) -> int:
+        """How many matches have been through :meth:`record_result`.
+
+        The denominator of :attr:`draw_rate`, and on its own the answer to "did
+        the self-play path score ANYTHING tonight?" — zero here after hours of
+        episodes means no outcome ever reached the pool, which no other metric
+        reports.
+        """
+        with self._lock:
+            return self._matches_scored
+
+    @property
+    def draws_scored(self) -> int:
+        """How many of those matches scored exactly :data:`DRAW_SCORE`."""
+        with self._lock:
+            return self._draws_scored
+
+    @property
+    def rated_matches(self) -> int:
+        """How many were ``rated_eligible`` — what builds ``elo/learner_rated``.
+
+        The number that separates "the learner stopped improving" from "nothing
+        ever fed the rated series". Both look like a flat line at
+        :attr:`elo_initial`, and only this counter tells them apart: it is zero
+        exactly when every match so far was played with at least one side
+        exploring, which at the shipped ``opponent_epsilon`` default is every
+        TRAINING match.
+        """
+        with self._lock:
+            return self._rated_matches
+
+    @property
+    def draw_rate(self) -> float:
+        """Fraction of scored matches that were draws; ``0.0`` before any match.
+
+        Numerator and denominator are read under ONE lock acquisition, so they
+        describe the same instant. Computed from two separate property reads
+        instead, the value could exceed 1.0 while arena threads score
+        concurrently.
+        """
+        with self._lock:
+            if self._matches_scored <= 0:
+                return 0.0
+            return self._draws_scored / float(self._matches_scored)
 
     def __len__(self) -> int:
         """Number of LIVE snapshots (dropped ones do not count)."""
@@ -796,7 +861,9 @@ class SnapshotPool:
           * the head-to-head :class:`MatchStats` (``plays += 1``,
             ``learner_wins += score``) — the input to the PFSP weighting;
           * ``elo/learner_online``, from EVERY result;
-          * ``elo/learner_rated``, only when ``result.rated_eligible``.
+          * ``elo/learner_rated``, only when ``result.rated_eligible``;
+          * the pool-wide match counters behind ``selfplay/draw_rate`` and
+            :attr:`rated_matches`.
 
         Only the learner's rating moves. The opponent's rating is the snapshot's
         frozen ``elo``; if the snapshot was dropped while the match was in
@@ -835,10 +902,20 @@ class SnapshotPool:
             stats.plays += 1
             stats.learner_wins += score
 
+            self._matches_scored += 1
+            # Exact equality against the shared literal, deliberately. The score
+            # alphabet this project produces is {0.0, DRAW_SCORE, 1.0} and the
+            # only producer writes DRAW_SCORE itself, so there is no arithmetic
+            # here to round; a tolerance would start counting near-misses that
+            # cannot occur as draws.
+            if score == DRAW_SCORE:
+                self._draws_scored += 1
+
             self._learner_elo_online = updated_elo(
                 self._learner_elo_online, opponent_elo, score, self._elo_k
             )
             if result.rated_eligible:
+                self._rated_matches += 1
                 self._learner_elo_rated = updated_elo(
                     self._learner_elo_rated, opponent_elo, score, self._elo_k
                 )
@@ -1050,7 +1127,8 @@ class SnapshotPool:
         """Return the JSON-serializable index: the exact content of ``pool.json``.
 
         Also the round-trip witness — two pools with equal index payloads hold
-        the same snapshots, the same statistics and the same Elo.
+        the same snapshots, the same statistics, the same Elo and the same match
+        accounting.
 
         Every payload is stamped with ``index_generation``: the pool's monotone
         version counter as of the moment it was built. That stamp is what lets
@@ -1071,6 +1149,11 @@ class SnapshotPool:
                 "elo_initial": self._elo_initial,
                 "learner_elo_online": self._learner_elo_online,
                 "learner_elo_rated": self._learner_elo_rated,
+                # Carried so a resumed run's `selfplay/draw_rate` describes the
+                # whole run rather than restarting from the restart.
+                "matches_scored": self._matches_scored,
+                "draws_scored": self._draws_scored,
+                "rated_matches": self._rated_matches,
                 "next_snapshot_id": self._next_id,
                 "snapshots": [
                     {
@@ -1204,9 +1287,9 @@ class SnapshotPool:
     ) -> "SnapshotPool":
         """Rebuild a pool from ``directory``/``pool.json``.
 
-        Restores the registry, the per-snapshot statistics, both Elo series and
-        the id counter, so a restarted run continues numbering where it stopped
-        (ids are never reused, even across restarts).
+        Restores the registry, the per-snapshot statistics, both Elo series,
+        the match counters and the id counter, so a restarted run continues
+        numbering where it stopped (ids are never reused, even across restarts).
 
         PINNED snapshots are verified to exist right here, so a run that lost a
         reference file fails at startup rather than a thousand episodes later,
@@ -1303,6 +1386,11 @@ class SnapshotPool:
             pool._learner_elo_rated = float(
                 raw.get("learner_elo_rated", pool._elo_initial)
             )
+            # `.get` with a zero default: an index written before these counters
+            # existed is not malformed, it just has no history to restore.
+            pool._matches_scored = int(raw.get("matches_scored", 0))
+            pool._draws_scored = int(raw.get("draws_scored", 0))
+            pool._rated_matches = int(raw.get("rated_matches", 0))
             known_ids = list(pool._records) + list(pool._retired_elo)
             # max(...)+1 as a floor: ids must stay monotone even if the stored
             # counter was written by an older build or hand-edited.
