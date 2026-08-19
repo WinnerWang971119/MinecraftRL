@@ -310,10 +310,10 @@ scoreboard setup.
 > **The dummy is no longer unarmored, so the number you *watch* is not 6.** Since M4
 > (issue #33) `spawn_dummy_pad.mcfunction` gives it a full iron set — 15 armor points,
 > about 48% off an incoming 6, so roughly **3.12** a hit and about **7** hits to a kill.
-> `eval.combat_probe`'s `6, 6, 6, 2` assertion was written against the bare-handed
-> regime and has **not** been recalibrated in the tool; if it red-fails on the per-hit
-> sequence while the fight otherwise looks healthy, check that before assuming the
-> damage channel broke.
+> `eval.combat_probe` **has** been recalibrated (T23): it now derives the expectation
+> from the target's loadout and expects `3.12` six times then `1.28`. It prints what it
+> expects before the first cycle. An earlier revision of this box said the tool had not
+> been recalibrated — that was true when written and is not now.
 
 Expect a **mix, weighted toward timeouts**: a random policy has to still be standing
 in melee range at the moment it happens to pick ATTACK, and it wanders. Kills happen;
