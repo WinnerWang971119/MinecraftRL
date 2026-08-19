@@ -2036,3 +2036,1427 @@ class TestTheEvalHandoffForwardsTheMirror:
         assert returned is None
         assert recorded == {}, "no env means the inner eval must not run at all"
         assert collector.calls == ["pause", "resume"]
+
+
+# ===========================================================================
+# T12 — the two Elo series, and the epsilon=0 gap that decides AC7.
+#
+# THE FAILURE MODE IS SILENCE. `elo/learner_rated` is the AC7 rising-trend
+# series and the checkpoint-selection input, and it moves ONLY on matches where
+# both epsilons are exactly 0.0. Nothing raises when that never happens: the run
+# trains all night, `elo/learner_online` fills up, and the rated series sits at
+# its initial rating looking exactly like a flat curve. Every test below fails
+# on a specific way to reach that morning.
+# ===========================================================================
+
+
+def _pool_and_driver(tmp_path, *, rated: bool, **cfg_overrides: Any):
+    """Build a pool plus ONE driver over it — training or rated as asked."""
+    from agent.train import SnapshotOpponentDriver, build_rated_eval_opponent
+
+    warm = _write_default_checkpoint(tmp_path / "warm.pt")
+    cfg = _selfplay_cfg(warm, **cfg_overrides)
+    pool, opponent_for = _build_opponents(cfg, tmp_path / "pool")
+    if rated:
+        driver = build_rated_eval_opponent(
+            cfg, pool, net_factory=_net_factory
+        )()
+        assert isinstance(driver, SnapshotOpponentDriver)
+    else:
+        driver = opponent_for(0)
+    return cfg, pool, driver
+
+
+def _play(driver, *, won: bool = True, lost: bool = False) -> None:
+    """Run one whole match through the driver: sample, then score the outcome."""
+    driver.begin_episode()
+    driver.observe_outcome({"won": won, "lost": lost})
+
+
+class TestTheRatedEvalDriverExists:
+    """The eps=0 capability the rated series needs, and cannot be faked without.
+
+    Before it, ``SnapshotOpponentDriver`` bound ``cfg.opponent_epsilon`` once in
+    its constructor and stamped it on every ``MatchResult``, so the only way to
+    get a rated match was to make the whole RUN greedy. ``--opponent-epsilon 0``
+    is not that fix: it makes the frozen opponent greedy in TRAINING too, and a
+    greedy learner facing a greedy snapshot can replay one deterministic episode
+    until morning.
+    """
+
+    def test_a_rated_driver_pins_both_epsilons_to_exactly_zero(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, _, driver = _pool_and_driver(tmp_path, rated=True, opponent_epsilon=0.02)
+
+        assert driver.rated is True
+        # Exact equality, not approx: MatchResult.rated_eligible is an `== 0.0`
+        # test, so a value that is merely epsilon-adjacent empties the series.
+        assert driver.epsilon == 0.0
+        assert driver.learner_epsilon == 0.0
+
+    def test_the_training_driver_keeps_its_own_epsilon(self, tmp_path):
+        pytest.importorskip("torch")
+
+        cfg, _, driver = _pool_and_driver(
+            tmp_path, rated=False, opponent_epsilon=0.02
+        )
+
+        assert driver.rated is False
+        assert driver.epsilon == pytest.approx(cfg.opponent_epsilon)
+        # The learner-side default stays the eps FLOOR, never 0.0: an unwired
+        # path must not be able to manufacture a rated match.
+        assert driver.learner_epsilon == pytest.approx(cfg.eps_end)
+
+    def test_the_rated_driver_is_a_separate_object_from_every_training_one(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        from agent.train import build_rated_eval_opponent
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm, arenas=3)
+        pool, opponent_for = _build_opponents(cfg, tmp_path / "pool")
+        build = build_rated_eval_opponent(cfg, pool, net_factory=_net_factory)
+
+        rated = build()
+        training = [opponent_for(i) for i in range(cfg.arenas)]
+
+        assert all(rated is not driver for driver in training)
+        assert all(rated.net is not driver.net for driver in training)
+        # A FRESH driver per call, like build_eval_opponent: two eval cycles must
+        # not share one LSTM state or one snapshot-sampling stream.
+        assert build() is not rated
+
+    def test_the_rated_driver_sits_in_a_band_no_collector_owns(self, tmp_path):
+        pytest.importorskip("torch")
+
+        from agent.train import build_rated_eval_opponent
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm, arenas=4)
+        pool, _ = _build_opponents(cfg, tmp_path / "pool")
+
+        driver = build_rated_eval_opponent(cfg, pool, net_factory=_net_factory)()
+
+        # One past the last collector — the same band build_eval_opponent uses,
+        # which is safe because the ROLES differ and opponent_seed offsets by
+        # role. Sharing a collector's band would make the eval's snapshot draws
+        # track that arena's.
+        assert driver.arena_id == cfg.arenas
+
+    def test_an_explicit_band_is_honoured(self, tmp_path):
+        pytest.importorskip("torch")
+
+        from agent.train import build_rated_eval_opponent
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm)
+        pool, _ = _build_opponents(cfg, tmp_path / "pool")
+
+        driver = build_rated_eval_opponent(
+            cfg, pool, arena_id=11, net_factory=_net_factory
+        )()
+
+        assert driver.arena_id == 11
+
+    def test_a_rated_driver_refuses_a_nonzero_learner_epsilon(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, _, driver = _pool_and_driver(tmp_path, rated=True)
+
+        # collect_episode reports the schedule's eps on every TRAINING episode.
+        # Silently accepting it would un-rate the whole eval cycle.
+        with pytest.raises(ValueError, match="rated"):
+            driver.note_learner_epsilon(0.05)
+        assert driver.learner_epsilon == 0.0
+
+    def test_a_rated_driver_accepts_exactly_zero(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, _, driver = _pool_and_driver(tmp_path, rated=True)
+
+        driver.note_learner_epsilon(0.0)
+
+        assert driver.learner_epsilon == 0.0
+
+    def test_a_training_driver_can_still_report_exactly_zero(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, _, driver = _pool_and_driver(tmp_path, rated=False)
+
+        # The safe DEFAULT is eps_end; reporting 0.0 explicitly stays legal, so
+        # the guard on the rated driver has not narrowed the ordinary contract.
+        driver.note_learner_epsilon(0.0)
+
+        assert driver.learner_epsilon == 0.0
+
+    def test_rated_with_a_nonzero_learner_epsilon_is_a_refused_contradiction(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        from agent.train import SnapshotOpponentDriver
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm)
+        pool, _ = _build_opponents(cfg, tmp_path / "pool")
+
+        with pytest.raises(ValueError, match="rated"):
+            SnapshotOpponentDriver(
+                cfg,
+                pool,
+                0,
+                net_factory=_net_factory,
+                learner_epsilon=0.05,
+                rated=True,
+            )
+
+
+class TestTheRatedSeriesActuallyMoves:
+    """TC18/TC19 at the driver seam: the guard against an EMPTY AC7 curve.
+
+    ``test_a_rated_match_moves_the_rated_series`` is the one that bites. If any
+    future edit re-binds a rated driver's epsilon off the literal ``0.0`` — a
+    config default, a rounded constant, a stray ``note_learner_epsilon`` — the
+    match stops being ``rated_eligible``, ``elo/learner_rated`` never moves, and
+    nothing else in the suite notices.
+    """
+
+    def test_a_rated_match_moves_the_rated_series(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(
+            tmp_path, rated=True, opponent_epsilon=0.02
+        )
+        before = pool.learner_elo_rated
+
+        _play(driver, won=True)
+
+        assert driver.current_match.rated_eligible is True
+        assert pool.rated_matches == 1
+        assert pool.learner_elo_rated > before, (
+            "a match with BOTH epsilons at 0.0 did not move elo/learner_rated: "
+            "the AC7 series is empty by construction and the demo has no curve"
+        )
+        # A rated match is also an online match — the online series takes every
+        # result, so both moved by the same amount off the same start.
+        assert pool.learner_elo_online == pytest.approx(pool.learner_elo_rated)
+
+    def test_a_training_match_does_not_move_the_rated_series(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(
+            tmp_path, rated=False, opponent_epsilon=0.02
+        )
+        rated_before = pool.learner_elo_rated
+
+        driver.note_learner_epsilon(0.1)
+        _play(driver, won=True)
+
+        assert driver.current_match.rated_eligible is False
+        assert pool.rated_matches == 0
+        assert pool.learner_elo_rated == rated_before, (
+            "an EXPLORING match moved elo/learner_rated: the AC7 series is now "
+            "polluted with eps-noise and no longer measures greedy strength"
+        )
+        assert pool.learner_elo_online != rated_before, (
+            "the online series must take every match, or PFSP is reading a "
+            "rating nothing updates"
+        )
+
+    def test_a_rated_loss_moves_the_series_downward(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+        before = pool.learner_elo_rated
+
+        _play(driver, won=False, lost=True)
+
+        assert pool.learner_elo_rated < before
+
+    def test_a_rated_draw_is_counted_as_half_and_as_a_draw(self, tmp_path):
+        pytest.importorskip("torch")
+
+        from opponents.snapshot_pool import MatchStats
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+
+        # Neither flag set: a timeout, which is a draw for both sides.
+        _play(driver, won=False, lost=False)
+
+        assert pool.stats_for(0) == MatchStats(plays=1, learner_wins=0.5)
+        assert pool.draws_scored == 1
+        assert pool.draw_rate == pytest.approx(1.0)
+        # Snapshot 0's rating is frozen at the learner's initial one, so an even
+        # score against it leaves the rating exactly where it started.
+        assert pool.learner_elo_rated == pytest.approx(pool.elo_initial)
+        assert pool.rated_matches == 1
+
+    def test_the_two_series_diverge_over_a_mixed_history(self, tmp_path):
+        pytest.importorskip("torch")
+
+        from agent.train import build_rated_eval_opponent
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm, opponent_epsilon=0.02)
+        pool, opponent_for = _build_opponents(cfg, tmp_path / "pool")
+        training = opponent_for(0)
+        rated = build_rated_eval_opponent(cfg, pool, net_factory=_net_factory)()
+
+        # Three exploring losses and one greedy win: online falls, rated rises.
+        training.note_learner_epsilon(0.1)
+        for _ in range(3):
+            _play(training, won=False, lost=True)
+        _play(rated, won=True)
+
+        assert pool.matches_scored == 4
+        assert pool.rated_matches == 1
+        assert pool.learner_elo_online < pool.elo_initial
+        assert pool.learner_elo_rated > pool.elo_initial
+
+
+class TestTheSelfPlayMetricsRow:
+    """What ``selfplay_log_row`` puts in front of whoever reads the run."""
+
+    def _row(self, pool):
+        from agent.train import selfplay_log_row
+
+        return selfplay_log_row(pool)
+
+    def test_both_series_and_the_pool_shape_are_present_from_the_start(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        _, pool, _ = _pool_and_driver(tmp_path, rated=True)
+
+        row = self._row(pool)
+
+        assert row["elo/learner_rated"] == pytest.approx(pool.elo_initial)
+        assert row["elo/learner_online"] == pytest.approx(pool.elo_initial)
+        assert row["selfplay/pool_size"] == pytest.approx(1.0)
+        assert row["selfplay/matches_scored"] == pytest.approx(0.0)
+        assert row["selfplay/rated_matches"] == pytest.approx(0.0)
+
+    def test_the_draw_rate_is_absent_until_something_has_been_scored(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+
+        # 0/0 is not a rate. Logging 0.0 for it would read as "no draws" rather
+        # than "no matches", which is a different and much better morning.
+        assert "selfplay/draw_rate" not in self._row(pool)
+
+        _play(driver, won=True)
+
+        assert self._row(pool)["selfplay/draw_rate"] == pytest.approx(0.0)
+
+    def test_the_draw_rate_counts_only_draws(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+
+        _play(driver, won=True)
+        _play(driver, won=False, lost=True)
+        _play(driver, won=False, lost=False)
+        _play(driver, won=False, lost=False)
+
+        row = self._row(pool)
+        assert row["selfplay/matches_scored"] == pytest.approx(4.0)
+        assert row["selfplay/draw_rate"] == pytest.approx(0.5)
+
+    def test_the_rated_counter_separates_an_empty_series_from_a_flat_one(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=False)
+
+        driver.note_learner_epsilon(0.1)
+        for _ in range(3):
+            _play(driver, won=True)
+
+        row = self._row(pool)
+        # Both readings look identical in `elo/learner_rated` alone; this is the
+        # number that says which one it is.
+        assert row["selfplay/matches_scored"] == pytest.approx(3.0)
+        assert row["selfplay/rated_matches"] == pytest.approx(0.0)
+        assert row["elo/learner_rated"] == pytest.approx(pool.elo_initial)
+
+    def test_an_unplayed_reference_gets_no_win_rate_series(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, _ = _pool_and_driver(tmp_path, rated=True)
+
+        assert pool.pinned_references(), "the fixture must pin snapshot 0"
+        # Reporting the Beta(1, 1) prior's 0.5 here would put a flat "even"
+        # segment on the front of a curve with no data behind it.
+        assert "selfplay/win_rate_vs_ref_0" not in self._row(pool)
+
+    def test_a_played_reference_reports_the_beta_prior_win_rate(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+
+        _play(driver, won=True)
+
+        # (wins + 1) / (plays + 2) = 2/3 after one win. An exact number, not a
+        # band: a raw ratio would read 1.0 here and the two are easy to confuse.
+        assert self._row(pool)["selfplay/win_rate_vs_ref_0"] == pytest.approx(
+            2.0 / 3.0
+        )
+
+    def test_only_pinned_snapshots_get_a_reference_series(self, tmp_path):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from opponents.snapshot_pool import MatchResult
+
+        _, pool, _ = _pool_and_driver(tmp_path, rated=True)
+        unpinned = pool.add(
+            {"weight": torch.zeros(4)}, grad_step=1000, elo=pool.elo_initial
+        )
+        pool.record_result(MatchResult.create(unpinned.snapshot_id, 0.0, 0.0, 1.0))
+
+        row = self._row(pool)
+        assert row["selfplay/pool_size"] == pytest.approx(2.0)
+        assert f"selfplay/win_rate_vs_ref_{unpinned.snapshot_id}" not in row, (
+            "an UNPINNED snapshot produced a win_rate_vs_ref_ series; AC8 is "
+            "about the fixed references, and an ordinary snapshot's series "
+            "would appear and vanish as the pool turns over"
+        )
+
+
+class _RecordingLogger:
+    """A ``MetricsLogger`` stand-in that keeps every row and the final summary."""
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.rows: List[Tuple[Optional[int], Dict[str, Any]]] = []
+        self.summaries: List[Dict[str, Any]] = []
+        self.closed = False
+
+    def log(self, metrics: Any, step: Optional[int] = None) -> None:
+        self.rows.append((step, dict(metrics)))
+
+    def summary(self, values: Any) -> None:
+        self.summaries.append(dict(values))
+
+    def close(self) -> None:
+        self.closed = True
+
+    # -- helpers for the assertions ---------------------------------------
+
+    def values_of(self, key: str) -> List[Any]:
+        return [row[key] for _step, row in self.rows if key in row]
+
+    def steps_of(self, key: str) -> List[Optional[int]]:
+        return [step for step, row in self.rows if key in row]
+
+
+class TestTheTrainingLoopLogsBothSeries:
+    """The wiring: a self-play run must actually emit the series, at a step.
+
+    Every metric name below is spelled in the plan's Naming section; a typo in
+    one of them costs the demo its curve and raises nothing.
+    """
+
+    def _run(self, tmp_path, cfg: Optional[TrainConfig] = None, **overrides: Any):
+        if cfg is None:
+            warm = _write_constant_action_checkpoint(
+                tmp_path / "warm.pt", Macro.JUMP
+            )
+            cfg = _selfplay_cfg(warm)
+        pads = [_MirrorPadEnv() for _ in range(cfg.arenas)]
+        logger = _RecordingLogger()
+        call: Dict[str, Any] = dict(
+            snapshot_dir=str(tmp_path / "pool"),
+            logger=logger,
+            # A periodic-checkpoint cadence with eval OFF, so the series is
+            # proved to be logged by its OWN boundary rather than as a side
+            # effect of an eval cycle this fake fleet cannot run.
+            checkpoint_hook=lambda _trainer, _step: None,
+            checkpoint_every_grad_steps=1,
+        )
+        call.update(overrides)
+        _run_multi_arena(cfg, pads, **call)
+        # The pads come back too: "no self-play key was logged" only means
+        # something if the run actually collected episodes.
+        return logger, pads
+
+    def test_both_elo_series_are_logged_against_a_grad_step(self, tmp_path):
+        pytest.importorskip("torch")
+
+        logger, _pads = self._run(tmp_path)
+
+        for key in ("elo/learner_rated", "elo/learner_online"):
+            assert logger.values_of(key), (
+                f"{key} was never logged: issue #10's headline series is empty "
+                "and nothing in the run reports it"
+            )
+            assert all(step is not None for step in logger.steps_of(key)), (
+                f"{key} was logged without a step, so it plots as a point"
+            )
+
+    def test_the_pool_shape_and_draw_rate_are_logged(self, tmp_path):
+        pytest.importorskip("torch")
+
+        logger, _pads = self._run(tmp_path)
+
+        sizes = logger.values_of("selfplay/pool_size")
+        assert sizes, "selfplay/pool_size was never logged"
+        # One snapshot for the whole run: T18's archive hook IS wired into this
+        # loop, but `snapshot_every_grad_steps` defaults to 1000 and this run
+        # stops at 20 grad steps, so no cadence boundary is ever crossed. A value
+        # above 1 would mean the row is reading some other pool than the one
+        # these collectors drew from. (The hook's own coverage — that it archives
+        # once a boundary IS crossed — is TestTheArchiveHookIsWiredIntoTheRun.)
+        assert sizes == pytest.approx([1.0] * len(sizes))
+        # The fake pads always end `lost=True`, so every match is a loss and the
+        # draw rate is a real 0.0 rather than an absent key.
+        assert logger.values_of("selfplay/draw_rate"), (
+            "selfplay/draw_rate never appeared even though matches were scored"
+        )
+        assert logger.values_of("selfplay/draw_rate")[-1] == pytest.approx(0.0)
+
+    def test_one_grad_step_never_logs_the_row_twice(self, tmp_path):
+        pytest.importorskip("torch")
+
+        logger, _pads = self._run(tmp_path)
+
+        steps = logger.steps_of("elo/learner_online")
+        assert len(steps) == len(set(steps)), (
+            f"the same grad step logged the self-play row more than once: {steps}"
+        )
+
+    def test_the_finals_reach_the_summary(self, tmp_path):
+        pytest.importorskip("torch")
+
+        logger, _pads = self._run(tmp_path)
+
+        assert len(logger.summaries) == 1
+        final = logger.summaries[0]
+        for key in (
+            "elo/learner_rated",
+            "elo/learner_online",
+            "selfplay/pool_size",
+            "selfplay/matches_scored",
+            "selfplay/rated_matches",
+        ):
+            assert key in final, f"{key} missing from the run summary"
+
+    def test_a_dummy_run_logs_no_self_play_series_at_all(self, tmp_path):
+        pytest.importorskip("torch")
+
+        # The control. No pool exists, so every key must be absent rather than
+        # present-and-zero, which would put a fabricated flat Elo curve on a run
+        # that never played a self-play match.
+        dummy_cfg = dataclasses.replace(
+            _selfplay_cfg(_write_default_checkpoint(tmp_path / "warm.pt")),
+            opponent="dummy",
+            warm_start=None,
+        )
+        logger, pads = self._run(tmp_path, cfg=dummy_cfg, snapshot_dir=None)
+
+        assert any(pad.step_calls for pad in pads), (
+            "the control run collected nothing, so an absent metric proves "
+            "nothing about the dummy path"
+        )
+        for key in (
+            "elo/learner_rated",
+            "elo/learner_online",
+            "selfplay/pool_size",
+            "selfplay/draw_rate",
+        ):
+            assert not logger.values_of(key), f"a dummy run logged {key}"
+        assert logger.summaries == []
+
+
+class TestAnAbortedEpisodeIsNotScored:
+    """A ``BridgeError`` mid-episode must reach NEITHER Elo series nor PFSP.
+
+    Matches the scripted curriculum, which also declines to score an episode it
+    never saw the end of. The danger is not a crash — it is a half-fought match
+    entering the rating table as a loss, which would make Elo track pad health
+    instead of policy strength.
+    """
+
+    def test_a_bridge_error_leaves_the_pool_untouched(self, tmp_path):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from env.mc_pvp_env import BridgeError
+
+        from agent.train import collect_episode
+
+        _, pool, driver = _pool_and_driver(tmp_path, rated=True)
+
+        class _DyingEnv(_MirrorPadEnv):
+            def step(self, action, opp_action=None):
+                # Two clean windows, then the pad's bridge dies mid-episode.
+                if len(self.step_calls) >= 2:
+                    raise BridgeError("pad lost its bridge mid-episode")
+                return super().step(action, opp_action=opp_action)
+
+        env = _DyingEnv(k=16)
+
+        with pytest.raises(BridgeError):
+            collect_episode(
+                env,
+                _FixedPolicy(torch, action=int(Macro.ATTACK)),
+                max_steps=16,
+                episode_index=0,
+                epsilon=0.0,
+                episode_seed=3,
+                opponent=driver,
+            )
+
+        assert env.step_calls, "the episode must get far enough to be aborted"
+        assert pool.matches_scored == 0
+        assert pool.stats_for(0).plays == 0
+        assert pool.learner_elo_online == pytest.approx(pool.elo_initial)
+        assert pool.learner_elo_rated == pytest.approx(pool.elo_initial)
+        assert driver.current_match is None
+
+
+# ===========================================================================
+# T18 — the snapshot archive hook (AC5 / TC13).
+#
+# The failure this section exists for is the loudest-consequence, quietest-symptom
+# one in the whole run: with nothing calling ``SnapshotPool.add`` on a cadence,
+# the pool holds exactly ONE member — snapshot 0, the warm start — for 24 hours.
+# PFSP weights a single candidate, Elo has a single opponent so the rating cannot
+# move, ``selfplay/pool_size`` reads 1 all night, and every existing self-play
+# test still passes because they drive the pool class directly.
+# ===========================================================================
+
+
+def _state_dict_of(net) -> Dict[str, Any]:
+    """A detached copy of ``net``'s weights, safe to keep and mutate."""
+    return {key: value.detach().clone() for key, value in net.state_dict().items()}
+
+
+def _shifted(state: Dict[str, Any], amount: float) -> Dict[str, Any]:
+    """``state`` with every FLOAT tensor shifted by ``amount`` (a 'trained' net).
+
+    Integer buffers are copied untouched: ``+`` on a long tensor would either
+    truncate the shift or raise, and neither says anything about the archive.
+    """
+    return {
+        key: (value + amount) if value.is_floating_point() else value.clone()
+        for key, value in state.items()
+    }
+
+
+class _FakePublisher:
+    """Stands in for ``_StampedWeightStore.latest_stamped`` with an exact clock.
+
+    The real store is fed by the learner thread, so a test that drove it would be
+    asserting against a race. This hands the archivist the same
+    ``(state_dict, version, grad_step)`` triple the wrapper does, but a test says
+    exactly WHEN a publish lands and at WHICH grad step — which is the only way
+    to prove the snapshot is labelled with the PUBLISHED step rather than the
+    later one the driver loop happened to observe.
+
+    Every publish shifts the weights, so two snapshots can never be equal by
+    accident: "these weights differ from snapshot 0" then means the archive
+    really followed a moving learner.
+    """
+
+    def __init__(self, template: Dict[str, Any]) -> None:
+        self._template = template
+        self.version = -1
+        self.grad_step = -1
+        self.state: Optional[Dict[str, Any]] = None
+
+    def publish(self, grad_step: int) -> None:
+        self.version += 1
+        self.grad_step = int(grad_step)
+        self.state = _shifted(self._template, float(self.version) + 1.0)
+
+    def latest_stamped(self):
+        if self.state is None:
+            # Exactly what the wrapper returns before the learner's first
+            # publish: no weights, no version, no step to label anything with.
+            return None, -1, None
+        return self.state, self.version, self.grad_step
+
+
+def _archivist(
+    pool,
+    publisher,
+    *,
+    every: int,
+    promote_at: Tuple[int, ...] = (),
+    log: Optional[Any] = None,
+):
+    from agent.train import SnapshotArchivist
+
+    return SnapshotArchivist(
+        pool,
+        publisher.latest_stamped,
+        every_grad_steps=every,
+        promote_at=promote_at,
+        log=log,
+    )
+
+
+def _drive(archivist, publisher, *, steps: int, publish_every: int = 1) -> List[Any]:
+    """Step a fake learner 1..steps, publishing on ITS cadence, archiving on the loop's.
+
+    Publish-then-poll on every step, in that order, because that is the real
+    ordering: the learner publishes from its own thread and the driver loop reads
+    whatever is there on its next poll.
+    """
+    created: List[Any] = []
+    for step in range(1, int(steps) + 1):
+        if step % int(publish_every) == 0:
+            publisher.publish(step)
+        record = archivist.maybe_archive(step)
+        if record is not None:
+            created.append(record)
+    return created
+
+
+def _pool_with_publisher(tmp_path, **cfg_overrides: Any):
+    """A real pool (pinned snapshot 0 = the warm start) plus a fake publisher."""
+    warm = _write_default_checkpoint(tmp_path / "warm.pt")
+    cfg = _selfplay_cfg(warm, **cfg_overrides)
+    pool, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+    publisher = _FakePublisher(_state_dict_of(_net_factory()))
+    return cfg, pool, publisher
+
+
+def _weights_equal(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    import torch
+
+    if set(left) != set(right):
+        return False
+    return all(torch.equal(left[key], right[key]) for key in left)
+
+
+class TestTheStampedWeightStore:
+    """Every publish is DATED on the publishing thread, or it carries no date.
+
+    The archive can only label a snapshot with the grad step its weights came
+    from if something records that step at publish time. ``WeightStore`` records
+    a publish COUNTER instead, and the driver thread that notices a new version
+    reads a grad step the learner has already moved past — so a snapshot dated
+    from the driver loop is dated wrong, and the Elo history it feeds is wrong
+    with nothing anywhere reporting it.
+    """
+
+    def _store(self, grad_step_box):
+        from distributed.weights import WeightStore
+
+        from agent.train import _StampedWeightStore
+
+        return _StampedWeightStore(WeightStore(), lambda: grad_step_box["value"])
+
+    def test_nothing_is_published_before_the_first_publish(self):
+        pytest.importorskip("torch")
+
+        store = self._store({"value": 0})
+
+        assert store.latest_stamped() == (None, -1, None)
+
+    def test_a_publish_carries_the_grad_step_the_weights_came_from(self):
+        pytest.importorskip("torch")
+
+        import torch
+
+        box = {"value": 7}
+        store = self._store(box)
+        store.publish({"w": torch.zeros(2)}, 0)
+        # The learner never stops. Anything that read `trainer.grad_step` after
+        # the publish — which is all the driver loop can do — would report 41.
+        box["value"] = 41
+
+        state, version, grad_step = store.latest_stamped()
+
+        assert version == 0
+        assert grad_step == 7, (
+            "the published weights are dated from a LATER read of the learner's "
+            "grad step, not from the publish that produced them"
+        )
+        assert torch.equal(state["w"], torch.zeros(2))
+
+    def test_latest_delegates_to_the_wrapped_store_untouched(self):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from distributed.weights import WeightStore
+
+        from agent.train import _StampedWeightStore
+
+        inner = WeightStore()
+        store = _StampedWeightStore(inner, lambda: 3)
+        store.publish({"w": torch.ones(2)}, 5)
+
+        # The collector path. A wrapper that changed what `latest()` returns
+        # would silently change what all 25 collectors act from.
+        wrapped_state, wrapped_version = store.latest()
+        inner_state, inner_version = inner.latest()
+        assert wrapped_version == inner_version == 5
+        assert wrapped_state is inner_state
+
+    def test_a_publish_behind_the_wrapper_carries_no_grad_step(self):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from distributed.weights import WeightStore
+
+        from agent.train import _StampedWeightStore
+
+        inner = WeightStore()
+        store = _StampedWeightStore(inner, lambda: 3)
+        store.publish({"w": torch.ones(2)}, 0)
+        # Straight into the wrapped store, bypassing the stamp.
+        inner.publish({"w": torch.zeros(2)}, 1)
+
+        _state, version, grad_step = store.latest_stamped()
+
+        assert version == 1
+        assert grad_step is None, (
+            "the wrapper handed out the PREVIOUS publish's grad step beside the "
+            "new version's weights — a snapshot dated from a net it is not"
+        )
+
+    def test_an_undated_publish_is_skipped_rather_than_guessed(self, tmp_path):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from distributed.weights import WeightStore
+
+        from agent.train import SnapshotArchivist, _StampedWeightStore
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm)
+        pool, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+        inner = WeightStore()
+        store = _StampedWeightStore(inner, lambda: 4)
+        lines: List[str] = []
+        archivist = SnapshotArchivist(
+            pool, store.latest_stamped, every_grad_steps=1, log=lines.append
+        )
+        inner.publish({"w": torch.zeros(2)}, 0)
+
+        assert archivist.maybe_archive(4) is None
+        assert len(pool) == 1
+        assert any("SKIPPED" in line for line in lines)
+
+    def test_an_undated_publish_is_reported_once_not_on_every_poll(self, tmp_path):
+        pytest.importorskip("torch")
+
+        import torch
+
+        from distributed.weights import WeightStore
+
+        from agent.train import SnapshotArchivist, _StampedWeightStore
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm)
+        pool, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+        inner = WeightStore()
+        store = _StampedWeightStore(inner, lambda: 4)
+        lines: List[str] = []
+        archivist = SnapshotArchivist(
+            pool, store.latest_stamped, every_grad_steps=1, log=lines.append
+        )
+        inner.publish({"w": torch.zeros(2)}, 0)
+
+        # The skip advances NOTHING (the archive stays owed), so the boundary is
+        # still due on the next poll and the driver loop re-enters this branch
+        # every iteration it runs. Unlatched, one publish behind the wrapper is
+        # one identical line per poll for the rest of a 24-hour run.
+        for step in range(4, 10):
+            assert archivist.maybe_archive(step) is None
+        assert len([line for line in lines if "SKIPPED" in line]) == 1, lines
+
+        # A second undated version is a NEW fact, and the log has to carry it:
+        # latching per version, not per archivist, keeps the line informative.
+        inner.publish({"w": torch.ones(2)}, 1)
+        assert archivist.maybe_archive(10) is None
+        assert len([line for line in lines if "SKIPPED" in line]) == 2, lines
+
+
+class TestTheArchiveCadence:
+    """TC13: N grad steps produce ``floor(N / cadence)`` snapshots, and they MOVE."""
+
+    def test_n_grad_steps_produce_floor_n_over_cadence_snapshots(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=4)
+
+        created = _drive(archivist, publisher, steps=13)
+
+        assert [record.snapshot_id for record in created] == [1, 2, 3], (
+            "13 grad steps at a cadence of 4 must archive at 4, 8 and 12"
+        )
+        # +1 for the seeded warm start, which is snapshot 0 and not an archive.
+        assert len(pool) == 1 + 13 // 4
+        assert archivist.archived == 3
+
+    def test_every_archived_snapshot_differs_from_snapshot_zero(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=3)
+
+        created = _drive(archivist, publisher, steps=9)
+
+        assert len(created) == 3
+        warm_start = pool.load_state_dict(pool.get(0))
+        seen: List[Dict[str, Any]] = []
+        for record in created:
+            weights = pool.load_state_dict(record)
+            # The clause that separates a real archive from a hook that keeps
+            # re-saving the warm start: identical weights under three ids would
+            # give PFSP three candidates that are ONE policy, and nothing
+            # downstream could tell.
+            assert not _weights_equal(weights, warm_start), (
+                f"snapshot {record.snapshot_id} is byte-identical to snapshot 0"
+            )
+            assert not any(_weights_equal(weights, other) for other in seen), (
+                f"snapshot {record.snapshot_id} repeats an earlier snapshot"
+            )
+            seen.append(weights)
+
+    def test_the_snapshot_carries_the_published_grad_step_not_the_observed_one(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        # The learner publishes at 3, 6, 9; the loop archives at its own
+        # boundaries 4 and 8. Neither archive coincides with a publish, so a hook
+        # that labelled the snapshot with the `trainer.grad_step` the driver loop
+        # read would produce [4, 8] and be caught by the numbers below.
+        archivist = _archivist(pool, publisher, every=4)
+
+        created = _drive(archivist, publisher, steps=9, publish_every=3)
+
+        assert [record.grad_step for record in created] == [3, 6], (
+            "the snapshots are labelled with the step the driver loop OBSERVED "
+            "instead of the one the published weights came out of"
+        )
+
+    def test_the_snapshot_carries_the_online_rating_not_the_initial_one(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        # A driver over a REAL pool, because the rating has to MOVE before the
+        # archive: while `learner_elo_online` still equals `elo_initial`, every
+        # wrong read of it is the same number and nothing can tell them apart.
+        _cfg, pool, driver = _pool_and_driver(tmp_path, rated=False)
+        publisher = _FakePublisher(_state_dict_of(_net_factory()))
+        archivist = _archivist(pool, publisher, every=1)
+
+        _play(driver, won=True, lost=False)
+        expected = pool.learner_elo_online
+        assert expected != pytest.approx(pool.elo_initial), (
+            "the match did not move the online series, so this test cannot see "
+            "which rating the archive read"
+        )
+        # The training driver plays the learner at the eps FLOOR, so that match
+        # was not rated-eligible and the rated series is still sitting at the
+        # initial value. Both wrong reads therefore equal `elo_initial` here,
+        # and the final assertion rejects both at once.
+        assert pool.learner_elo_rated == pytest.approx(pool.elo_initial)
+
+        publisher.publish(1)
+        record = archivist.maybe_archive(1)
+
+        assert record is not None
+        # `record.elo` is what `SnapshotPool.record_result` uses as
+        # `opponent_elo` for every future match against this snapshot, and it is
+        # frozen on disk forever. Stamped from `elo_initial` (or from the rated
+        # series, which only moves on eval cycles) it skews every later Elo
+        # update against this member, permanently, with nothing downstream able
+        # to notice.
+        assert record.elo == pytest.approx(expected)
+        assert record.elo != pytest.approx(pool.elo_initial)
+
+    def test_a_cadence_boundary_with_nothing_new_published_stays_owed(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=2)
+
+        # Boundaries at 2 and 4 pass with the learner having published nothing.
+        for step in (1, 2, 3, 4):
+            assert archivist.maybe_archive(step) is None
+        assert len(pool) == 1
+
+        # The first publish makes the owed archive land on the very next poll —
+        # skipping it outright would lose a snapshot for every boundary the
+        # learner happened to be behind.
+        publisher.publish(5)
+        record = archivist.maybe_archive(5)
+        assert record is not None
+        assert record.grad_step == 5
+
+    def test_one_published_version_is_never_archived_twice(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=2)
+
+        publisher.publish(1)
+        # Ten boundary crossings, one publish behind them. A second id for one
+        # policy version would be double-counted by PFSP and rated twice by Elo.
+        created = [archivist.maybe_archive(step) for step in range(1, 11)]
+
+        assert len([record for record in created if record is not None]) == 1
+        assert len(pool) == 2
+
+    def test_the_warm_start_publish_is_never_re_archived(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=2)
+
+        # Version 0 published at grad_step 0 is the PRE-LOOP publish of the warm
+        # start, which the pool already holds as pinned snapshot 0. Reachable
+        # whenever weight_sync_every_k_steps outruns the archive cadence.
+        publisher.publish(0)
+        assert archivist.maybe_archive(2) is None
+        assert len(pool) == 1
+
+        publisher.publish(3)
+        assert archivist.maybe_archive(3) is not None
+
+    def test_an_overshot_boundary_does_not_stretch_the_cadence(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=5)
+
+        # The driver loop polls, so it observes 7 rather than 5. The next
+        # boundary must stay the absolute multiple 10; `step + every` would put
+        # it at 12 and every later archive would drift further out, so a 24-hour
+        # run would end with visibly fewer snapshots than its cadence promised.
+        publisher.publish(7)
+        assert archivist.maybe_archive(7) is not None
+        for step in (8, 9):
+            publisher.publish(step)
+            assert archivist.maybe_archive(step) is None
+        publisher.publish(10)
+        assert archivist.maybe_archive(10) is not None
+
+    def test_a_zero_cadence_is_refused_at_construction(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+
+        with pytest.raises(ValueError, match="every_grad_steps"):
+            _archivist(pool, publisher, every=0)
+
+
+class TestPinnedReferencePromotion:
+    """The references grow 1 -> 2 -> 3, on schedule, and are never assumed to be 3."""
+
+    def test_pinned_references_grow_one_two_three(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        # A cadence far beyond the drive, so every snapshot below is created BY
+        # the promotion boundary and the count cannot be confused with the
+        # ordinary cadence's output.
+        archivist = _archivist(pool, publisher, every=1000, promote_at=(3, 6))
+
+        # Bootstrap: snapshot 0 alone, exactly what T13's eval must cope with.
+        assert [rec.snapshot_id for rec in pool.pinned_references()] == [0]
+
+        growth: List[int] = []
+        for step in range(1, 9):
+            publisher.publish(step)
+            archivist.maybe_archive(step)
+            growth.append(len(pool.pinned_references()))
+
+        assert growth == [1, 1, 2, 2, 2, 3, 3, 3], (
+            f"pinned references did not grow 1 -> 2 -> 3 on schedule: {growth}"
+        )
+        assert archivist.promoted == 2
+        assert all(rec.pinned for rec in pool.pinned_references())
+
+    def test_a_promotion_step_off_the_cadence_still_creates_its_reference(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        # 5 is not a multiple of 4: a promotion that could only PIN a snapshot
+        # the cadence happened to create would silently never fire here, and the
+        # run would end with one reference instead of two.
+        archivist = _archivist(pool, publisher, every=4, promote_at=(5,))
+
+        created = _drive(archivist, publisher, steps=8)
+
+        pinned = [rec.snapshot_id for rec in pool.pinned_references()]
+        assert len(pinned) == 2, f"the off-cadence reference was never made: {pinned}"
+        promoted = [rec for rec in created if rec.pinned]
+        assert [rec.grad_step for rec in promoted] == [5]
+
+    def test_a_promotion_boundary_fires_exactly_once(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=1000, promote_at=(3,))
+
+        created = _drive(archivist, publisher, steps=20)
+
+        assert len(created) == 1, (
+            "a promotion threshold that is not consumed pins a new reference on "
+            "every later poll, and the pool fills with pinned near-duplicates "
+            "that can never be dropped"
+        )
+        assert len(pool.pinned_references()) == 2
+
+    def test_a_run_with_no_promotions_keeps_the_bootstrap_reference(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, publisher = _pool_with_publisher(tmp_path)
+        archivist = _archivist(pool, publisher, every=2, promote_at=())
+
+        created = _drive(archivist, publisher, steps=6)
+
+        assert len(created) == 3
+        assert [rec.snapshot_id for rec in pool.pinned_references()] == [0]
+        assert archivist.promoted == 0
+
+
+class TestTheArchiveSurvivesARestart:
+    """Stop mid-run and resume: nothing lost, no id reused, nothing re-seeded."""
+
+    def _archive_some(self, tmp_path, *, steps: int = 6, every: int = 2):
+        _cfg, pool, driver = _pool_and_driver(tmp_path, rated=False)
+        publisher = _FakePublisher(_state_dict_of(_net_factory()))
+        archivist = _archivist(pool, publisher, every=every)
+        created = _drive(archivist, publisher, steps=steps)
+        return _cfg, pool, driver, archivist, created
+
+    def test_a_restart_loses_no_snapshot_and_reuses_no_id(self, tmp_path):
+        pytest.importorskip("torch")
+
+        cfg, pool, driver, archivist, created = self._archive_some(tmp_path)
+        assert len(created) == 3
+
+        before_ids = [rec.snapshot_id for rec in pool.records()]
+        before_steps = {rec.snapshot_id: rec.grad_step for rec in pool.records()}
+        archivist.flush()
+
+        # The restart: a brand-new pool object over the SAME directory, exactly
+        # as build_snapshot_opponents does when it finds a pool.json.
+        resumed, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+
+        assert [rec.snapshot_id for rec in resumed.records()] == before_ids
+        assert {
+            rec.snapshot_id: rec.grad_step for rec in resumed.records()
+        } == before_steps
+        assert [rec.snapshot_id for rec in resumed.pinned_references()] == [0]
+
+        # The resumed run archives again: the next id must CONTINUE the sequence.
+        # A reused id would `os.replace` a live snapshot file, so two policy
+        # versions would answer to one id and every metric already keyed on it
+        # would silently describe a different net.
+        publisher = _FakePublisher(_state_dict_of(_net_factory()))
+        resumed_archivist = _archivist(resumed, publisher, every=2)
+        publisher.publish(2)
+        record = resumed_archivist.maybe_archive(2)
+
+        assert record is not None
+        assert record.snapshot_id == max(before_ids) + 1
+        assert record.snapshot_id not in before_ids
+
+    def test_a_restart_re_seeds_nothing_over_a_populated_directory(self, tmp_path):
+        pytest.importorskip("torch")
+
+        cfg, pool, _driver, archivist, _created = self._archive_some(tmp_path)
+        archivist.flush()
+
+        snap_zero = os.path.join(pool.directory, "snap_0.pt")
+        digest_before = hashlib.sha256(open(snap_zero, "rb").read()).hexdigest()
+        size_before = len(pool)
+
+        resumed, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+
+        assert len(resumed) == size_before, (
+            "the resume constructed a FRESH pool over a populated directory: the "
+            "id counter restarts at 0 and the next add overwrites snap_0.pt, the "
+            "pinned first reference, while the index still claims the history"
+        )
+        assert hashlib.sha256(open(snap_zero, "rb").read()).hexdigest() == (
+            digest_before
+        ), "snap_0.pt was rewritten by the resume"
+        assert resumed.get(0) is not None and resumed.get(0).pinned
+
+    def test_the_final_flush_carries_the_elo_and_the_match_counters(self, tmp_path):
+        pytest.importorskip("torch")
+
+        cfg, pool, driver, archivist, _created = self._archive_some(tmp_path)
+
+        # Scored AFTER the last archive, which is exactly the history that only
+        # the teardown flush can save: record_result never touches disk, so
+        # without the flush every number below is lost when the process exits.
+        _play(driver, won=True, lost=False)
+        _play(driver, won=False, lost=True)
+        _play(driver, won=False, lost=False)
+
+        expected = {
+            "matches_scored": pool.matches_scored,
+            "draws_scored": pool.draws_scored,
+            "rated_matches": pool.rated_matches,
+        }
+        assert expected["matches_scored"] == 3
+        assert expected["draws_scored"] == 1
+        elo_online = pool.learner_elo_online
+        elo_rated = pool.learner_elo_rated
+        assert elo_online != pytest.approx(pool.elo_initial)
+
+        archivist.flush()
+        resumed, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+
+        assert resumed.matches_scored == expected["matches_scored"]
+        assert resumed.draws_scored == expected["draws_scored"]
+        assert resumed.rated_matches == expected["rated_matches"]
+        assert resumed.learner_elo_online == pytest.approx(elo_online)
+        assert resumed.learner_elo_rated == pytest.approx(elo_rated)
+        # selfplay/draw_rate is the signal that would reveal a degenerate
+        # mutual-stalling equilibrium; a resumed run must describe the whole run.
+        assert resumed.draw_rate == pytest.approx(pool.draw_rate)
+
+    def test_a_redundant_flush_writes_the_pool_forward_never_backward(
+        self, tmp_path
+    ):
+        pytest.importorskip("torch")
+
+        cfg, pool, driver, archivist, _created = self._archive_some(tmp_path)
+        archivist.flush()
+
+        # More happens to the pool AFTER that flush: another archive, then a
+        # match. `flush` builds its payload immediately before the write, so it
+        # carries the pool's CURRENT generation stamp — a second call writes the
+        # newest state rather than replaying the one it wrote before, which would
+        # drop the snapshot below out of the index while its file stayed on disk
+        # and let a resumed run hand its id out twice.
+        publisher = _FakePublisher(_state_dict_of(_net_factory()))
+        later = _archivist(pool, publisher, every=1)
+        publisher.publish(9)
+        assert later.maybe_archive(9) is not None
+        _play(driver, won=True, lost=False)
+
+        archivist.flush()
+
+        resumed, _opponent_for = _build_opponents(cfg, tmp_path / "pool")
+        assert [rec.snapshot_id for rec in resumed.records()] == [
+            rec.snapshot_id for rec in pool.records()
+        ]
+        assert resumed.matches_scored == pool.matches_scored == 1
+
+    def test_the_flush_swallows_a_failed_write(self, tmp_path):
+        pytest.importorskip("torch")
+
+        _cfg, pool, _driver, _archivist_unused, _created = self._archive_some(
+            tmp_path
+        )
+        lines: List[str] = []
+        publisher = _FakePublisher(_state_dict_of(_net_factory()))
+        archivist = _archivist(pool, publisher, every=1, log=lines.append)
+
+        def _boom(_payload):
+            raise OSError("disk full")
+
+        pool.persist = _boom  # type: ignore[method-assign]
+
+        # It runs from the teardown `finally`, where the caller is about to
+        # re-raise the learner's own exception; a raise here would replace that
+        # traceback with this one.
+        archivist.flush()
+
+        assert any("FAILED" in line for line in lines)
+
+
+class TestTheArchiveHookIsWiredIntoTheRun:
+    """The mutation test: delete the loop's ``maybe_archive`` call and this fails.
+
+    Everything above drives :class:`SnapshotArchivist` directly, so all of it
+    still passes on a build where the training loop never calls it — which is
+    precisely the bug T18 exists to fix. These two run
+    ``train_multi_arena`` end to end over fake pads and read the pool back OFF
+    DISK, so they bite on the wiring and on the persistence together.
+    """
+
+    def _run(self, tmp_path, **overrides: Any):
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _selfplay_cfg(warm, **overrides.pop("cfg_overrides", {}))
+        pads = [_MirrorPadEnv() for _ in range(cfg.arenas)]
+        pool_dir = tmp_path / "pool"
+        call: Dict[str, Any] = dict(snapshot_dir=str(pool_dir))
+        call.update(overrides)
+        result = _run_multi_arena(cfg, pads, **call)
+        return cfg, pool_dir, result, pads
+
+    def _reload(self, cfg, pool_dir):
+        from opponents.snapshot_pool import SnapshotPool
+
+        return SnapshotPool.load(str(pool_dir), sampling=cfg.snapshot_sampling)
+
+    def test_a_run_archives_published_weights_onto_disk(self, tmp_path):
+        pytest.importorskip("torch")
+
+        cfg, pool_dir, result, pads = self._run(
+            tmp_path,
+            cfg_overrides={"snapshot_every_grad_steps": 5},
+            max_grad_steps=40,
+            poll_interval=0.002,
+        )
+
+        assert any(pad.step_calls for pad in pads), (
+            "the run collected nothing, so an empty pool proves nothing"
+        )
+        assert result.grad_steps >= 5, (
+            f"the run stopped at {result.grad_steps} grad steps, before the "
+            "first archive boundary, so this test is inconclusive"
+        )
+
+        pool = self._reload(cfg, pool_dir)
+        archived = [rec for rec in pool.records() if rec.snapshot_id != 0]
+        assert archived, (
+            "a self-play run crossed its archive cadence and the pool STILL "
+            "holds only snapshot 0: nothing calls SnapshotPool.add, so every "
+            "episode of the run fought the frozen warm start"
+        )
+
+        warm_start = pool.load_state_dict(pool.get(0))
+        for record in archived:
+            # Published weights of a learner that kept stepping — the clause that
+            # separates a real archive from repeated copies of the warm start.
+            assert not _weights_equal(pool.load_state_dict(record), warm_start), (
+                f"archived snapshot {record.snapshot_id} is byte-identical to "
+                "snapshot 0"
+            )
+            # The published grad step is at or behind what the driver loop saw,
+            # and always past the pre-loop publish of the warm start.
+            assert 0 < record.grad_step <= result.grad_steps
+
+    def test_the_teardown_flush_lands_stats_that_no_archive_carried(self, tmp_path):
+        pytest.importorskip("torch")
+
+        # The DEFAULT cadence (1000) against a 20-grad-step run: no archive can
+        # fire, so `add` never rewrites the index and the only thing that can put
+        # this run's matches on disk is the teardown flush.
+        cfg, pool_dir, _result, pads = self._run(tmp_path)
+
+        assert any(pad.step_calls for pad in pads)
+        pool = self._reload(cfg, pool_dir)
+
+        assert len(pool) == 1, "an archive fired; this test no longer isolates flush"
+        assert pool.matches_scored > 0, (
+            "the run's matches never reached pool.json: record_result keeps them "
+            "in memory only, so without the teardown flush every Elo update and "
+            "every head-to-head statistic since the last archive is lost"
+        )
+        assert pool.learner_elo_online != pytest.approx(pool.elo_initial), (
+            "elo/learner_online was persisted at its initial value even though "
+            "matches were scored"
+        )
+
+    def test_the_learner_publishes_through_the_stamping_store(
+        self, tmp_path, monkeypatch
+    ):
+        pytest.importorskip("torch")
+
+        import distributed.learner as learner_module
+
+        import agent.train as train_module
+        from agent.train import _StampedWeightStore
+
+        # The wrapper has to be installed BEFORE LearnerLoop is handed the store.
+        # A learner publishing into the bare store produces versions the wrapper
+        # never saw, `latest_stamped` refuses to date them, and the archive then
+        # declines every publish for the whole run: the pool never grows past
+        # snapshot 0 and one SKIPPED line per publish is the entire evidence.
+        seen: Dict[str, Any] = {}
+        real_loop = learner_module.LearnerLoop
+
+        def _spy(trainer, transport, weight_store, cfg, **kwargs):
+            seen["store"] = weight_store
+            return real_loop(trainer, transport, weight_store, cfg, **kwargs)
+
+        monkeypatch.setattr(learner_module, "LearnerLoop", _spy)
+
+        # The other half of that wiring, and the half nothing else pins: WHAT the
+        # archivist was told to read. A driver-side reader —
+        # `lambda: (trainer.online.state_dict(), trainer.grad_step, ...)` — fits
+        # the signature, leaves every archivist test green (they inject their own
+        # publisher) and even satisfies the end-to-end
+        # `0 < grad_step <= result.grad_steps`, while reintroducing both failures
+        # the wrapper exists to route around: the read-during-write race on the
+        # live net, and weights labelled with a LATER step than they came from.
+        real_init = train_module.SnapshotArchivist.__init__
+
+        def _archivist_spy(self, pool, published, **kwargs):
+            seen["published"] = published
+            return real_init(self, pool, published, **kwargs)
+
+        monkeypatch.setattr(
+            train_module.SnapshotArchivist, "__init__", _archivist_spy
+        )
+
+        self._run(tmp_path)
+
+        assert isinstance(seen.get("store"), _StampedWeightStore), (
+            "the self-play learner was handed a bare WeightStore, so every "
+            f"archived snapshot would carry a guessed grad step: {seen!r}"
+        )
+        published = seen.get("published")
+        assert getattr(published, "__func__", None) is (
+            _StampedWeightStore.latest_stamped
+        ), (
+            "the archivist reads something other than the stamping store's "
+            f"latest_stamped, so its snapshots are dated by a guess: {published!r}"
+        )
+        assert published.__self__ is seen["store"], (
+            "the archivist reads a DIFFERENT stamping store from the one the "
+            "learner publishes into, so it can only ever report an undated "
+            f"publish and the pool stops growing: {published!r}"
+        )
+
+    def test_a_dummy_run_gets_the_store_it_was_given(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+
+        import distributed.learner as learner_module
+
+        from agent.train import _StampedWeightStore
+
+        # The control (AC10): the archive wiring must not reach into a run that
+        # has no pool to archive into.
+        seen: Dict[str, Any] = {}
+        real_loop = learner_module.LearnerLoop
+
+        def _spy(trainer, transport, weight_store, cfg, **kwargs):
+            seen["store"] = weight_store
+            return real_loop(trainer, transport, weight_store, cfg, **kwargs)
+
+        monkeypatch.setattr(learner_module, "LearnerLoop", _spy)
+
+        dummy_cfg = dataclasses.replace(
+            _selfplay_cfg(_write_default_checkpoint(tmp_path / "warm.pt")),
+            opponent="dummy",
+            warm_start=None,
+        )
+        pads = [_MirrorPadEnv() for _ in range(dummy_cfg.arenas)]
+        _run_multi_arena(dummy_cfg, pads)
+
+        assert seen and not isinstance(seen["store"], _StampedWeightStore)
