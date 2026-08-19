@@ -128,8 +128,8 @@ class GreedyPolicy(Protocol):
 class EvalOpponent(Protocol):
     """Structural protocol for an opponent policy the EVAL steps in Python.
 
-    Mirrors ``agent.train.EpisodeOpponent`` minus ``observe_outcome``: an eval
-    scores the AGENT, so nothing is fed back into a curriculum from here.
+    Mirrors ``agent.train.EpisodeOpponent``: ``begin_episode`` / ``act``, plus
+    the two OPTIONAL members below that the self-play reference gauntlet needs.
 
     Passing one of these to :func:`evaluate` is what makes the eval score the
     same MOVING opponent training fights. Without it the eval sends no
@@ -137,6 +137,27 @@ class EvalOpponent(Protocol):
     is not "the dummy path" when the run's opponent is a scripted bot, it is a
     silently different, far easier opponent, and any checkpoint selected on that
     win rate was selected against the wrong thing.
+
+    Two members are OPTIONAL and are discovered with ``getattr``, never
+    required, so the scripted :class:`~agent.train.EvalOpponentDriver` — which
+    has neither — routes exactly as it always did:
+
+      * ``needs_observation: bool`` — ``True`` means ``act`` wants the OPPONENT
+        seat's ``(OBS_DIM,)`` observation from ``env.opponent_observation()``
+        rather than an ``OpponentView``. It is the same class-level
+        discriminator ``agent.train.collect_episode`` branches on, so a frozen
+        ``DuelingDRQN`` is fed the exact input type it was trained on in the
+        eval and in training alike. The accessor RAISES on an env built without
+        ``mirror_opponent=True``, so a missed construction site fails on the
+        first eval episode rather than scoring garbage.
+      * ``observe_outcome(info)`` — called once with the FINAL step's ``info``.
+        Without it a self-play reference match is never scored into the snapshot
+        pool: no :class:`~opponents.snapshot_pool.MatchResult` is built,
+        ``elo/learner_rated`` never moves and ``selfplay/win_rate_vs_ref_<id>``
+        stays absent, with nothing anywhere reporting why.
+
+    :func:`evaluate` deliberately does NOT call ``note_learner_epsilon``, even
+    on an opponent that has one. See the note in :func:`evaluate`.
     """
 
     def begin_episode(self) -> None:
@@ -149,7 +170,9 @@ class EvalOpponent(Protocol):
         ``view`` is whatever ``env.raw_opponent_view()`` returned, passed
         through UNTOUCHED (its ``attack_cooldown`` is clamped to exactly 1.0 by
         its producer and compared against a deliberately tight
-        ``>= 1.0 - 1e-6``; perturbing it makes a scripted bot never attack).
+        ``>= 1.0 - 1e-6``; perturbing it makes a scripted bot never attack) —
+        or, when ``needs_observation`` is ``True``, the mirrored opponent-seat
+        observation from ``env.opponent_observation()``.
         """
         ...
 
@@ -373,12 +396,25 @@ def evaluate(
     None`` (the default) the opponent is the stage-0 stationary dummy: the
     env/bridge drive it, this loop steps no opponent policy, and the wire line is
     the byte-identical M2 one. Pass an :class:`EvalOpponent` and each decision
-    additionally reads ``env.raw_opponent_view()``, asks that policy for a macro,
-    and sends BOTH in one ``env.step(action, opp_action=...)`` — which is the
+    additionally reads the accessor that opponent kind wants
+    (``env.raw_opponent_view()``, or ``env.opponent_observation()`` when it
+    declares ``needs_observation``), asks that policy for a macro, and sends BOTH
+    in one ``env.step(action, opp_action=...)`` — which is the
     only way a run whose training opponent MOVES gets a win rate that means
     anything. Scoring a scripted-opponent run against a stationary target reports
     a number the agent did not earn, and selecting a checkpoint on it selects
     against the wrong opponent.
+
+    THE LEARNER'S ε IS NEVER REPORTED TO THE OPPONENT, deliberately. A self-play
+    :class:`~agent.train.SnapshotOpponentDriver` built for a RATED eval pins both
+    epsilons to a literal ``0.0`` at construction and its
+    ``note_learner_epsilon`` RAISES on any nonzero value, because a rated cycle
+    that quietly records ε>0 leaves ``elo/learner_rated`` empty and an empty
+    series is indistinguishable from a flat one. This evaluator is greedy by
+    construction — :class:`DRQNGreedyPolicy` drives the net at ``epsilon=0.0``
+    — so it has no ε to report and calling that method could only ever be
+    wrong. ``agent.train.collect_episode``, which DOES have a schedule ε, is the
+    only caller of it.
 
     Per episode the per-reward-component breakdown carried in each ``step``
     ``info`` (keys :data:`REWARD_COMPONENT_KEYS`) is accumulated, the aim-bonus
@@ -604,19 +640,39 @@ def _run_one_episode(
     spin-farming policy (rewarded for "aiming" at an unseen opponent) is caught.
 
     With an ``opponent``, the per-decision order mirrors
-    ``agent.train.collect_episode`` EXACTLY — agent action, then one fresh
-    ``env.raw_opponent_view()``, then ONE ``env.step`` carrying both. One
+    ``agent.train.collect_episode`` EXACTLY — agent action, then one fresh read
+    of that opponent's accessor, then ONE ``env.step`` carrying both. One
     ``env.step`` is one decision window and the opponent's swing meter is
     shadow-tracked by counting those windows, so a skipped, doubled, or cached
     view desynchronizes the meter (and a view read before the agent acts scores
     the opponent on a state the agent has already left).
+
+    WHICH accessor is resolved ONCE, before the first decision, off the
+    opponent's ``needs_observation`` attribute — the same discriminator, read the
+    same way, as ``agent.train.collect_episode``. Absent (every scripted eval
+    driver) means the historical ``env.raw_opponent_view()`` branch, untouched.
+
+    The FINAL step's ``info`` is handed to the opponent's ``observe_outcome`` if
+    it has one, so a self-play reference match is actually scored into the
+    snapshot pool. Skipping that call is silent: the eval still reports a win
+    rate, and only ``elo/learner_rated`` and ``selfplay/win_rate_vs_ref_<id>``
+    — the two series a checkpoint is selected on — come out empty.
     """
+    # Which accessor this episode's opponent is fed. Resolved ONCE so the
+    # routing cannot change mid-episode and the hot loop pays no attribute
+    # lookup per step. ``getattr`` with a False default (rather than an import
+    # of ``agent.train._needs_observation``, which would make this lower layer
+    # depend on the training loop) so an opponent WITHOUT the attribute — every
+    # scripted eval driver — routes to the view branch exactly as before.
+    opponent_observes = bool(getattr(opponent, "needs_observation", False))
+
     # Clear the policy's per-episode state (e.g. LSTM hidden) BEFORE the reset obs
     # so no memory leaks across the episode boundary.
     policy.reset()
     obs = env.reset(seed=seed)
     # Episode boundary for the opponent, AFTER the reset: the reset re-arms the
-    # opponent's shadow swing meter that its ATTACK gate reads.
+    # opponent's shadow swing meter that its ATTACK gate reads, and re-primes
+    # the mirror an observation-driven opponent reads.
     if opponent is not None:
         opponent.begin_episode()
 
@@ -638,6 +694,15 @@ def _run_one_episode(
             # The M1/M2 line, unchanged: one positional argument, no opp_action
             # on the wire at all.
             next_obs, reward, done, info = env.step(action)
+        elif opponent_observes:
+            # ONE mirrored observation, ONE macro, ONE step. Same invariant as
+            # the view branch below, different accessor: a frozen DuelingDRQN
+            # decides from the OPPONENT seat's OBS_DIM vector, which is the only
+            # input shape it was ever trained on — an OpponentView handed to it
+            # is not a wrong VALUE, it is a wrong TYPE, and the failure would be
+            # an exception minutes into an eval cycle rather than at wiring time.
+            opp_action = opponent.act(env.opponent_observation())
+            next_obs, reward, done, info = env.step(action, opp_action=opp_action)
         else:
             # ONE view, ONE macro, ONE step. The view is read HERE (never cached
             # from an earlier step) and passed through untouched so its clamped
@@ -665,6 +730,18 @@ def _run_one_episode(
 
         if max_episode_steps is not None and length >= max_episode_steps:
             break
+
+    # Score the finished episode back into whatever the opponent reports to —
+    # the snapshot pool's Elo table and head-to-head statistics for a self-play
+    # reference driver. Guarded rather than required: the scripted eval drivers
+    # have no such method (an eval must not move the curriculum it measures) and
+    # must keep routing untouched. ``info`` holds the terminal verdict from the
+    # LAST step; an episode stopped by ``max_episode_steps`` above carries
+    # won=False, which is the right reading — it did not win.
+    if opponent is not None:
+        observe_outcome = getattr(opponent, "observe_outcome", None)
+        if callable(observe_outcome):
+            observe_outcome(info)
 
     return EpisodeOutcome(
         index=episode_index,
