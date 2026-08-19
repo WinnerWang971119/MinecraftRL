@@ -1010,9 +1010,18 @@ def test_env_opponent_observation_hides_the_learners_live_position():
     Everything above drives ``OpponentMirror`` directly; this drives the whole
     production path — ``MCPvPEnv(mirror_opponent=True).reset()`` ingesting a
     wire state and serving the cached vector from ``opponent_observation()``.
-    Each iteration is a fresh episode, so this doubles as the env-level reset
-    isolation check: if ``reset()`` failed to clear the mirror's memory, the
-    second episode would open in the MEMORY regime and the bytes would move.
+    Each iteration is a fresh episode, but this does NOT prove env-level reset
+    isolation, and an earlier revision of this docstring wrongly claimed it did.
+    Every probe here comes from the behind sweep, so the learner is never
+    sighted, ``_last_seen_local`` stays ``None``, and there is no memory for a
+    reset to carry. Commenting out ``MCPvPEnv``'s ``self._mirror.reset()``
+    leaves this whole file green — verified by mutation.
+
+    That invariant is pinned by
+    ``tests/test_mc_pvp_env.py::test_mirror_memory_does_not_leak_into_the_next_episode``
+    and ``::test_a_dead_reset_leaves_opponent_observation_raising_not_stale``,
+    the only two tests in the repo that die to it. Do not delete those believing
+    this file covers them.
     """
     rng = _seed_np()
     bridge = _ScriptedBridge()
