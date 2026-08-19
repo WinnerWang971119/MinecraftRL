@@ -51,6 +51,7 @@ Owner: T16 (DQN core track)
 
 from __future__ import annotations
 
+import os
 import random
 import threading
 from collections import deque
@@ -58,6 +59,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Deque,
     Dict,
     List,
@@ -66,6 +68,7 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
+    Union,
 )
 
 import numpy as np
@@ -88,6 +91,12 @@ from agent.train_config import (
 )
 from distributed.serialization import Episode
 from opponents.scripted_bot import OpponentView, ScriptedBot, ScriptedPreset
+from opponents.snapshot_pool import (
+    INDEX_FILENAME,
+    MatchResult,
+    SnapshotPool,
+    SnapshotRecord,
+)
 
 __all__ = [
     "EnvProtocol",
@@ -109,11 +118,17 @@ __all__ = [
     "arena_episode_seed",
     "opponent_seed",
     "EpisodeOpponent",
+    "ObservationOpponent",
+    "OpponentDriver",
     "OpponentCurriculum",
     "ScriptedOpponentDriver",
     "build_scripted_opponents",
+    "SnapshotOpponentDriver",
+    "build_snapshot_opponents",
+    "snapshot_pool_directory",
     "EvalOpponentDriver",
     "build_eval_opponent",
+    "build_live_env_factory_for",
     "collect_episode",
     "hidden_snapshot",
     "LearnStats",
@@ -781,10 +796,23 @@ def arena_episode_seed(cfg: TrainConfig, arena_id: int, local_ep: int) -> int:
 
 
 #: Seed roles inside one arena's opponent band, in index order. Each per-arena
-#: driver owns three independent RNG streams — the EASY/HARD mixture draw, and
-#: one per ``ScriptedBot`` — and they must not collide with each other or with
-#: another arena's.
-_OPPONENT_SEED_ROLES: Tuple[str, ...] = ("mixture", "easy", "hard", "eval")
+#: driver owns independent RNG streams — for the scripted driver the EASY/HARD
+#: mixture draw plus one per ``ScriptedBot``; for the self-play driver the
+#: snapshot draw plus its ε-greedy generator — and they must not collide with
+#: each other or with another arena's.
+#:
+#: APPEND ONLY. The seed for a role is its INDEX in this tuple, so inserting or
+#: reordering an entry silently re-seeds every role after it and changes what a
+#: previously reproducible run replays. The self-play roles are therefore at the
+#: end, behind the four this project already shipped.
+_OPPONENT_SEED_ROLES: Tuple[str, ...] = (
+    "mixture",
+    "easy",
+    "hard",
+    "eval",
+    "snapshot_sample",
+    "snapshot_epsilon",
+)
 
 
 def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
@@ -810,8 +838,10 @@ def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
         cfg: The training config (supplies ``seed`` and ``seed_stride``).
         arena_id: 0-based arena index.
         role: One of :data:`_OPPONENT_SEED_ROLES` — ``"mixture"``, ``"easy"``,
-            ``"hard"``, or ``"eval"`` (the periodic eval's own opponent, which
-            :func:`build_eval_opponent` seeds from a band no collector owns).
+            ``"hard"``, ``"eval"`` (the periodic eval's own opponent, which
+            :func:`build_eval_opponent` seeds from a band no collector owns),
+            ``"snapshot_sample"`` (the self-play driver's pool draw) or
+            ``"snapshot_epsilon"`` (its ε-greedy ``torch.Generator``).
 
     Returns:
         The integer seed for that arena's stream.
@@ -1137,6 +1167,517 @@ def build_scripted_opponents(
     return curriculum, opponent_for
 
 
+# ---------------------------------------------------------------------------
+# Self-play: the frozen past-self opponent (T10, M4 / issues #8-#10).
+#
+# WHAT CHANGES. The scripted curriculum drives the second fighter from an
+# omniscient hand-written bot that reads an :class:`OpponentView`. Self-play
+# drives it from a FROZEN SNAPSHOT of this agent's own past policy, which is a
+# ``DuelingDRQN`` and therefore needs the one thing a view is not: the 23-dim
+# observation vector, computed from the OPPONENT'S seat. ``MCPvPEnv`` serves
+# that from ``opponent_observation()`` when it was built with
+# ``mirror_opponent=True``.
+#
+# TWO PROTOCOLS, ONE DISCRIMINATOR. The two opponent kinds cannot share one
+# ``act`` signature without one of them silently receiving the wrong argument
+# type, so :class:`ObservationOpponent` is a SEPARATE protocol and
+# :func:`collect_episode` picks the branch off the ``needs_observation`` class
+# attribute. :class:`EpisodeOpponent` is untouched; the scripted path keeps
+# every byte of its behavior.
+#
+# THE MIRROR IS NOT OPTIONAL. ``opponent_observation()`` RAISES on an env built
+# without ``mirror_opponent=True`` rather than returning a zeroed world, so a
+# missed construction site is a loud failure on the first episode instead of a
+# night spent training a frozen net on garbage. Both sites — the training env
+# factory and the eval env — are wired below.
+# ---------------------------------------------------------------------------
+
+
+class ObservationOpponent(Protocol):
+    """An opponent that decides from the OPPONENT-seat OBSERVATION, not a view.
+
+    Deliberately a SEPARATE protocol from :class:`EpisodeOpponent` rather than a
+    widening of it: the two differ in what ``act`` takes (a 23-dim
+    ``np.ndarray`` here, an :class:`~opponents.scripted_bot.OpponentView` there)
+    and Python would happily pass either object to either implementation.
+    Splitting them makes the mismatch a routing decision
+    :func:`collect_episode` takes ONCE per episode, off :attr:`needs_observation`,
+    instead of a duck-typing accident discovered at the first ``act`` call.
+
+    :class:`SnapshotOpponentDriver` is the only production implementation; a
+    test may substitute a recorder.
+
+    Attributes:
+        needs_observation: Always ``True``. The discriminator
+            :func:`collect_episode` reads to decide between
+            ``env.opponent_observation()`` and ``env.raw_opponent_view()``. A
+            ``ClassVar`` rather than an instance field so it describes the KIND
+            of opponent: one driver cannot route one way this episode and the
+            other way the next.
+    """
+
+    needs_observation: ClassVar[bool]
+
+    def begin_episode(self) -> None:
+        """Called once before an episode's first decision (sample + reset)."""
+        ...
+
+    def act(self, obs: np.ndarray) -> int:
+        """Return the opponent's macro (``0..N_ACTIONS-1``) for this window.
+
+        Args:
+            obs: The OPPONENT seat's ``(OBS_DIM,)`` float32 observation, from
+                ``env.opponent_observation()``.
+        """
+        ...
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Called once with the FINAL step's ``info`` so the episode can be scored."""
+        ...
+
+
+#: Either opponent kind, as :func:`collect_episode` sees it.
+#: :class:`~distributed.actor.ActorPool` builds one per arena and only stores it
+#: (it never calls into a driver itself); :func:`collect_episode` is the single
+#: place either protocol is actually exercised.
+OpponentDriver = Union[EpisodeOpponent, ObservationOpponent]
+
+
+def _needs_observation(opponent: Optional[Any]) -> bool:
+    """True iff ``opponent`` wants the mirrored observation rather than a view.
+
+    Read via ``getattr`` with a ``False`` default so an
+    :class:`EpisodeOpponent` — which has no such attribute, and must not grow
+    one — routes to the historical view path untouched. ``None`` (the
+    stationary-dummy path) reads as ``False`` for the same reason. The ``bool``
+    coercion makes the return a real boolean rather than whatever the attribute
+    happened to hold, so a caller may compare it with ``is``.
+    """
+    return bool(getattr(opponent, "needs_observation", False))
+
+
+def snapshot_pool_directory(run_name: str) -> str:
+    """Return the snapshot-pool directory for ``run_name`` (``runs/<run>/snapshots``).
+
+    The one place that layout is spelled out, so the pool the training loop
+    writes and the pool a restart reloads cannot drift apart by a path typo.
+
+    Args:
+        run_name: The run's logger name (``--run-name``), e.g. ``"m4_selfplay"``.
+
+    Returns:
+        The relative directory path. :class:`~opponents.snapshot_pool.SnapshotPool`
+        creates it if it does not exist.
+
+    Raises:
+        ValueError: ``run_name`` is empty or whitespace — that would silently
+            collapse the path to ``runs/snapshots`` and merge two runs' pools.
+    """
+    name = str(run_name).strip()
+    if not name:
+        raise ValueError(f"run_name must be a non-empty string, got {run_name!r}")
+    return os.path.join("runs", name, "snapshots")
+
+
+class SnapshotOpponentDriver:
+    """One arena's self-play opponent: a frozen past-self policy, resampled per episode.
+
+    Implements :class:`ObservationOpponent`. Per episode it draws a snapshot
+    from the shared :class:`~opponents.snapshot_pool.SnapshotPool`, loads those
+    frozen weights into its OWN net, and plays them; at the end it scores the
+    match back into the pool, which is what feeds PFSP and both Elo series.
+
+    Four properties are load-bearing, and each one is a specific failure this
+    class exists to prevent:
+
+      * **The net is a PRIVATE CPU clone in ``eval()`` mode.** One per arena —
+        ``cfg.arenas`` of them, all live while the learner steps the optimizer;
+        putting them on the learner's device would make every arena's episode
+        boundary contend with it for the same compute. It is a SECOND frozen
+        clone per collector, beside the
+        :class:`~distributed.weights.SnapshotPolicy` that already acts for the
+        learner, and that one is CPU-pinned too. ``DuelingDRQN.act`` is itself
+        ``@torch.no_grad()``, so no autograd graph is ever built here.
+      * **The LSTM hidden state is reset in :meth:`begin_episode`.** A DRQN's
+        action depends on its whole carried history; a hidden state left over
+        from the PREVIOUS episode (a different snapshot, a different fight) is
+        not an error anywhere — the net still returns a legal macro — it just
+        makes the opponent's behavior a function of the last episode's ending.
+        Silent corruption, so it is reset explicitly and asserted by a test.
+      * **Two private RNG streams, never the global ones.** ``self._rng`` draws
+        the snapshot, ``self._generator`` drives ε-greedy; both are seeded from
+        this arena's own band via :func:`opponent_seed`. A stream shared with
+        another arena — or with the process-wide RNG — makes each arena's draws
+        depend on how the collector threads happened to interleave, so the run
+        stops being reproducible from its seed and the arenas stop being
+        independent samples.
+      * **It acts at ``cfg.opponent_epsilon`` (0.02 by default), not greedily.**
+        Two greedy deterministic policies facing each other can lock into the
+        same move sequence every episode, producing thousands of near-identical
+        trajectories that teach the learner nothing.
+
+    Args:
+        cfg: The training config (``opponent_epsilon``, seeds).
+        pool: The SHARED snapshot pool (one per run). Thread-safe; every arena's
+            driver samples from and records into the same instance.
+        arena_id: 0-based arena index; selects this driver's seed band.
+        net_factory: Zero-arg builder for this driver's own net. MUST produce
+            the same architecture the learner publishes, or
+            ``load_state_dict(strict=True)`` refuses the snapshot loudly.
+            Defaults to a stock :class:`~agent.dqn.DuelingDRQN`.
+        learner_epsilon: The learner's ε for the FIRST match, before
+            :meth:`note_learner_epsilon` reports the real per-episode value.
+            Defaults to ``cfg.eps_end`` — the learner's ε FLOOR, deliberately
+            not ``0.0``: a match whose ε was never reported must not read as a
+            greedy one and slip into the rated Elo series.
+    """
+
+    #: The :func:`collect_episode` discriminator: this driver is fed
+    #: ``env.opponent_observation()``, never ``env.raw_opponent_view()``.
+    needs_observation: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        pool: SnapshotPool,
+        arena_id: int,
+        *,
+        net_factory: Optional[Callable[[], Any]] = None,
+        learner_epsilon: Optional[float] = None,
+    ) -> None:
+        self.arena_id = int(arena_id)
+        self._pool = pool
+        self._epsilon = float(cfg.opponent_epsilon)
+        self._learner_epsilon = float(
+            cfg.eps_end if learner_epsilon is None else learner_epsilon
+        )
+
+        # CPU only, deliberately and unconditionally — see the class docstring.
+        # Not derived from the learner's device: a run that ever gets a GPU
+        # learner must NOT quietly move a frozen clone per arena onto it.
+        self._device = torch.device("cpu")
+        build = net_factory if net_factory is not None else DuelingDRQN
+        self._net = build().to(self._device)
+        self._net.eval()
+
+        # Private streams, seeded from this arena's own band. `random.Random`
+        # for the pool draw (SnapshotPool.sample only needs `.random()`) and a
+        # torch.Generator for ε-greedy (what DuelingDRQN.act consumes).
+        self._rng = random.Random(
+            opponent_seed(cfg, self.arena_id, "snapshot_sample")
+        )
+        self._generator = torch.Generator(device=self._device)
+        self._generator.manual_seed(
+            opponent_seed(cfg, self.arena_id, "snapshot_epsilon")
+        )
+
+        # Per-episode state. `None` hidden is the LSTM zero-init contract
+        # DuelingDRQN.act applies, and `None` record means "no snapshot loaded
+        # yet", which observe_outcome treats as nothing to score.
+        self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._record: Optional[SnapshotRecord] = None
+        self._last_match: Optional[MatchResult] = None
+
+    # -- read side ---------------------------------------------------------
+
+    @property
+    def net(self) -> Any:
+        """This driver's own frozen net (exposed for tests / introspection)."""
+        return self._net
+
+    @property
+    def hidden(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The carried LSTM state; ``None`` at every episode's first decision."""
+        return self._hidden
+
+    @property
+    def snapshot_id(self) -> Optional[int]:
+        """Id of the snapshot loaded for the CURRENT episode, or ``None``."""
+        return None if self._record is None else int(self._record.snapshot_id)
+
+    @property
+    def record(self) -> Optional[SnapshotRecord]:
+        """The :class:`~opponents.snapshot_pool.SnapshotRecord` being played."""
+        return self._record
+
+    @property
+    def epsilon(self) -> float:
+        """This driver's own ε — the ``opponent_epsilon`` side of a match record."""
+        return self._epsilon
+
+    @property
+    def learner_epsilon(self) -> float:
+        """The learner's ε for the current episode, as last reported."""
+        return self._learner_epsilon
+
+    @property
+    def name(self) -> str:
+        """Stable name for logs (``"snapshot_<id>"``, or ``"snapshot"`` before one)."""
+        return "snapshot" if self._record is None else f"snapshot_{self.snapshot_id}"
+
+    @property
+    def current_match(self) -> Optional[MatchResult]:
+        """The most recently SCORED match, or ``None`` before the first outcome.
+
+        Deliberately the scored result and not the in-flight one: a
+        :class:`~opponents.snapshot_pool.MatchResult` carries a ``score``, and a
+        match still being played has none. Fabricating a placeholder score here
+        would put a value into a record whose whole purpose is to be rated. The
+        in-flight match's identity is available meanwhile from
+        :attr:`snapshot_id`, :attr:`learner_epsilon` and :attr:`epsilon`.
+        """
+        return self._last_match
+
+    # -- write side --------------------------------------------------------
+
+    def note_learner_epsilon(self, epsilon: float) -> None:
+        """Report the LEARNER's ε for the episode about to start.
+
+        The driver cannot derive this: ε comes from the global per-episode
+        schedule (plus the Ape-X per-actor spread), which lives on the collector
+        side. :func:`collect_episode` calls this immediately before
+        :meth:`begin_episode` on every self-play episode; an eval that wants its
+        matches to count toward ``elo/learner_rated`` must call it with EXACTLY
+        ``0.0`` (see ``TrainConfig.opponent_epsilon`` — eligibility is exact
+        float equality, so an ε-adjacent constant empties the rated series
+        silently).
+
+        Args:
+            epsilon: The learner's exploration rate for this episode, in
+                ``[0, 1]``.
+
+        Raises:
+            ValueError: ``epsilon`` is outside ``[0, 1]`` or not finite —
+                :class:`~opponents.snapshot_pool.MatchResult` would reject it
+                later, at scoring time, far from the caller that supplied it.
+        """
+        value = float(epsilon)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"learner epsilon must be in [0, 1], got {epsilon!r}")
+        self._learner_epsilon = value
+
+    def begin_episode(self) -> None:
+        """Sample this episode's snapshot, load it, and clear the LSTM memory.
+
+        Three steps, all of them before the first :meth:`act`:
+
+          1. ``pool.sample_state_dict`` draws a snapshot AND reads its weights,
+             internally dropping-and-resampling past an unpinned member that
+             turns out to be missing or corrupt. That retry loop is the pool's,
+             not this class's — reimplementing it here would give the fleet two
+             disagreeing corruption policies.
+          2. ``load_state_dict(strict=True)`` (torch's default) copies the frozen
+             weights in; a snapshot from a different architecture fails loudly
+             rather than loading a partial net.
+          3. The hidden state is cleared, so the first ``act`` of the episode
+             starts from a zero LSTM state instead of the last episode's memory.
+
+        ``exclude_id`` is passed as ``None``. It names the learner's own current
+        policy version, and this driver has no way to know it: the collector
+        carries a :class:`~distributed.weights.WeightStore` version, which is a
+        publish counter, not a snapshot id. So the newest snapshot stays
+        sampleable — a near-copy of the learner as of the last archive cadence.
+        Wiring a real exclusion belongs with whatever owns that cadence, which
+        is also the only thing that knows which snapshot id it just wrote.
+        Either way the pool's bootstrap rule (snapshot 0 stays sampleable until
+        a second distinct version exists) guarantees the very first episode has
+        a legal opponent.
+
+        Raises:
+            opponents.snapshot_pool.PinnedSnapshotError: A pinned reference
+                snapshot is missing or unreadable — fatal by contract.
+            opponents.snapshot_pool.SnapshotPoolError: No sampleable member
+                remains. Never silently falls back to an untrained net.
+        """
+        record, state_dict = self._pool.sample_state_dict(self._rng, exclude_id=None)
+        self._net.load_state_dict(state_dict)
+        self._record = record
+        # AFTER the load, and unconditionally: a hidden state carried across the
+        # episode boundary makes this episode's behavior depend on the last
+        # one's ending, with nothing anywhere reporting it.
+        self._hidden = None
+
+    def act(self, obs: np.ndarray) -> int:
+        """Return the frozen snapshot's macro for this decision window.
+
+        Advances the driver's own LSTM by exactly one step and acts ε-greedily
+        at :attr:`epsilon` off the driver's private generator.
+
+        Args:
+            obs: The OPPONENT seat's ``(OBS_DIM,)`` observation, from
+                ``env.opponent_observation()``. Passed through untouched apart
+                from the float32/CPU coercion the net requires.
+
+        Returns:
+            The macro as an ``int`` in ``[0, N_ACTIONS)`` — ``DuelingDRQN.act``
+            can only return an index into its own Q head, so the env's range
+            check on ``opp_action`` is unreachable from here.
+        """
+        if torch.is_tensor(obs):
+            obs_tensor = obs.to(dtype=torch.float32, device=self._device)
+        else:
+            obs_tensor = torch.as_tensor(
+                obs, dtype=torch.float32, device=self._device
+            )
+        action, self._hidden = self._net.act(
+            obs_tensor,
+            self._hidden,
+            epsilon=self._epsilon,
+            generator=self._generator,
+        )
+        return int(action)
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Score the finished episode into the shared pool.
+
+        ``info["won"]`` is the LEARNER's win (this snapshot died), so the score
+        is written from the LEARNER's perspective, matching
+        :class:`~opponents.snapshot_pool.MatchResult`: 1.0 win, 0.0 loss, 0.5
+        otherwise. "Otherwise" covers a timeout AND an episode stopped by the
+        rollout's ``max_steps`` — in both, neither fighter died, which is a draw
+        by any reading and must not be recorded as a loss for the learner.
+
+        ``lost`` is tested FIRST so a malformed pair with both flags set reads
+        as a loss. ``MCPvPEnv`` already resolves them exclusively — a
+        simultaneous double death is a loss there, because the learner dying can
+        never count as a win — and this keeps the same rule rather than letting
+        a fake env or a future producer turn a double death into a win.
+
+        No-ops when no snapshot is loaded — the only way to reach that is an
+        ``observe_outcome`` without a preceding ``begin_episode``, and inventing
+        a match against no opponent would corrupt PFSP and Elo alike. An episode
+        aborted mid-flight by a ``BridgeError`` never reaches here at all, so a
+        lost pad is simply not scored, matching the scripted curriculum.
+        """
+        record = self._record
+        if record is None:
+            return
+        won = bool(info.get("won", False))
+        lost = bool(info.get("lost", False))
+        score = 0.0 if lost else (1.0 if won else 0.5)
+        result = MatchResult.create(
+            snapshot_id=int(record.snapshot_id),
+            learner_epsilon=self._learner_epsilon,
+            opponent_epsilon=self._epsilon,
+            score=score,
+        )
+        self._pool.record_result(result)
+        self._last_match = result
+
+
+def build_snapshot_opponents(
+    cfg: TrainConfig,
+    *,
+    run_name: str = "selfplay",
+    snapshot_dir: Optional[str] = None,
+    net_factory: Optional[Callable[[], Any]] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> Tuple[SnapshotPool, Callable[[int], SnapshotOpponentDriver]]:
+    """Build the shared snapshot pool and a per-arena self-play driver factory.
+
+    The self-play twin of :func:`build_scripted_opponents`, with the same
+    lock-guarded MEMOIZATION: a given ``arena_id`` gets the SAME driver for the
+    whole run, and two arenas can never be handed one object.
+    :meth:`distributed.actor.ActorPool.build` requires that — two collectors
+    sharing a driver would share one LSTM hidden state (each arena's episode
+    stomping the other's memory mid-fight) and one ε-greedy generator, which is
+    exactly the cross-arena correlation the per-arena seed bands exist to
+    prevent. The memoization is lock-guarded, matching
+    :func:`build_scripted_opponents`: nothing in this factory's contract says
+    the caller builds every collector on one thread, and a torn read would hand
+    two collectors two DIFFERENT drivers for the same arena.
+
+    Seeds the pool's snapshot 0 from ``cfg.warm_start``, ``pinned=True``: the
+    run's first opponent is the policy the run itself starts from, and a pinned
+    member is never dropped, so PFSP always has a floor opponent and Elo always
+    has a fixed yardstick.
+
+    A directory that ALREADY holds a ``pool.json`` is RELOADED through
+    :meth:`~opponents.snapshot_pool.SnapshotPool.load` instead, and no snapshot
+    is seeded. Constructing a fresh pool over a populated directory would reset
+    the id counter to 0 and let the next ``add`` overwrite ``snap_0.pt`` — the
+    PINNED first reference — while the index still claimed the whole earlier
+    history. The reload also restores the Elo series and every head-to-head
+    statistic, so PFSP resumes from what the run actually measured rather than
+    from a flat table.
+
+    Args:
+        cfg: The training config. Reads ``warm_start`` (snapshot 0's weights),
+            ``snapshot_sampling``, ``elo_k``, ``elo_initial``,
+            ``opponent_epsilon`` and the seed scheme.
+        run_name: The run's name, used to derive the default pool directory via
+            :func:`snapshot_pool_directory` (so the default is
+            ``runs/selfplay/snapshots``). Ignored when ``snapshot_dir`` is
+            given.
+        snapshot_dir: Explicit pool directory, which OVERRIDES ``run_name``.
+            The multi-arena loop passes its own ``snapshot_dir`` straight
+            through; tests point it at a ``tmp_path``.
+        net_factory: Zero-arg builder for each driver's own net. MUST match the
+            learner's architecture (the multi-arena path passes the same
+            ``net_kwargs`` the learner was built with) or a snapshot load fails.
+        log: Sink for the pool's loud corruption/drop messages.
+
+    Returns:
+        ``(pool, opponent_for)`` — the shared pool and
+        ``arena_id -> SnapshotOpponentDriver``.
+
+    Raises:
+        ValueError: ``cfg.warm_start`` is ``None``. ``TrainConfig`` already
+            refuses that combination for ``opponent == "selfplay"``; this second
+            check covers a caller that built the pool from some other config,
+            because the alternative is seeding snapshot 0 from a randomly
+            initialized net and calling it a past self.
+        FileNotFoundError: ``cfg.warm_start`` does not exist.
+        opponents.snapshot_pool.PinnedSnapshotError: A reloaded pool is missing
+            a pinned snapshot's file — fatal, never recovered from.
+        opponents.snapshot_pool.SnapshotPoolError: An existing ``pool.json`` is
+            unreadable, of an unknown index version, or malformed.
+    """
+    if cfg.warm_start is None:
+        raise ValueError(
+            "build_snapshot_opponents requires cfg.warm_start: the pool's "
+            "snapshot 0 IS the warm-start policy, and with no checkpoint to "
+            "load the first opponent would be a freshly initialized net "
+            "presented as a past self. Pass --warm-start <checkpoint>."
+        )
+
+    directory = (
+        snapshot_pool_directory(run_name) if snapshot_dir is None else str(snapshot_dir)
+    )
+    if os.path.isfile(os.path.join(directory, INDEX_FILENAME)):
+        pool = SnapshotPool.load(directory, sampling=cfg.snapshot_sampling, log=log)
+    else:
+        pool = SnapshotPool(
+            directory,
+            elo_k=cfg.elo_k,
+            elo_initial=cfg.elo_initial,
+            sampling=cfg.snapshot_sampling,
+            log=log,
+        )
+        pool.add(
+            load_checkpoint_state_dict(str(cfg.warm_start)),
+            grad_step=0,
+            elo=cfg.elo_initial,
+            pinned=True,
+        )
+
+    drivers: Dict[int, SnapshotOpponentDriver] = {}
+    lock = threading.Lock()
+
+    def opponent_for(arena_id: int) -> SnapshotOpponentDriver:
+        key = int(arena_id)
+        with lock:
+            driver = drivers.get(key)
+            if driver is None:
+                driver = SnapshotOpponentDriver(
+                    cfg, pool, key, net_factory=net_factory
+                )
+                drivers[key] = driver
+            return driver
+
+    return pool, opponent_for
+
+
 class EvalOpponentDriver:
     """The PERIODIC EVAL's opponent: fixed tier schedule, fully deterministic.
 
@@ -1351,7 +1892,7 @@ def collect_episode(
     episode_index: int,
     epsilon: float,
     episode_seed: int,
-    opponent: Optional[EpisodeOpponent] = None,
+    opponent: Optional[OpponentDriver] = None,
 ) -> Episode:
     """Roll ONE episode against ``env`` with ``policy`` and return it as an Episode.
 
@@ -1387,16 +1928,32 @@ def collect_episode(
             an episode, per the per-EPISODE schedule).
         episode_seed: Deterministic seed for BOTH the env reset and the policy's
             action RNG, so the exploration stream is replayable.
-        opponent: Optional per-arena :class:`EpisodeOpponent` (T12). ``None`` (the
-            default) is the M1/M2 stationary-dummy path and is BYTE-IDENTICAL to
-            what this loop did before the parameter existed: ``env.step(action)``
-            is called with one positional argument, no ``opp_action`` reaches the
-            wire, and the env is never asked for a raw view. When given, each
-            decision reads ``env.raw_opponent_view()``, asks the opponent for a
-            macro, and sends both actions in ONE ``env.step`` — see the
-            one-step-one-window invariant in this section's banner. The env must
-            then expose ``raw_opponent_view()`` and accept ``opp_action``
-            (``MCPvPEnv`` does; a fake env used with an opponent must too).
+        opponent: Optional per-arena opponent driver. ``None`` (the default) is
+            the M1/M2 stationary-dummy path and is BYTE-IDENTICAL to what this
+            loop did before the parameter existed: ``env.step(action)`` is
+            called with one positional argument, no ``opp_action`` reaches the
+            wire, and the env is never asked for anything extra.
+
+            Otherwise the driver's ``needs_observation`` attribute selects what
+            it is fed, ONCE per episode, before the first decision:
+
+              * absent/False — an :class:`EpisodeOpponent` (the scripted
+                curriculum, T12). Each decision reads
+                ``env.raw_opponent_view()``.
+              * ``True`` — an :class:`ObservationOpponent` (the self-play
+                snapshot driver, T10). Each decision reads
+                ``env.opponent_observation()``, the OPPONENT seat's 23-dim
+                vector, because a frozen ``DuelingDRQN`` needs the exact inputs
+                it was trained on and an ``OpponentView`` is not one of them.
+                That accessor RAISES unless the env was built with
+                ``mirror_opponent=True``, so a missed construction site fails on
+                the first episode rather than training an hour against garbage.
+
+            Either way it is ONE read, ONE macro, ONE ``env.step`` per decision
+            window — see the one-step-one-window invariant in this section's
+            banner. The env must accept ``opp_action`` and expose whichever
+            accessor the branch uses (``MCPvPEnv`` does; a fake env used with an
+            opponent must too).
 
     Returns:
         An immutable :class:`~distributed.serialization.Episode` whose
@@ -1415,10 +1972,27 @@ def collect_episode(
     policy.reseed(episode_seed)
     obs = env.reset(seed=episode_seed)
     hidden = policy.init_hidden()
-    # Episode boundary for the opponent: draw this episode's difficulty tier and
-    # start its bot's episode. AFTER env.reset(), because the reset re-arms the
-    # opponent's shadow swing meter that the bot's ATTACK gate reads.
+    # Which accessor this episode's opponent is fed. Resolved ONCE, before the
+    # first decision, so the routing cannot change mid-episode and the hot loop
+    # pays no attribute lookup per step.
+    opponent_observes = _needs_observation(opponent)
+    # Episode boundary for the opponent: draw this episode's difficulty tier (or
+    # snapshot) and start its episode. AFTER env.reset(), because the reset
+    # re-arms the opponent's shadow swing meter that the scripted bot's ATTACK
+    # gate reads, and re-primes the mirror the snapshot driver reads.
     if opponent is not None:
+        if opponent_observes:
+            # Report the LEARNER's ε for this episode so the driver can build a
+            # truthful MatchResult: the rated Elo series takes a match only when
+            # BOTH epsilons are exactly 0.0, and ε lives on this side of the
+            # seam (the schedule plus the Ape-X per-actor spread), not the
+            # driver's. Guarded rather than required, because it is NOT part of
+            # the ObservationOpponent protocol — a test recorder can omit it.
+            # It is never looked up on the view branch, so an EpisodeOpponent
+            # is untouched by this whether or not it has such an attribute.
+            note_epsilon = getattr(opponent, "note_learner_epsilon", None)
+            if callable(note_epsilon):
+                note_epsilon(float(epsilon))
         opponent.begin_episode()
 
     transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
@@ -1440,6 +2014,16 @@ def collect_episode(
         if opponent is None:
             # The M1/M2 line, unchanged: one positional argument, no opp_action.
             next_obs, reward, done, info = env.step(action)
+        elif opponent_observes:
+            # ONE mirrored observation, ONE macro, ONE step. Same invariant as
+            # the view branch below, different accessor: a frozen DuelingDRQN
+            # decides from the OPPONENT seat's 23-dim vector. Read here rather
+            # than cached from an earlier step so the snapshot decides from the
+            # same window the agent just acted on; the env computed it EAGERLY
+            # when it ingested that state, so this read is a cache hit and does
+            # not age the mirror's perception memory.
+            opp_action = opponent.act(env.opponent_observation())
+            next_obs, reward, done, info = env.step(action, opp_action=opp_action)
         else:
             # ONE view, ONE macro, ONE step — the decision window the env counts.
             # The view is read here (not cached from an earlier step) so the
@@ -1466,11 +2050,12 @@ def collect_episode(
         if max_steps is not None and steps >= max_steps:
             break
 
-    # Score the finished episode into the curriculum. The FINAL step's info holds
-    # the terminal verdict (``won`` / ``lost`` / ``timeout``); an episode stopped
-    # by ``max_steps`` carries won=False, which is the right reading — it did not
-    # win. The loop body always runs at least once, so ``last_info`` is only None
-    # in a pathological env.
+    # Score the finished episode — into the curriculum gate on the scripted
+    # path, into the snapshot pool's stats and Elo on the self-play one. The
+    # FINAL step's info holds the terminal verdict (``won`` / ``lost`` /
+    # ``timeout``); an episode stopped by ``max_steps`` carries won=False, which
+    # is the right reading — it did not win. The loop body always runs at least
+    # once, so ``last_info`` is only None in a pathological env.
     if opponent is not None:
         opponent.observe_outcome(last_info if last_info is not None else {})
 
@@ -2527,6 +3112,7 @@ def _eval_against_opponent(
     base_seed: int,
     log: Optional[Callable[[str], None]],
     opponent: Optional[Any] = None,
+    mirror_opponent: bool = False,
 ) -> Any:
     """Run ONE greedy (ε=0) eval of the current online net vs the stage opponent.
 
@@ -2535,6 +3121,15 @@ def _eval_against_opponent(
     :class:`EvalOpponentDriver` when the run fights the scripted opponent — in
     which case the eval steps it exactly as collection does, so the win rate this
     returns is a win rate against the SAME moving opponent training faces.
+
+    ``mirror_opponent`` builds the eval env with the opponent-seat observation
+    mirror, and MUST be true whenever ``opponent`` is a self-play
+    :class:`SnapshotOpponentDriver` — that driver reads
+    ``env.opponent_observation()``, which raises on an env without the mirror.
+    It is the SECOND of the two construction sites the self-play wiring has to
+    reach, and the more dangerous one: the training factory's mistake surfaces
+    on the first episode, this one's only at the first eval cycle, potentially
+    an hour into a run.
 
     The bridge serves EXACTLY ONE connection, so eval must not open a second one:
     a fresh eval socket adopts the stream and the bridge destroys the training
@@ -2595,6 +3190,9 @@ def _eval_against_opponent(
         transport=shared_transport,
         max_episode_steps=env_max_episode_steps,
         auto_connect=False,
+        # The self-play eval's second construction site (AC13). False on every
+        # other path, which is byte-identical to the pre-M4 call.
+        mirror_opponent=bool(mirror_opponent),
     )
     # Switch back to train mode afterward: DRQNGreedyPolicy flips the net to eval()
     # for inference; the next collection/learn step expects train mode.
@@ -2764,6 +3362,74 @@ class MultiArenaResult:
 EnvFactoryFor = Callable[[int], Callable[[], "EnvProtocol"]]
 
 
+def build_live_env_factory_for(
+    cfg: TrainConfig,
+    *,
+    host: str,
+    base_port: int,
+    max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
+) -> EnvFactoryFor:
+    """Build the LIVE per-arena env factory: pad ``i`` -> a fresh connected env.
+
+    The TRAINING half of the two ``MCPvPEnv`` construction sites a self-play run
+    must reach (the other is the eval env inside
+    :func:`_eval_against_opponent`). Both derive their ``mirror_opponent`` flag
+    from the same ``cfg.opponent == "selfplay"`` test, so a run cannot mirror on
+    one side and not the other.
+
+    Module-level rather than a closure inside :func:`_main_multi_arena` for one
+    reason: this is the wiring AC13 is about, and wiring that can only be
+    exercised by starting a real fleet is wiring nothing tests. Here a test
+    builds the factory from a config and inspects the env it produces.
+
+    Each returned builder opens ONE
+    :class:`~env.mc_pvp_env.TcpBridgeClient` to ``base_port + arena_id``.
+    ``auto_connect`` stays at its default ``True``: the collector treats a
+    successful return as a working connection, and a connect failure raises
+    ``BridgeError`` into its recovery path. One TCP connection per arena — the
+    wire carries no arena id, and a bridge accepts exactly one client.
+
+    Args:
+        cfg: The training config; only ``opponent`` is read (for the mirror).
+        host: Bridge host shared by every pad.
+        base_port: Pad 0's bridge port; pad ``i`` listens on ``base_port + i``.
+        max_episode_steps: Episode truncation handed to every env; ``None``
+            disables truncation entirely.
+
+    Returns:
+        An :data:`EnvFactoryFor` — ``arena_id -> (() -> MCPvPEnv)``.
+    """
+    # Function-local, like every other env import in this module (there is no
+    # module-level one), so importing agent.train never drags in the env
+    # package. Resolved HERE, at factory-build time — the builders below close
+    # over these two names, which is the same binding moment the closure this
+    # replaced had inside _main_multi_arena.
+    from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
+
+    # Evaluated ONCE, not per arena: every pad in a run mirrors or none does.
+    mirror_opponent = cfg.opponent == "selfplay"
+
+    def _factory_for(arena_id: int) -> Callable[[], Any]:
+        port = int(base_port) + int(arena_id)
+
+        def _build() -> Any:
+            transport = TcpBridgeClient(host=host, port=port)
+            return MCPvPEnv(
+                transport=transport,
+                max_episode_steps=max_episode_steps,
+                # Self-play drives the second fighter from a frozen DuelingDRQN,
+                # which needs the OPPONENT seat's observation.
+                # ``opponent_observation()`` RAISES without this flag, so
+                # omitting it here fails on the run's first episode rather than
+                # quietly feeding the snapshot nothing.
+                mirror_opponent=mirror_opponent,
+            )
+
+        return _build
+
+    return _factory_for
+
+
 class _BestCheckpointSelector:
     """Decide which eval report is worth saving as THE checkpoint to ship.
 
@@ -2822,6 +3488,7 @@ def _eval_via_designated_arena(
     log: Optional[Callable[[str], None]],
     pause_timeout: float,
     opponent: Optional[Any] = None,
+    mirror_opponent: bool = False,
 ) -> Optional[_EvalOutcome]:
     """Run ONE greedy eval on the designated arena via the pause/handoff protocol.
 
@@ -2839,6 +3506,10 @@ def _eval_via_designated_arena(
     the opponent is the EVAL's own — a fresh, fixed-seed driver per eval, never
     the collector's curriculum-driven one, so the eval neither perturbs training's
     opponent RNG nor inherits its drifting mixture.
+
+    ``mirror_opponent`` is forwarded unchanged to :func:`_eval_against_opponent`,
+    which is where the eval env is actually built; see that function for why the
+    flag has to reach it.
 
     Returns the eval :class:`_EvalOutcome` (report + the weight snapshot the eval
     started from), or ``None`` if the designated collector could not be brought to
@@ -2888,6 +3559,7 @@ def _eval_via_designated_arena(
             base_seed=base_seed,
             log=log,
             opponent=opponent,
+            mirror_opponent=mirror_opponent,
         )
     finally:
         # Always resume the collector, even if eval raised, so a single arena is
@@ -2919,6 +3591,7 @@ def train_multi_arena(
     best_checkpoint_hook: Optional[BestCheckpointHook] = None,
     checkpoint_every_grad_steps: Optional[int] = None,
     eval_opponent_factory: Optional[Callable[[], Any]] = None,
+    snapshot_dir: Optional[str] = None,
     is_live: bool = False,
     log: Optional[Callable[[str], None]] = None,
     poll_interval: float = 0.05,
@@ -3029,6 +3702,11 @@ def train_multi_arena(
             means the eval is built from ``cfg`` via :func:`build_eval_opponent` —
             which yields ``None`` on the dummy path, keeping the M2 eval's wire
             line byte-identical.
+        snapshot_dir: Where the self-play snapshot pool lives. Read only when
+            ``cfg.opponent == "selfplay"``; ``None`` falls back to
+            ``snapshot_pool_directory("selfplay")``. The live CLI passes
+            ``snapshot_pool_directory(--run-name)`` so two runs cannot share one
+            pool of past selves, and a test points it at a ``tmp_path``.
         is_live: Marks reports/result as live vs offline.
         log: Optional ASCII-only ``str -> None`` sink (Windows cp1252-safe).
         poll_interval: Seconds between the driver's budget/health polls.
@@ -3139,14 +3817,46 @@ def train_multi_arena(
             "live run, or a fake launcher in tests."
         )
 
-    # --- the opponent curriculum (T12) --------------------------------------
+    # --- the opponent drivers (T12 scripted / T10 self-play) ----------------
     # "dummy" (the default) builds nothing at all: no opponent_for reaches the
-    # pool, no opp_action reaches the wire, and the M2 path is untouched.
+    # ACTOR pool, no opp_action reaches the wire, and the M2 path is untouched.
     # "scripted" builds ONE shared curriculum gate plus one driver per arena.
+    # "selfplay" builds ONE shared snapshot pool plus one driver per arena.
+    #
+    # EVERY non-dummy choice MUST have a branch here. A choice that reaches this
+    # block without one leaves `opponent_for` at None, and then the whole run
+    # trains against the stationary bridge-served dummy while every log line,
+    # every metric label and the logger's own config record all say otherwise —
+    # a silent night, not a crash.
     curriculum: Optional[OpponentCurriculum] = None
-    opponent_for: Optional[Callable[[int], EpisodeOpponent]] = None
+    snapshot_pool: Optional[SnapshotPool] = None
+    opponent_for: Optional[Callable[[int], OpponentDriver]] = None
+    # "Does this run mirror the opponent seat?" — the eval env's flag, below.
+    # `build_live_env_factory_for` applies the SAME test on the training side,
+    # so the two construction sites AC13 names cannot disagree.
+    mirror_opponent = cfg.opponent == "selfplay"
     if cfg.opponent == "scripted":
         curriculum, opponent_for = build_scripted_opponents(cfg)
+    elif cfg.opponent == "selfplay":
+        snapshot_pool, opponent_for = build_snapshot_opponents(
+            cfg,
+            snapshot_dir=snapshot_dir,
+            # The SAME net_kwargs the learner was built with, so a published
+            # state_dict loads into a frozen clone strictly. `net_kwargs` is
+            # already normalized to a dict above; `_net_factory` is defined
+            # further down for the collector policies and does exactly this.
+            net_factory=lambda: DuelingDRQN(**net_kwargs),
+            log=log,
+        )
+        # The pool's own line, because "selfplay" in the config record proves
+        # only that the flag was parsed. This says a pool exists, where it is,
+        # and how many past selves the collectors can actually draw from.
+        _emit(
+            f"[multi] opponent=selfplay: snapshot pool at "
+            f"{snapshot_pool.directory!r} holds {len(snapshot_pool)} snapshot(s), "
+            f"sampling={snapshot_pool.sampling}, opponent_epsilon="
+            f"{cfg.opponent_epsilon}"
+        )
 
     # --- the EVAL's own opponent (T13) --------------------------------------
     # Separate from the collectors' drivers on purpose: the eval must fight the
@@ -3457,6 +4167,10 @@ def train_multi_arena(
                         if eval_opponent_factory is not None
                         else None
                     ),
+                    # AC13's second construction site. Derived from the SAME cfg
+                    # field as the training factory's flag so the two sites
+                    # cannot disagree about whether this run mirrors.
+                    mirror_opponent=mirror_opponent,
                 )
                 # Advance the boundary past the CURRENT grad step so a long eval (the
                 # learner kept stepping during the borrow) does not immediately re-fire.
@@ -4253,10 +4967,11 @@ def _main_multi_arena(
 ) -> int:
     """Live multi-arena (N>1) run: wire real clients + the subprocess launcher.
 
-    Constructs, per pad ``i``, an env factory that opens a
-    :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port ``--port + i`` and wraps
-    it in an :class:`~env.mc_pvp_env.MCPvPEnv`, then runs :func:`train_multi_arena`.
-    The N pads must ALREADY be booted AND PRIMED by the human
+    Constructs, via :func:`build_live_env_factory_for`, an env factory that per
+    pad ``i`` opens a :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port
+    ``--port + i`` and wraps it in an :class:`~env.mc_pvp_env.MCPvPEnv` (with
+    the self-play observation mirror when ``--opponent selfplay``), then runs
+    :func:`train_multi_arena`. The N pads must ALREADY be booted AND PRIMED by the human
     (``server/setup/start-pads.sh --pads N``, which resets every pad before any pad
     may step); T8 only connects clients. The
     :class:`~distributed.launcher.SubprocessArenaLauncher` is imported lazily here so
@@ -4283,8 +4998,6 @@ def _main_multi_arena(
     # distributed.actor imports FROM agent.train, so a module-level import here
     # would be a cycle.
     from distributed.actor import ShutdownSignal, jvm_alive
-
-    from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
 
     base_port = int(args.port)
     host = str(args.host)
@@ -4314,20 +5027,14 @@ def _main_multi_arena(
         )
         return 1
 
-    def _env_factory_for(arena_id: int) -> Callable[[], Any]:
-        port = base_port + arena_id
-
-        def _build() -> Any:
-            # auto_connect=True (default): the collector treats a successful return as
-            # a working connection; a connect failure raises BridgeError into its
-            # recovery path. One TCP connection per arena (the wire has no arena id).
-            transport = TcpBridgeClient(host=host, port=port)
-            return MCPvPEnv(
-                transport=transport,
-                max_episode_steps=MAX_EPISODE_STEPS,
-            )
-
-        return _build
+    # The per-pad env factory, including the self-play observation mirror. Built
+    # by a module-level helper so the mirror wiring is testable without a fleet.
+    _env_factory_for = build_live_env_factory_for(
+        cfg,
+        host=host,
+        base_port=base_port,
+        max_episode_steps=MAX_EPISODE_STEPS,
+    )
 
     # The launcher is the only piece that cannot be exercised offline. Import it
     # lazily and fail loudly (not silently) if it is missing — it is required to
