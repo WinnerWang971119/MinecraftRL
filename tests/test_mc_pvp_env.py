@@ -29,6 +29,11 @@ Covered behaviors:
     clock — decision-window counts (one step == ACTION_REPEAT gate ticks), never
     the coarse flat-then-jumping ``state.tick`` — and clamps to EXACTLY 1.0
     (``ScriptedBot`` reads readiness as ``>= 1.0 - 1e-6``).
+  * The M4 mirrored opponent seat (T6): ``mirror_opponent`` is OFF by default and
+    changes nothing when ON; ``opponent_observation()`` serves an EAGERLY built
+    cache (repeat reads are byte-identical and age no perception memory); the
+    mirror's memory is cleared per episode and never shares the env's filter;
+    and both seats read the shadow swing meter at the same point in the window.
 """
 
 import math
@@ -41,13 +46,14 @@ from agent.contract_config import ACTION_REPEAT, MAX_EPISODE_STEPS
 from agent.reward_config import RewardConfig
 from bridge.messages import ResetAckMsg, StateMsg
 from env.mc_pvp_env import (
+    DECISION_DT_SECONDS,
     OPPONENT_ATTACK_SPEED_TICKS,
     REWARD_COMPONENT_KEYS,
     BridgeError,
     ExhibitionConfig,
     MCPvPEnv,
 )
-from env.observation_spec import OBS_DIM, Obs, validate
+from env.observation_spec import MEMORY_TTL_SECONDS, OBS_DIM, Obs, validate
 from env.perception_filter import PerceptionFilter
 
 
@@ -1506,3 +1512,247 @@ def test_a_reset_that_fails_after_the_gate_does_not_serve_a_stale_raw_view():
 
     with pytest.raises(ValueError, match="before any state"):
         env.raw_opponent_view()
+
+
+# ---------------------------------------------------------------------------
+# The mirrored opponent seat (T6 / AC2). Everything above this banner runs with
+# ``mirror_opponent`` at its default False, i.e. on the untouched M1/M2/M3 path.
+#
+# Geometry note for every test below. The wire yaw convention is "0 looks down
+# +z" (``_look_vector``), and ``_state()``'s defaults put the learner at
+# (0, 64, 0) and the opponent at (0, 64, 2). So the opponent must look down -z
+# to see the learner, and yaw 0 has it facing away. This matters: the perception
+# filter's ``_advance_age`` is a NO-OP until the first sighting (the age starts
+# infinite), so an aging assertion made from a state where the opponent never
+# saw the learner would pass for the wrong reason.
+# ---------------------------------------------------------------------------
+
+#: Opponent yaw that points it AT the learner in ``_state()``'s default layout.
+_OPP_SEES_LEARNER = math.pi
+#: ...and the yaw that points it away, so the mirrored memory ages instead.
+_OPP_LOOKS_AWAY = 0.0
+
+
+def _mirror_env(bridge=None, **state_kwargs):
+    """A mirror-enabled env, reset on a state where the opponent SEES the learner.
+
+    Returns ``(env, bridge)``. Starting from a sighting is what makes the
+    mirrored ``time_since_seen`` finite, and therefore what makes it age.
+    """
+    if bridge is None:
+        bridge = ScriptedBridge()
+    bridge.push(_reset_ack(ok=True), _state(opp_yaw=_OPP_SEES_LEARNER, **state_kwargs))
+    env = _env(bridge, mirror_opponent=True)
+    env.reset(seed=0)
+    return env, bridge
+
+
+def test_opponent_observation_raises_when_the_mirror_is_off():
+    """The default env builds no mirror, so there is no opponent seat to serve."""
+    bridge = ScriptedBridge([_reset_ack(ok=True), _state()])
+    env, _ = _reset_env(bridge)
+
+    assert env._mirror is None  # the M1/M2/M3 shape: no second filter at all
+    with pytest.raises(ValueError, match="mirror_opponent=True"):
+        env.opponent_observation()
+
+
+def test_opponent_observation_raises_before_any_state():
+    """No state yet is a refusal, matching raw_opponent_view()'s wording."""
+    env = _env(ScriptedBridge(), mirror_opponent=True)
+
+    with pytest.raises(ValueError, match="before any state"):
+        env.opponent_observation()
+
+
+def test_opponent_observation_returns_a_validated_mirrored_vector():
+    """The flag turns the seat on: a valid OBS_DIM vector built from the OTHER seat."""
+    bridge = ScriptedBridge()
+    bridge.push(
+        _reset_ack(ok=True),
+        _state(opp_yaw=_OPP_SEES_LEARNER, self_health=20.0, opp_health=11.0),
+    )
+    env = _env(bridge, mirror_opponent=True)
+    learner_obs = env.reset(seed=0)
+
+    opp_obs = env.opponent_observation()
+
+    assert isinstance(opp_obs, np.ndarray)
+    assert opp_obs.shape == (OBS_DIM,)
+    assert opp_obs.dtype == np.float32
+    validate(opp_obs)
+
+    # The mirrored SELF block is the OPPONENT's own health (11 of the learner's
+    # 20), not a copy of the learner's — the seats really are exchanged.
+    assert opp_obs[Obs.HEALTH] == pytest.approx(learner_obs[Obs.HEALTH] * 11.0 / 20.0)
+    # ...and the opponent is looking straight at the learner, so its gated
+    # target block is VISIBLE this window.
+    assert opp_obs[Obs.VISIBLE] == 1.0
+
+
+def test_the_mirror_never_shares_the_env_perception_filter():
+    """Two seats, two memories. One shared filter destroys both.
+
+    ``PerceptionFilter.filter`` zeroes ``time_since_seen`` on every sighting, so
+    a single instance driven from both seats would have each fighter refreshing
+    the OTHER's "how long since I saw you" — with both vectors still
+    well-formed and validate()-passing.
+    """
+    env_filter = PerceptionFilter()
+    env = _env(ScriptedBridge(), perception_filter=env_filter, mirror_opponent=True)
+
+    assert env._mirror is not None
+    assert env._mirror.perception_filter is not env_filter
+    assert env._mirror.perception_filter is not env._filter
+
+
+def test_turning_the_mirror_on_does_not_perturb_the_learner_path():
+    """The mirror is additive: the learner's episode is byte-identical either way.
+
+    Two runs of the same scripted episode, one with ``mirror_opponent`` and one
+    without. Observations, rewards, done flags and the exact wire lines must
+    match — that is what keeps M1/M2/M3 reproducible under a flag they never set.
+    """
+
+    def run(mirror):
+        bridge = ScriptedBridge()
+        bridge.push(_reset_ack(ok=True), _state(opp_yaw=_OPP_SEES_LEARNER))
+        env = _env(bridge, mirror_opponent=mirror)
+        frames = [env.reset(seed=5).copy()]
+        outcomes = []
+        for tick, damage in ((2, 0.0), (3, 1.5), (4, 0.0)):
+            bridge.push(
+                _state(tick=tick, damage_dealt=damage, opp_yaw=_OPP_LOOKS_AWAY)
+            )
+            obs, reward, done, info = env.step(Macro.ATTACK, opp_action=Macro.ATTACK)
+            frames.append(obs.copy())
+            outcomes.append((reward, done, info["step"], info["tick"]))
+        return frames, outcomes, bridge.sent
+
+    plain_frames, plain_outcomes, plain_sent = run(False)
+    mirrored_frames, mirrored_outcomes, mirrored_sent = run(True)
+
+    assert plain_sent == mirrored_sent
+    assert plain_outcomes == mirrored_outcomes
+    for plain, mirrored in zip(plain_frames, mirrored_frames):
+        assert plain.tobytes() == mirrored.tobytes()
+
+
+def test_repeated_opponent_observation_is_identical_and_ages_no_memory():
+    """TC9/AC2: the accessor serves a cache; only an ingested state ages memory.
+
+    The failure this pins is the lazy accessor. ``OpponentMirror.observe`` runs
+    a ``PerceptionFilter`` whose memory advances by ``dt`` per call, so building
+    the vector inside ``opponent_observation()`` would make the opponent's
+    ``time_since_seen`` count CALLS rather than seconds: read it twelve times in
+    one window and the frozen snapshot is told the learner vanished twelve
+    windows ago.
+    """
+    env, bridge = _mirror_env()
+    # Window 0 was a sighting, so the age is finite (and zero) and will now grow.
+    assert env.opponent_observation()[Obs.TIME_SINCE_SEEN] == 0.0
+
+    # Window 1: the opponent turns away, so its memory of the learner ages.
+    bridge.push(_state(tick=2, opp_yaw=_OPP_LOOKS_AWAY))
+    env.step(Macro.IDLE)
+
+    one_window = DECISION_DT_SECONDS / MEMORY_TTL_SECONDS
+    reads = [env.opponent_observation().copy() for _ in range(12)]
+    for read in reads[1:]:
+        assert read.tobytes() == reads[0].tobytes()
+    assert reads[0][Obs.TIME_SINCE_SEEN] == pytest.approx(one_window)
+
+    # Window 2: exactly TWO windows of aging, not fourteen. This is the half
+    # that bites — twelve reads above must have advanced nothing.
+    bridge.push(_state(tick=3, opp_yaw=_OPP_LOOKS_AWAY))
+    env.step(Macro.IDLE)
+    assert env.opponent_observation()[Obs.TIME_SINCE_SEEN] == pytest.approx(
+        2 * one_window
+    )
+
+
+def test_mirror_memory_restarts_at_zero_on_a_new_episode():
+    """TC10: the mirror is reset by the env's reset(), beside the learner's filter."""
+    env, bridge = _mirror_env()
+
+    # Age the mirrored memory across three windows with the opponent looking away.
+    for tick in (2, 3, 4):
+        bridge.push(_state(tick=tick, opp_yaw=_OPP_LOOKS_AWAY))
+        env.step(Macro.IDLE)
+    aged = env.opponent_observation()[Obs.TIME_SINCE_SEEN]
+    assert aged == pytest.approx(3 * DECISION_DT_SECONDS / MEMORY_TTL_SECONDS)
+    assert aged > 0.0
+
+    # A new episode whose first state is another sighting: the age is 0 again.
+    bridge.push(_reset_ack(ok=True), _state(tick=5, opp_yaw=_OPP_SEES_LEARNER))
+    env.reset(seed=1)
+
+    assert env.opponent_observation()[Obs.TIME_SINCE_SEEN] == 0.0
+
+
+def test_mirror_memory_does_not_leak_into_the_next_episode():
+    """The reset must CLEAR the memory, not merely be overwritten by a sighting.
+
+    A new episode that opens with the opponent looking AWAY separates the two
+    cases: a cleared memory is ABSENT (``time_since_seen`` at the clamped max of
+    1.0, position zeroed), while a leaked one would still be in the MEMORY
+    regime, holding last episode's geometry and reporting a small age.
+    """
+    env, bridge = _mirror_env()
+    for tick in (2, 3, 4):
+        bridge.push(_state(tick=tick, opp_yaw=_OPP_LOOKS_AWAY))
+        env.step(Macro.IDLE)
+    assert env.opponent_observation()[Obs.TIME_SINCE_SEEN] < 1.0  # still remembering
+
+    bridge.push(_reset_ack(ok=True), _state(tick=5, opp_yaw=_OPP_LOOKS_AWAY))
+    env.reset(seed=1)
+
+    fresh = env.opponent_observation()
+    assert fresh[Obs.TIME_SINCE_SEEN] == 1.0  # ABSENT: never seen this episode
+    assert fresh[Obs.VISIBLE] == 0.0
+    np.testing.assert_array_equal(fresh[Obs.OPP_POS_LOCAL : Obs.OPP_POS_LOCAL + 3], 0.0)
+
+
+def test_a_dead_reset_leaves_opponent_observation_raising_not_stale():
+    """A reset that dies after the gate must not serve the previous episode.
+
+    Same hazard as the raw-view test above, on the mirrored seat: the gate
+    confirms, per-episode state (including the cached mirrored vector) is
+    cleared, and THEN the transport dies before the post-reset state arrives.
+    """
+    env, bridge = _mirror_env()
+    assert env.opponent_observation()[Obs.VISIBLE] == 1.0  # episode 0's vector
+
+    bridge.push(_reset_ack(ok=True), ScriptedBridge.Disconnect)
+    with pytest.raises(BridgeError):
+        env.reset(seed=1)
+
+    with pytest.raises(ValueError, match="before any state"):
+        env.opponent_observation()
+
+
+def test_mirrored_cooldown_matches_raw_opponent_view_in_the_same_window():
+    """Both seats read the SAME shadow swing meter at the same point in the window.
+
+    There is no opponent ``attack_cooldown`` on the wire; the env shadow-tracks
+    it, and the mirror is handed that one value rather than recomputing it. The
+    remaining way to get it wrong is placement: ``raw_opponent_view()`` is
+    called by a scripted opponent AFTER ``step()`` returns, to choose the next
+    window's action, so it reads the POST-increment ``_step_count``. Building
+    the mirrored vector above ``step()``'s increment would report 0.0 for the
+    swing that just fired while the scripted seat reports one window of charge.
+    """
+    env, bridge = _mirror_env()
+    assert env.raw_opponent_view().attack_cooldown == 1.0
+    assert env.opponent_observation()[Obs.ATTACK_COOLDOWN] == pytest.approx(1.0)
+
+    # Window 0 swings; the next three windows recharge it.
+    for index, tick in enumerate((2, 3, 4, 5)):
+        bridge.push(_state(tick=tick, opp_yaw=_OPP_SEES_LEARNER))
+        env.step(Macro.IDLE, opp_action=Macro.ATTACK if index == 0 else Macro.IDLE)
+        assert env.opponent_observation()[Obs.ATTACK_COOLDOWN] == pytest.approx(
+            env.raw_opponent_view().attack_cooldown
+        )
+
+    # Not a vacuous match on 1.0: the meter really did discharge and recharge.
+    assert env.raw_opponent_view().attack_cooldown == 1.0
