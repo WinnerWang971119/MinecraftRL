@@ -24,16 +24,27 @@ Required by the plan (docs/plans/2026-08-16-demo-scripted-opponent-exhibition.md
 
   * T6 (AC5) — the SEPARATE reset command. ``--reset`` files a request and
     starts nothing; the running launcher consumes it, heals, repositions and
-    re-arms BOTH sides and plays exactly one more match. The AC4 half is tested as
+    re-gears BOTH sides and plays exactly one more match. The AC4 half is tested as
     hard as the AC5 half: a match never restarts itself, a request left over
     from an earlier launch is discarded, and a request filed while a match is
     still running is discarded too (honoring it would make the death the
     proximate cause of the restart).
 
+  * T15 (AC9, TC33) — the HUMAN challenger's iron loadout, and the
+    server-authoritative read that proves it. The exact gear command list is
+    pinned against the committed datapack, armor goes out by ``item replace``
+    and never by ``give``, and the read-back is driven against
+    :class:`FakePaperWorld` — an offline server that models the one distinction
+    the whole task turns on: ``item replace`` puts a piece on the BODY,
+    ``give`` puts it in the BAG. A launcher that used the wrong one leaves that
+    world's ``worn`` empty and fails here, which is what a classmate fighting
+    an armored agent in their own clothes looks like from outside.
+
 Everything else here is supporting coverage for the pure helpers `run()` is
 built from (``is_port_free``, ``find_checkpoints``, ``build_bridge_argv``,
 ``load_greedy_policy``, ``wait_for_port``, ``play_one_match``,
-``find_toolchain_problems``, ``human_reset_commands``, the request-file
+``find_toolchain_problems``, ``human_reset_commands``,
+``human_gear_commands``, ``human_loadout_read_commands``, the request-file
 helpers) plus the --checkpoint-missing/unloadable "never random-init"
 guarantee, the --challenger-username help-text requirement from the spec, and
 the ``BaseException``-proof teardown a second Ctrl-C depends on.
@@ -49,6 +60,7 @@ the ``BaseException``-proof teardown a second Ctrl-C depends on.
 
 from __future__ import annotations
 
+import re
 import signal
 import subprocess
 import threading
@@ -68,13 +80,18 @@ from deploy.exhibition import (
     REFLEX_MAX_CONSECUTIVE_OVERRIDES,
     RESET_REQUEST_FILENAME,
     SIGTERM_EXIT_CODE,
+    CHALLENGER_ARMOR,
+    CHALLENGER_WEAPON,
     CheckpointError,
     build_bridge_argv,
     checkpoint_missing_message,
     checkpoint_unloadable_message,
+    confirm_human_loadout,
     drain_reset_request,
     find_checkpoints,
     find_toolchain_problems,
+    human_gear_commands,
+    human_loadout_read_commands,
     human_reset_commands,
     install_sigterm_handler,
     is_port_free,
@@ -106,6 +123,179 @@ LEARNER_PAD_MCFUNCTION = (
 
 
 # ---------------------------------------------------------------------------
+# THE OFFLINE PAPER STAND-IN, and the two Minecraft facts it is built on.
+#
+# The human's gear is confirmed by a CONSOLE READ: the launcher writes
+# `data get entity <player> ...` down Paper's stdin and scans Paper's own log
+# for the answer. Testing that offline needs something that answers the way the
+# pinned jar answers, so `FakePaperWorld` below is exactly that and no more.
+#
+# Both facts it encodes are restated here from
+# `server/versions/1.21.1/paper-1.21.1.jar` rather than imported from
+# deploy.exhibition. That is the point: a module that gets the slot numbers or
+# the reply wording wrong must FAIL these tests, not agree with itself.
+# ---------------------------------------------------------------------------
+
+#: Where a PLAYER's worn armor lives in NBT. `Inventory.save`
+#: (net/minecraft/world/entity/player/Inventory) writes the armor list at
+#: `index + 100`, and net/minecraft/world/entity/EquipmentSlot orders that list
+#: FEET=0, LEGS=1, CHEST=2, HEAD=3. Note this is `Inventory`, NOT the `ArmorItems`
+#: tag -- that one belongs to Mob, and a read against it would find nothing on a
+#: perfectly armored person.
+VANILLA_ARMOR_NBT_SLOT = {"feet": 100, "legs": 101, "chest": 102, "head": 103}
+
+#: The console's rendering of `commands.data.entity.query` and of the
+#: `arguments.nbtpath.nothing_found` failure, from the jar's
+#: assets/minecraft/lang/en_us.json.
+VANILLA_QUERY_REPLY = '{who} has the following entity data: "{value}"'
+VANILLA_NOTHING_FOUND = "Found no elements matching {path}"
+
+_ARMOR_SLOT_READ = re.compile(
+    r"^data get entity (?P<who>\w+) Inventory\[\{Slot:(?P<slot>\d+)b\}\]\.id$"
+)
+_ITEM_ID_READ = re.compile(
+    r'^data get entity (?P<who>\w+) Inventory\[\{id:"(?P<item>[a-z_:]+)"\}\]\.id$'
+)
+_EQUIP = re.compile(
+    r"^item replace entity (?P<who>\w+) armor\.(?P<slot>\w+) with (?P<item>minecraft:\w+)$"
+)
+_GIVE = re.compile(r"^give (?P<who>\w+) (?P<item>minecraft:\w+) 1$")
+_CLEAR = re.compile(r"^clear (?P<who>\w+) (?P<item>minecraft:\w+)$")
+
+
+def datapack_gear(mcfunction, macro):
+    """``(sword id, [(armor slot, item id), ...])`` as the COMMITTED datapack
+    hands them out.
+
+    Parsed rather than hard-coded so every gear assertion in this file is a
+    drift pin against the real file, which is the only thing that keeps the
+    human's kit and the bots' kit the same fight.
+    """
+    give = re.compile(rf"^\$give \$\({macro}\) (?P<item>minecraft:\w+) 1$")
+    replace = re.compile(
+        rf"^\$item replace entity \$\({macro}\) armor\.(?P<slot>\w+) "
+        rf"with (?P<item>minecraft:\w+)$"
+    )
+    sword, armor = None, []
+    for line in mcfunction.read_text(encoding="utf-8").splitlines():
+        given = give.match(line)
+        if given is not None:
+            assert sword is None, f"{mcfunction.name} hands out two $gives"
+            sword = given.group("item")
+        worn = replace.match(line)
+        if worn is not None:
+            armor.append((worn.group("slot"), worn.group("item")))
+    return sword, armor
+
+
+class FakePaperWorld:
+    """The sliver of a Minecraft server this launcher can touch: a player with a
+    BODY and a BAG, four gear commands that fill one or the other, and a console
+    that answers `data get entity` about the result.
+
+    THE BODY/BAG SPLIT IS THE WHOLE POINT, and it is modelled here rather than
+    assumed by the assertions:
+
+      * `item replace entity <who> armor.<slot> with <item>` OVERWRITES an
+        equipment slot -- the piece is WORN, and re-running it changes nothing;
+      * `give <who> <item> 1` appends to the BAG and equips NOTHING.
+
+    So a launcher that handed out armor with `give` leaves this world's `worn`
+    empty, the reads come back `Found no elements matching ...`, and the tests
+    that drive a whole exhibition through it fail -- which is exactly the bug
+    (armored in the log, naked in the fight) that they exist to catch.
+
+    `ignore_equips` is a silently-failed `item replace`: the command arrives and
+    the slot does not change. That is what a mistyped item id or a voided
+    `$`-macro looks like from outside, and it is the case the read-back is for.
+
+    Answers are APPENDED to a real paper.log, because that file is the entire
+    reply channel -- the launcher's console pipe is write-only. Any console line
+    that is neither a gear command nor a read is ignored, exactly as a real
+    server ignores a `tp` for the purposes of this file.
+    """
+
+    def __init__(self, paper_log, *, player, ignore_equips=()):
+        self.paper_log = Path(paper_log)
+        self.player = player
+        self.ignore_equips = set(ignore_equips)
+        self.worn = {}
+        self.bag = []
+        self.reads = []
+
+    def _say(self, text):
+        with open(self.paper_log, "ab") as handle:
+            handle.write(f"[12:00:00 INFO]: {text}\n".encode("utf-8"))
+
+    def on_console_line(self, line):
+        if not self._apply_gear(line):
+            self._answer_read(line)
+
+    def _apply_gear(self, line):
+        """True if ``line`` was a gear command (whether or not it changed
+        anything)."""
+        equip = _EQUIP.match(line)
+        if equip is not None:
+            if (
+                equip.group("who") == self.player
+                and equip.group("slot") not in self.ignore_equips
+            ):
+                self.worn[equip.group("slot")] = equip.group("item")
+            return True
+        given = _GIVE.match(line)
+        if given is not None:
+            if given.group("who") == self.player:
+                self.bag.append(given.group("item"))
+            return True
+        cleared = _CLEAR.match(line)
+        if cleared is not None:
+            if cleared.group("who") == self.player:
+                self.bag = [item for item in self.bag if item != cleared.group("item")]
+            return True
+        return False
+
+    def _answer_read(self, line):
+        armor = _ARMOR_SLOT_READ.match(line)
+        item = _ITEM_ID_READ.match(line)
+        if armor is None and item is None:
+            return
+        self.reads.append(line)
+        if armor is not None:
+            who, slot = armor.group("who"), int(armor.group("slot"))
+            by_number = {
+                VANILLA_ARMOR_NBT_SLOT[name]: worn for name, worn in self.worn.items()
+            }
+            found = by_number.get(slot) if who == self.player else None
+            path = f"Inventory[{{Slot:{slot}b}}]"
+        else:
+            who, wanted = item.group("who"), item.group("item")
+            found = wanted if who == self.player and wanted in self.bag else None
+            path = f'Inventory[{{id:"{wanted}"}}]'
+        if found is None:
+            self._say(VANILLA_NOTHING_FOUND.format(path=path))
+        else:
+            self._say(VANILLA_QUERY_REPLY.format(who=who, value=found))
+
+
+def scripted_paper(tmp_path, *, player="Steve", ignore_equips=(), gear=True):
+    """A ``(FakeProc, FakePaperWorld)`` pair wired the way ``run()`` wires them:
+    Paper's stdin is the console, Paper's stdout is ``paper.log``.
+
+    ``gear=True`` first runs the launcher's OWN gear commands through the world,
+    so the state the read-back then inspects is the state those commands
+    produce -- not a state the test declared.
+    """
+    paper_log = tmp_path / "paper.log"
+    paper_log.write_bytes(b"")
+    world = FakePaperWorld(paper_log, player=player, ignore_equips=ignore_equips)
+    proc = FakeProc(stdin=FakeConsole(on_line=world.on_console_line))
+    if gear:
+        for command in human_gear_commands(player):
+            proc.stdin.write(f"{command}\n".encode("ascii"))
+    return proc, world
+
+
+# ---------------------------------------------------------------------------
 # Shared fakes (mirror the FakeProc / ScriptedProbe style in
 # tests/test_pad_launcher.py — no real OS process or socket).
 # ---------------------------------------------------------------------------
@@ -121,14 +311,19 @@ class FakeConsole:
     ``write`` asserts BYTES. ``subprocess.PIPE`` without an encoding is a binary
     stream, so a launcher that wrote ``str`` would raise ``TypeError`` on the
     first real reset and heal nobody; a fake that accepted both would hide it.
+
+    ``on_line`` is where a :class:`FakePaperWorld` plugs in: the console is
+    write-only in production too, so the only way an answer comes back is the
+    server writing it to its log, and this hook is the server doing that.
     """
 
-    def __init__(self, *, fail=False, record=None):
+    def __init__(self, *, fail=False, record=None, on_line=None):
         self.lines = []
         self.flushes = 0
         self.closed = False
         self._fail = fail
         self._record = record
+        self._on_line = on_line
 
     def write(self, data):
         if self._fail:
@@ -138,6 +333,8 @@ class FakeConsole:
         self.lines.append(line)
         if self._record is not None:
             self._record(("console", line))
+        if self._on_line is not None:
+            self._on_line(line)
         return len(data)
 
     def flush(self):
@@ -1325,6 +1522,10 @@ class ExhibitionRun:
         self.transports = []
         self.policy = None
         self.request_path = None
+        #: The offline Paper the console talked to, once one has been spawned.
+        #: Its `worn`/`bag` are the only place a test can see whether the gear
+        #: commands EQUIPPED anything or merely handed it over.
+        self.paper_world = None
         #: SIGTERM's disposition as observed FROM INSIDE the run, while both
         #: children were up -- the only moment at which it matters. Read through
         #: the real ``signal`` module, so it is what a real ``kill`` would find.
@@ -1354,6 +1555,7 @@ def drive_exhibition(
     challenger="Steve",
     extra_argv=(),
     console_fails=False,
+    human_gear_missing=(),
     on_step=None,
     opponent_visible=None,
     stop_with="ctrl-c",
@@ -1386,6 +1588,11 @@ def drive_exhibition(
     script the REAL ``MCPvPEnv``/``PerceptionFilter`` into gating the opponent
     out of view for specific decisions, exactly as a human circling behind the
     agent would.
+
+    ``human_gear_missing`` names armor slots the offline Paper refuses to equip
+    — a silently-failed ``item replace``, which is what a voided ``$``-macro or a
+    mistyped item id looks like from outside. It is the case the human-side
+    read-back (AC9) exists for, and the only way this file can produce it.
 
     ``log_dir`` overrides the launcher's ``--log-dir``. It exists for one case:
     passing a RELATIVE directory (with the test's cwd moved into ``tmp_path``),
@@ -1424,11 +1631,21 @@ def drive_exhibition(
         result.spawn_kwargs[label] = kwargs
         result.spawn_argv[label] = list(cmd)
         # Popen only exposes a .stdin stream when the caller asked for a PIPE.
-        console = (
-            FakeConsole(fail=console_fails, record=record)
-            if kwargs.get("stdin") is subprocess.PIPE
-            else None
-        )
+        console = None
+        if label == "paper" and kwargs.get("stdin") is subprocess.PIPE:
+            # Paper's console is write-only; the server's ANSWERS come back
+            # through the log file run() just opened as this child's stdout, so
+            # the offline server writes there and nowhere else.
+            result.paper_world = FakePaperWorld(
+                log_dir / "paper.log",
+                player=challenger if challenger is not None else "nobody",
+                ignore_equips=human_gear_missing,
+            )
+            console = FakeConsole(
+                fail=console_fails,
+                record=record,
+                on_line=result.paper_world.on_console_line,
+            )
         proc = proc_classes.get(label, FakeProc)(
             pid=101 if label == "paper" else 202,
             label=label,
@@ -1494,6 +1711,11 @@ def drive_exhibition(
     # The join banner calls _detect_lan_ip(), which opens a real UDP socket.
     # This file opens no sockets at all.
     monkeypatch.setattr("deploy.exhibition._detect_lan_ip", lambda: "192.168.1.50")
+    # The gear read-back's wait budget. Zero makes it take exactly ONE look at
+    # paper.log, which is all an offline server needs (FakePaperWorld answers
+    # inside the write); left at its real five seconds every reset in this file
+    # would idle for them. The scan itself is untouched -- only the waiting is.
+    monkeypatch.setattr("deploy.exhibition.HUMAN_LOADOUT_READ_TIMEOUT_SECONDS", 0.0)
 
     armed = {"bomb": log_bomb is not None}
 
@@ -2214,7 +2436,20 @@ class TestHumanResetCommands:
             "effect give Steve minecraft:saturation 1 19 true",
             "clear Steve minecraft:iron_sword",
             "give Steve minecraft:iron_sword 1",
+            "item replace entity Steve armor.head with minecraft:iron_helmet",
+            "item replace entity Steve armor.chest with minecraft:iron_chestplate",
+            "item replace entity Steve armor.legs with minecraft:iron_leggings",
+            "item replace entity Steve armor.feet with minecraft:iron_boots",
         ]
+
+    def test_the_gear_is_the_tail_of_the_reset_and_nothing_else_is(self):
+        # human_gear_commands is the piece other code reuses (the read-back
+        # builds its checks from the same constants), so the two must not be
+        # allowed to drift into "nearly the same list".
+        commands = human_reset_commands(pad_anchor(0), "Steve")
+        gear = human_gear_commands("Steve")
+        assert commands[-len(gear):] == gear
+        assert not any(command in gear for command in commands[: -len(gear)])
 
     def test_the_challenger_is_armed_with_a_sword(self):
         # The bug this pair exists to kill: the datapack re-arms the LEARNER on
@@ -2289,7 +2524,7 @@ class TestHumanResetCommands:
         """Drift pin. These commands duplicate the dummy's reset template for a
         player instead of a bot; if that template moves, this fails here rather
         than in a live exhibition where the human quietly spawns in the wrong
-        place or at the wrong health."""
+        place, at the wrong health, or in the wrong gear."""
         datapack = DUMMY_PAD_MCFUNCTION.read_text(encoding="utf-8").splitlines()
 
         # Position: anchor + 3 on x, y=64, z centre, yaw 90 (facing the
@@ -2306,31 +2541,379 @@ class TestHumanResetCommands:
             if line.startswith("$effect "):
                 assert line[1:].replace("$(dummy)", "Steve") in ours
 
-        # Gear is the ONE place the dummy is the wrong model: it is given a
-        # blanket `$clear` and no weapon at all, which is right for a passive
-        # training target and wrong for a person facing an armed agent.
+        # GEAR. This assertion used to read "the dummy gets no `$give` at all",
+        # and that was true: until M4 the opponent template handed out a blanket
+        # `$clear`, two effects and NO weapon, which suited a passive punching
+        # bag and not a person. T2 (issue #33) re-geared BOTH bots, so the dummy
+        # now carries exactly the kit the human is handed -- and it is that
+        # sameness, not the old absence, that keeps the human's fight and the
+        # agent's training the same fight.
+        sword, armor = datapack_gear(DUMMY_PAD_MCFUNCTION, "dummy")
+        assert sword == CHALLENGER_WEAPON
+        assert armor == list(CHALLENGER_ARMOR)
+        for line in datapack:
+            if line.startswith("$give ") or line.startswith("$item replace "):
+                assert line[1:].replace("$(dummy)", "Steve") in ours
+
+        # The blanket clear is the ONE line still deliberately not copied:
+        # emptying a person's unrelated items is no part of heal-and-reposition.
         assert "$clear $(dummy)" in datapack
-        assert not any(line.startswith("$give ") for line in datapack)
         assert "clear Steve" not in ours
 
     def test_the_gear_matches_what_the_committed_datapack_hands_the_learner(self):
-        """Drift pin for the symmetry claim. The challenger's sword exists only
-        because the learner gets one on every reset; if that line is re-geared
-        (a diamond sword, armor, nothing at all) the fight silently stops being
-        symmetric, so it fails here instead of in front of a room."""
+        """Drift pin for the symmetry claim, and TC33's exact-list half.
+
+        The challenger's kit exists only because the learner is handed one on
+        every reset; if that block is re-geared -- a diamond sword, a different
+        armor set, a fifth slot -- the fight silently stops being symmetric, so
+        it fails here instead of in front of a room.
+
+        This test used to assert the opposite of what it asserts now: that NO
+        command line in the learner's template mentions armor. That was true
+        when it was written and M4 (T2, issue #33) ended it -- the learner now
+        wears a full iron set, so an unarmored human would be the mismatch.
+        """
         datapack = LEARNER_PAD_MCFUNCTION.read_text(encoding="utf-8").splitlines()
 
         give_lines = [line for line in datapack if line.startswith("$give ")]
         assert give_lines == ["$give $(learner) minecraft:iron_sword 1"]
+        replace_lines = [line for line in datapack if line.startswith("$item replace ")]
+        assert replace_lines == [
+            "$item replace entity $(learner) armor.head with minecraft:iron_helmet",
+            "$item replace entity $(learner) armor.chest with minecraft:iron_chestplate",
+            "$item replace entity $(learner) armor.legs with minecraft:iron_leggings",
+            "$item replace entity $(learner) armor.feet with minecraft:iron_boots",
+        ]
 
-        ours = human_reset_commands(pad_anchor(0), "Steve")
-        assert give_lines[0][1:].replace("$(learner)", "Steve") in ours
-        # And no armor on either side: the checkpoint never trained against an
-        # armored opponent, so armor is out of scope by decision, not oversight.
-        # Command lines only (`$...`); a comment may discuss armor freely.
-        commands_in_datapack = [line for line in datapack if line.startswith("$")]
-        assert not any("armor" in line for line in commands_in_datapack)
-        assert not any("armor" in command for command in ours)
+        # THE EXACT LIST (TC33), built from the committed file rather than
+        # restated: five gear lines, in this order, with the sword's scoped
+        # clear in front of it and nothing else anywhere.
+        assert human_gear_commands("Steve") == [
+            "clear Steve minecraft:iron_sword",
+            *[line[1:].replace("$(learner)", "Steve") for line in give_lines],
+            *[line[1:].replace("$(learner)", "Steve") for line in replace_lines],
+        ]
+
+    def test_armor_is_handed_over_by_item_replace_and_never_by_give(self):
+        """TC33's other half, and the trap this whole task turns on.
+
+        `give` pushes a stack into the first free INVENTORY slot and equips
+        NOTHING -- nothing in Minecraft moves a piece from a player's bag onto
+        their body. Four `give`s would leave the challenger standing there
+        HOLDING a full iron set at zero armor points: armored in the console
+        echo, in the chat log and in the run notes, and naked in the fight,
+        taking 6 a hit where the armored agent takes 3.12.
+        """
+        armor_ids = {item for _slot, item in CHALLENGER_ARMOR}
+        assert len(armor_ids) == 4
+
+        ours = human_gear_commands("Steve")
+        for command in ours:
+            if any(item in command for item in armor_ids):
+                assert command.startswith("item replace entity Steve armor.")
+        # Said the other way round, so that adding a `give` line for a FIFTH
+        # piece fails too rather than sliding past a loop over the four.
+        assert not any(
+            command.startswith("give ") and command != "give Steve minecraft:iron_sword 1"
+            for command in ours
+        )
+
+        # And on the datapack side of the mirror, for the same reason.
+        datapack = LEARNER_PAD_MCFUNCTION.read_text(encoding="utf-8").splitlines()
+        assert not any(
+            line.startswith("$give ") and any(item in line for item in armor_ids)
+            for line in datapack
+        )
+
+    def test_only_the_sword_carries_a_clear_because_item_replace_overwrites(
+        self, tmp_path
+    ):
+        """The two halves are idempotent for DIFFERENT reasons, and copying one
+        rule onto the other breaks it.
+
+        `item replace` overwrites the equipment slot, so the four armor lines
+        survive an evening of resets on their own -- a paired `clear` would be
+        noise. `give` appends, so the sword genuinely needs its scoped clear or
+        it piles one sword per reset into the challenger's hotbar.
+        """
+        commands = human_gear_commands("Steve")
+        assert [c for c in commands if c.startswith("clear ")] == [
+            "clear Steve minecraft:iron_sword"
+        ]
+        # Idempotence, demonstrated rather than asserted: running the block
+        # twice against a server leaves exactly one of everything.
+        armor = {slot: item for slot, item in CHALLENGER_ARMOR}
+        world = FakePaperWorld(tmp_path / "paper.log", player="Steve")
+        for _ in range(3):
+            for command in commands:
+                world.on_console_line(command)
+        assert world.worn == armor
+        assert world.bag == [CHALLENGER_WEAPON]
+
+    def test_a_gear_command_for_a_bad_username_is_refused(self):
+        # Same level-4 console, same rule: these are built independently of
+        # human_reset_commands now, so they need their own guard.
+        with pytest.raises(ValueError):
+            human_gear_commands("a\nop b")
+        with pytest.raises(ValueError):
+            human_gear_commands("")
+        with pytest.raises(ValueError):
+            human_gear_commands(None)
+
+
+# ---------------------------------------------------------------------------
+# THE HUMAN-SIDE LOADOUT READ (AC9). The bots' gear is proved by the bridge's
+# fail-closed gate off their own connections; a HUMAN has no connection, so the
+# only server-authoritative channel left is a console read whose answer comes
+# back as text in paper.log. These tests drive that read against
+# FakePaperWorld, which models the body/bag split the read exists to detect.
+# ---------------------------------------------------------------------------
+
+
+class TestHumanLoadoutReadCommands:
+    def test_the_exact_read_commands(self):
+        # Slot numbers, not slot NAMES: `item replace` speaks `armor.head`, but
+        # a player's NBT keeps worn armor in `Inventory` at 100..103 (feet up to
+        # head). The two vocabularies are not interchangeable and this is where
+        # the translation is pinned.
+        assert human_loadout_read_commands("Steve") == [
+            "data get entity Steve Inventory[{Slot:103b}].id",
+            "data get entity Steve Inventory[{Slot:102b}].id",
+            "data get entity Steve Inventory[{Slot:101b}].id",
+            "data get entity Steve Inventory[{Slot:100b}].id",
+            'data get entity Steve Inventory[{id:"minecraft:iron_sword"}].id',
+        ]
+
+    def test_the_slot_numbers_agree_with_vanilla(self):
+        # Restated from the pinned jar at the top of this file rather than
+        # imported, so a module that renumbered the slots fails here.
+        commands = human_loadout_read_commands("Steve")
+        for (slot, _item), command in zip(CHALLENGER_ARMOR, commands):
+            assert f"Slot:{VANILLA_ARMOR_NBT_SLOT[slot]}b" in command
+
+    def test_every_piece_the_reset_hands_out_is_read_back(self):
+        # The drift that would matter most: a fifth armor slot added to the gear
+        # commands and never read, i.e. a piece nothing on the demo path checks.
+        gear = " ".join(human_gear_commands("Steve"))
+        reads = " ".join(human_loadout_read_commands("Steve"))
+        for _slot, item in CHALLENGER_ARMOR:
+            assert item in gear
+        assert reads.count("data get") == len(CHALLENGER_ARMOR) + 1
+
+    def test_no_read_carries_a_leading_slash(self):
+        for command in human_loadout_read_commands("Steve"):
+            assert not command.startswith("/")
+
+    def test_a_bad_username_is_refused(self):
+        with pytest.raises(ValueError):
+            human_loadout_read_commands("a\nop b")
+
+
+class TestConfirmHumanLoadout:
+    def test_a_fully_geared_challenger_is_confirmed(self, tmp_path):
+        proc, world = scripted_paper(tmp_path)
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, world.paper_log, "Steve", log=log, timeout=0.0
+        ) is True
+
+        # It really asked -- five reads on the wire, not an inference from the
+        # gear commands this same test just ran.
+        assert world.reads == human_loadout_read_commands("Steve")
+        assert "server-authoritative read" in "\n".join(messages)
+
+    def test_armor_handed_out_with_give_is_NOT_confirmed(self, tmp_path):
+        """The bug the whole read exists to catch, driven end to end.
+
+        A launcher that armed the human with `give minecraft:iron_helmet 1`
+        instead of `item replace ... armor.head` produces a challenger who is
+        carrying a full iron set and wearing none of it. Every command
+        "succeeds", the console echo looks perfect, and the read is the only
+        thing in the stack that notices.
+        """
+        proc, world = scripted_paper(tmp_path, gear=False)
+        for item in [item for _slot, item in CHALLENGER_ARMOR]:
+            proc.stdin.write(f"give Steve {item} 1\n".encode("ascii"))
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, world.paper_log, "Steve", log=log, timeout=0.0
+        ) is False
+
+        assert world.worn == {}  # carried, not worn
+        text = "\n".join(messages)
+        assert "COULD NOT CONFIRM" in text
+        for slot, _item in CHALLENGER_ARMOR:
+            assert f"armor.{slot}" in text
+
+    def test_one_silently_failed_equip_is_named(self, tmp_path):
+        proc, world = scripted_paper(tmp_path, ignore_equips=("chest",))
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, world.paper_log, "Steve", log=log, timeout=0.0
+        ) is False
+
+        text = "\n".join(messages)
+        assert "COULD NOT CONFIRM 1 of 5" in text
+        assert "armor.chest" in text
+        # The three that DID land are not dragged down with it.
+        assert "armor.head" not in text
+        # And the operator is told how to check it by hand, not merely that
+        # something is wrong.
+        assert "data get entity Steve Inventory[{Slot:102b}].id" in text
+
+    def test_a_missing_sword_is_named(self, tmp_path):
+        proc, world = scripted_paper(tmp_path, gear=False)
+        for command in human_gear_commands("Steve"):
+            if not command.startswith("give "):
+                proc.stdin.write(f"{command}\n".encode("ascii"))
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, world.paper_log, "Steve", log=log, timeout=0.0
+        ) is False
+        assert "the sword" in "\n".join(messages)
+
+    def test_it_never_claims_the_sword_is_HELD(self, tmp_path):
+        # `give` picks a free slot, not the selected one, and which slot a
+        # person selects is theirs. Claiming "holding" would be the kind of
+        # false confirmation this read was added to remove.
+        proc, world = scripted_paper(tmp_path)
+        messages, log = collector()
+
+        confirm_human_loadout(proc, world.paper_log, "Steve", log=log, timeout=0.0)
+
+        text = "\n".join(messages)
+        assert "in their inventory" in text
+        assert "NOT prove the sword is in their HAND" in text
+
+    def test_a_reply_that_predates_the_reads_does_not_count(self, tmp_path):
+        """The scan window opens at the log's CURRENT length.
+
+        Without that, last reset's replies -- or a hand-typed `data get` from an
+        operator ten minutes ago -- would confirm gear that this reset never
+        applied, which is worse than no check at all.
+        """
+        proc, world = scripted_paper(tmp_path, ignore_equips=("head",))
+        # Somebody's earlier read, still sitting in the log.
+        world._say('Steve has the following entity data: "minecraft:iron_helmet"')
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, world.paper_log, "Steve", log=log, timeout=0.0
+        ) is False
+        assert "armor.head" in "\n".join(messages)
+
+    def test_another_players_replies_do_not_confirm_this_one(self, tmp_path):
+        """A reply about somebody ELSE, in the same log and the same window.
+
+        Two people in the challenger queue, or an operator checking the last
+        one's gear by hand, and the answers land interleaved. A check that
+        scanned for the item id alone would read Alex's helmet as Steve's --
+        a false confirmation arriving through the confirmation itself.
+        """
+        paper_log = tmp_path / "paper.log"
+        paper_log.write_bytes(b"")
+        alex = FakePaperWorld(paper_log, player="Alex")
+        for command in human_gear_commands("Alex"):
+            alex.on_console_line(command)
+
+        def answer_about_alex(line):
+            if line.startswith("data get entity Steve "):
+                alex.on_console_line(line.replace("Steve", "Alex"))
+
+        proc = FakeProc(stdin=FakeConsole(on_line=answer_about_alex))
+        messages, log = collector()
+
+        assert confirm_human_loadout(proc, paper_log, "Steve", log=log, timeout=0.0) is False
+
+        text = "\n".join(messages)
+        assert "COULD NOT CONFIRM 5 of 5" in text
+        # Alex really was fully geared -- the ids are in the log, they are just
+        # not Steve's.
+        assert "minecraft:iron_helmet" in paper_log.read_text(encoding="utf-8")
+
+    def test_a_silent_server_reads_as_could_not_confirm_not_as_missing(self, tmp_path):
+        # No FakePaperWorld at all: the commands go out, nothing answers. This
+        # is a slow or dead server, and it must NOT be reported as "the gear is
+        # missing" -- the two are indistinguishable from here and the message
+        # says so.
+        paper_log = tmp_path / "paper.log"
+        paper_log.write_bytes(b"")
+        proc = FakeProc(stdin=FakeConsole())
+        messages, log = collector()
+
+        assert confirm_human_loadout(proc, paper_log, "Steve", log=log, timeout=0.0) is False
+
+        text = "\n".join(messages)
+        assert "COULD NOT CONFIRM 5 of 5" in text
+        assert "NOT proof the gear is missing" in text
+
+    def test_it_waits_for_a_reply_that_has_not_landed_yet(self, tmp_path):
+        # Paper runs console input on the next tick and log4j flushes
+        # asynchronously, so the first look at the log is EXPECTED to be empty.
+        # A check that gave up there would report every healthy reset as
+        # unconfirmed and train the operator to ignore it.
+        proc, world = scripted_paper(tmp_path, gear=False)
+        clock = {"t": 0.0}
+        answered = {"yet": False}
+
+        def monotonic():
+            return clock["t"]
+
+        def sleep(seconds):
+            # The tick the gear lands on, and the log line that follows it.
+            clock["t"] += seconds
+            if not answered["yet"]:
+                answered["yet"] = True
+                for command in human_gear_commands("Steve"):
+                    world.on_console_line(command)
+                for command in human_loadout_read_commands("Steve"):
+                    world.on_console_line(command)
+
+        messages, log = collector()
+        assert confirm_human_loadout(
+            proc,
+            world.paper_log,
+            "Steve",
+            log=log,
+            sleep=sleep,
+            monotonic=monotonic,
+            timeout=5.0,
+        ) is True
+        assert clock["t"] > 0.0  # it really did wait
+
+    def test_no_console_pipe_is_reported_and_never_passes(self, tmp_path):
+        proc = FakeProc(stdin=None)  # --no-paper-console / DEVNULL
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, tmp_path / "paper.log", "Steve", log=log, timeout=0.0
+        ) is False
+
+        text = "\n".join(messages)
+        assert "did NOT run" in text
+        # The failure names the READ, not the heal -- the generic message would
+        # send an operator to look at the wrong commands.
+        assert "read Steve's gear back off the server" in text
+
+    def test_no_captured_log_is_reported_and_never_passes(self, tmp_path):
+        proc = FakeProc(stdin=FakeConsole())
+        messages, log = collector()
+
+        assert confirm_human_loadout(proc, None, "Steve", log=log, timeout=0.0) is False
+        assert "CANNOT CONFIRM" in "\n".join(messages)
+
+    def test_a_broken_pipe_is_survivable(self, tmp_path):
+        proc = FakeProc(stdin=FakeConsole(fail=True))
+        messages, log = collector()
+
+        assert confirm_human_loadout(
+            proc, tmp_path / "paper.log", "Steve", log=log, timeout=0.0
+        ) is False
+        assert "BrokenPipeError" in "\n".join(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -2421,7 +3004,12 @@ class TestResetRedrivesPlay:
 
         # The gap T3's review found: formatHumanResetCommands resets the LEARNER
         # only, so a match the AGENT lost leaves the human on partial health.
-        assert result.console_lines == human_reset_commands(pad_anchor(0), "Steve")
+        # The reads follow the gear on the SAME pipe and in that order, which is
+        # what makes them a check on the re-gear rather than a race with it.
+        assert result.console_lines == (
+            human_reset_commands(pad_anchor(0), "Steve")
+            + human_loadout_read_commands("Steve")
+        )
 
         # And they land BEFORE the second match's reset -- a heal that arrives
         # after the fight has started is a heal mid-fight.
@@ -2430,6 +3018,40 @@ class TestResetRedrivesPlay:
             i for i, e in enumerate(result.events) if e == ("bridge.send", "reset")
         ]
         assert reset_indices[0] < console_idx < reset_indices[1]
+
+    def test_the_reset_leaves_the_challenger_wearing_the_iron_set(
+        self, tmp_path, monkeypatch
+    ):
+        """AC9, end to end through the real ``run()``.
+
+        The offline server models the body/bag split, so this passes only if the
+        launcher EQUIPPED the four pieces -- four `give`s would leave `worn`
+        empty here exactly as they would leave a classmate unarmored.
+        """
+        result = drive_exhibition(tmp_path, monkeypatch, steps_to_win=2, resets=1)
+
+        world = result.paper_world
+        assert world.worn == {slot: item for slot, item in CHALLENGER_ARMOR}
+        assert world.bag == [CHALLENGER_WEAPON]  # the scoped clear kept it at one
+        assert world.reads == human_loadout_read_commands("Steve")
+        assert "server-authoritative read" in result.text()
+
+    def test_a_silently_failed_equip_is_reported_and_the_match_still_runs(
+        self, tmp_path, monkeypatch
+    ):
+        result = drive_exhibition(
+            tmp_path, monkeypatch, steps_to_win=2, resets=1, human_gear_missing=("legs",)
+        )
+
+        text = result.text()
+        assert "COULD NOT CONFIRM 1 of 5" in text
+        assert "armor.legs" in text
+        # BEST-EFFORT, unlike the bots' fail-closed gate: a demo that refuses to
+        # play because one piece is unconfirmed is worse than one that plays and
+        # says so. The match is re-driven and the exhibition ends normally.
+        assert result.escaped is None
+        assert result.code == 130
+        assert result.transports[0].resets == 2
 
     def test_no_human_commands_are_sent_before_the_first_match(self, tmp_path, monkeypatch):
         # Nobody has joined yet at launch, so healing "the challenger" would be
@@ -2542,6 +3164,11 @@ class TestInGameChatResetPath:
         text = result.text()
         assert "--no-paper-console" in text
         for command in human_reset_commands(pad_anchor(0), "Steve"):
+            assert command in text
+        # Including the read commands: an operator running the gear by hand has
+        # no more evidence the armor went ON than the launcher would have had,
+        # and the `give`-instead-of-`item replace` trap looks identical in chat.
+        for command in human_loadout_read_commands("Steve"):
             assert command in text
         # The match is still played: the console is a fairness aid, not a gate.
         assert result.transports[0].resets == 2

@@ -8,9 +8,10 @@ coordinates so a classmate can join and find the arena without being talked
 through it.
 
 ``python -m deploy.exhibition --reset`` is the SEPARATE between-challengers
-command (T6): it heals, repositions and re-arms both sides (one iron sword
-each), hands the slot to the next challenger and re-drives play — once per
-invocation, never by itself. See "THE RESET COMMAND" below.
+command (T6): it heals, repositions and re-gears both sides (an iron sword
+AND a full iron set each, since M4), hands the slot to the next challenger and
+re-drives play — once per invocation, never by itself. See "THE RESET COMMAND"
+below.
 
 A PLAYER CAN DO THE SAME THING WITHOUT A TERMINAL by typing ``reset`` (or
 ``!reset``) in Minecraft chat. That is not a second reset implementation: the
@@ -124,14 +125,30 @@ slot for one. Two things go wrong without a human-side reset. Health is the
 quiet one: it is invisible in the common case — a human who DIES respawns at
 full health — but a match ending in the AGENT's death leaves the human carrying
 partial health into the next round, i.e. it goes wrong exactly when somebody has
-just beaten the AI in front of a room. GEAR is the loud one: the datapack hands
-the learner a fresh iron sword every reset and nothing in the stack ever armed
-the challenger, so a bare fist (1 damage) faced an iron sword (6). The only
-command channel this process can reach is Paper's own console, so ``run()``
-starts Paper with a stdin PIPE and writes the heal, reposition and re-arm lines
-into it (:func:`human_reset_commands`). Re-arming is idempotent by construction
-(a sword-scoped ``clear`` before the ``give``), so a broken sword fixes itself
-at the next reset and repeated resets never pile swords up.
+just beaten the AI in front of a room. GEAR is the loud one: the datapack re-gears
+the learner on EVERY reset — since M4 (T2, issue #33) with an iron sword AND a
+full iron set — and nothing in the stack ever armed the challenger. The old gap
+was a bare fist (1 damage) against an iron sword (6); the M4 gap is the same
+gap widened, because an unarmored human takes 6 a hit while the agent takes
+3.12 through 15 armor points. The only command channel this process can reach
+is Paper's own console, so ``run()`` starts Paper with a stdin PIPE and writes
+the heal, reposition and re-gear lines into it (:func:`human_reset_commands`).
+ARMOR IS ``item replace``, NOT ``give``: ``give`` fills an INVENTORY slot and
+equips nothing, so four ``give``s would hand the challenger a full iron set to
+CARRY at zero armor points — armored in the log, naked in the fight.
+``item replace`` also overwrites rather than appends, which makes the four
+armor lines idempotent on their own; only the sword needs its paired
+sword-scoped ``clear`` to stay so.
+AND THE GEAR IS READ BACK (AC9). A human has no bot connection, so the bridge's
+fail-closed reset gate — which proves the BOTS' loadout off their own
+connections (T3) — cannot see the challenger at all, and worn armor would be
+invisible to an inventory check even if it could (slots 5-8 sit outside
+mineflayer's 9-44 window). So the reset follows the gear lines with five
+``data get entity`` reads on the same console and scans Paper's own log for the
+server's answers (:func:`confirm_human_loadout`). That is a server-authoritative
+read that needs no bot; it is BEST-EFFORT where the bots' gate is fail-closed,
+because a demo that refuses to play over an unconfirmed helmet is worse than
+one that plays and says so loudly.
 Best-effort by construction: every command is echoed to the exhibition log, a
 write failure is reported with the commands that did not run, and
 ``--no-paper-console`` turns the channel off. It needs a PINNED
@@ -207,8 +224,11 @@ __all__ = [
     "ExhibitionTerminated",
     "CheckpointError",
     "build_bridge_argv",
+    "confirm_human_loadout",
     "drain_reset_request",
     "find_toolchain_problems",
+    "human_gear_commands",
+    "human_loadout_read_commands",
     "human_reset_commands",
     "install_sigterm_handler",
     "is_port_free",
@@ -296,14 +316,35 @@ PAD_SPAWN_Y = 64
 #: fighters spawn pointing the same way.
 CHALLENGER_SPAWN_YAW = 90
 
-#: The challenger's weapon, and the whole of their gear. Mirrors the LEARNER's
-#: line -- ``$give $(learner) minecraft:iron_sword 1`` in
-#: ``spawn_learner_pad.mcfunction`` -- because the fight has to be symmetric:
-#: the agent is re-armed on every reset, so a barehanded human is 1 damage
-#: against 6. NOT the dummy's template, which gives its opponent nothing at all.
-#: No armor: the checkpoint never trained against an armored opponent, so armor
-#: is deliberately out of scope rather than merely forgotten.
+#: The challenger's WEAPON -- half their gear; the four worn pieces below are
+#: the other half. Mirrors the LEARNER's line -- ``$give $(learner)
+#: minecraft:iron_sword 1`` in ``spawn_learner_pad.mcfunction`` -- because the
+#: fight has to be symmetric: the agent is re-geared on every reset, so a
+#: barehanded human is 1 damage against 6.
 CHALLENGER_WEAPON = "minecraft:iron_sword"
+
+#: The four WORN pieces, head->feet. Mirrors the ``$item replace entity
+#: $(learner) armor.<slot> with minecraft:iron_*`` lines that close the re-gear
+#: block of BOTH ``spawn_learner_pad.mcfunction`` and
+#: ``spawn_dummy_pad.mcfunction`` (M4/T2, issue #33), so the human fights the
+#: same matchup the agent trained on. tests/test_exhibition.py reads the
+#: committed datapack and fails if these four drift from it.
+#:
+#: THE OLD RATIONALE HERE WAS "NO ARMOR", AND IT IS RETRACTED. This file used to
+#: say the checkpoint had never trained against an armored opponent, so armor
+#: was out of scope. That was true when it was written and is now exactly
+#: backwards: M4 arms BOTH bots, so it is the UNARMORED human who is the
+#: mismatch -- they would take 6 a hit where the agent takes 3.12 through 15
+#: armor points, in a fight the policy has never played.
+#:
+#: ORDER IS head -> feet, matching the datapack's line order and ``ARMOR_PIECES``
+#: in ``bridge/bot.js``, so a missing piece is reported the same way everywhere.
+CHALLENGER_ARMOR: Tuple[Tuple[str, str], ...] = (
+    ("head", "minecraft:iron_helmet"),
+    ("chest", "minecraft:iron_chestplate"),
+    ("legs", "minecraft:iron_leggings"),
+    ("feet", "minecraft:iron_boots"),
+)
 
 
 def _ascii_log(message: str) -> None:
@@ -662,8 +703,87 @@ def reset_command_hint(log_dir: Path) -> str:
     return hint
 
 
+def _validate_challenger_username(challenger_username: str) -> None:
+    """Refuse anything that is not a Minecraft username, loudly.
+
+    Shared by every builder below because all of them interpolate the name into
+    text a LEVEL-4 console executes: a name carrying a newline would be a second
+    command of the attacker's choosing (``op <them>``), and a name carrying a
+    space would silently retarget the command at a different selector.
+    :class:`ExhibitionConfig` owns the username rule and is reused rather than
+    re-implemented.
+    """
+    if not isinstance(challenger_username, str) or not challenger_username:
+        raise ValueError(
+            "challenger_username must be a non-empty Minecraft username, got "
+            f"{challenger_username!r}"
+        )
+    ExhibitionConfig(challenger_username=challenger_username)  # raises on a bad name
+
+
+def human_gear_commands(challenger_username: str) -> List[str]:
+    """The five Paper CONSOLE lines that re-gear the human: one held iron sword,
+    four WORN iron pieces.
+
+    Mirrors the LEARNER's re-gear block line for line
+    (``spawn_learner_pad.mcfunction``: ``$give $(learner) minecraft:iron_sword
+    1`` followed by four ``$item replace entity $(learner) armor.<slot> with
+    minecraft:iron_*``), because since M4 (T2, issue #33) BOTH bots are re-geared
+    with a sword AND a full iron set on every reset, and the human has to fight
+    the same fight the agent trained on. The dummy's template used to be the
+    wrong model for gear -- it armed its opponent with nothing -- and since M4 it
+    carries the identical kit; the one thing still NOT copied from it is its
+    blanket ``$clear``.
+
+    ARMOR IS ``item replace``, NEVER ``give``, AND THAT IS THE POINT OF THIS
+    FUNCTION. ``give`` pushes a stack into the first free INVENTORY slot and
+    equips nothing; nothing in Minecraft moves a piece from a player's bag onto
+    their body. Four ``give``s would leave the challenger standing there HOLDING
+    a full iron set at zero armor points, taking 6 a hit while the agent takes
+    3.12 -- armored in the log, naked in the fight. ``item replace entity <name>
+    armor.<slot> with <item>`` writes the equipment slot itself, so the piece is
+    worn the instant the command returns.
+
+    THE TWO HALVES ARE IDEMPOTENT FOR DIFFERENT REASONS, so do not "simplify"
+    either into the other:
+
+    * The four armor lines are idempotent BY CONSTRUCTION -- ``item replace``
+      OVERWRITES the slot rather than appending to a bag, so an evening of
+      resets leaves exactly one set, always at full durability, with no paired
+      ``clear`` anywhere.
+    * The sword is NOT independently idempotent: a bare ``give`` really would
+      pile a sword per reset into the challenger's hotbar, so ``clear <name>
+      minecraft:iron_sword`` immediately BEFORE it is what makes the pair
+      idempotent and what lets a broken sword fix itself at the next reset. Keep
+      the clear narrow: widening it to a blanket ``clear <name>`` (which the
+      dummy's template does use) would empty a person's unrelated items, which
+      is no part of heal-and-reposition.
+
+    WHAT THIS CANNOT DO is make the challenger HOLD the sword. ``give`` chooses
+    a free slot, not the selected one, and a person's hand is theirs; the sword
+    is confirmed as OWNED by :func:`confirm_human_loadout`, never as held. Do not
+    "fix" that by switching the sword to ``item replace ... weapon.mainhand``:
+    that would break the line-for-line mirror of the datapack that the drift
+    tests pin, and the datapack is what the agent trained against.
+    """
+    _validate_challenger_username(challenger_username)
+    return [
+        # Scoped clear THEN give -- see the docstring. The clear is what keeps
+        # the SWORD idempotent across an evening of resets; the give is what
+        # makes the fight symmetric.
+        f"clear {challenger_username} {CHALLENGER_WEAPON}",
+        f"give {challenger_username} {CHALLENGER_WEAPON} 1",
+        # ...and `item replace` for the armor, which needs no clear because it
+        # overwrites the equipment slot outright.
+        *(
+            f"item replace entity {challenger_username} armor.{slot} with {item}"
+            for slot, item in CHALLENGER_ARMOR
+        ),
+    ]
+
+
 def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[str]:
-    """Paper CONSOLE lines that heal, reposition and re-arm the human
+    """Paper CONSOLE lines that heal, reposition and re-gear the human
     challenger.
 
     Two datapack templates, not one, because the human is the dummy's
@@ -676,28 +796,23 @@ def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[st
       ``saturation 1 19``), same clear-then-give ORDER — an instant effect is
       applied on its first tick, so a clear issued afterwards can strip it
       before it ever lands, which is the bug that ordering exists to remove.
-    * GEAR mirrors the LEARNER's template instead
-      (``spawn_learner_pad.mcfunction``'s ``$give $(learner)
-      minecraft:iron_sword 1``), because the agent is re-armed with a fresh
-      iron sword on EVERY reset and a barehanded challenger swings for 1 damage
-      against 6. The dummy's template is the wrong model for this one line: it
-      arms its opponent with nothing, which is right for a passive training
-      target and wrong for a person. One sword and no armor — the checkpoint
-      never trained against an armored opponent, so armor is out of scope.
+    * GEAR mirrors the LEARNER's re-gear block instead, and lives in
+      :func:`human_gear_commands` — an iron sword by ``give``, four worn iron
+      pieces by ``item replace``. The ONE thing not copied from the dummy is its
+      blanket ``$clear``: taking a person's unrelated items is not part of
+      heal-and-reposition.
 
-    THE GEAR CLEAR IS SCOPED TO THE SWORD, AND THAT IS THE WHOLE MECHANISM. A
-    bare ``give`` really would pile a sword per reset into the challenger's
-    inventory; ``clear <name> minecraft:iron_sword`` immediately before it makes
-    the pair idempotent, so any number of resets leaves exactly one sword at
-    full durability and a broken sword fixes itself at the next reset. Do NOT
-    "simplify" it back to a lone ``give``, and do NOT widen it to a blanket
-    ``clear`` (which the dummy's template does use): taking a person's unrelated
-    items is not part of heal-and-reposition, and the narrow clear is the only
-    part that has to be there.
+    RETRACTED, AND IT WAS TRUE WHEN IT WAS WRITTEN: this docstring used to end
+    "one sword and no armor — the checkpoint never trained against an armored
+    opponent, so armor is out of scope". M4 arms BOTH bots (T2, issue #33), so
+    the reasoning now runs the other way — the unarmored human is the mismatch,
+    taking 6 a hit where the agent takes 3.12 through 15 armor points, in a
+    matchup the policy has never played. Armor is in scope precisely BECAUSE of
+    what the checkpoint trained against.
 
     NO LEADING SLASH. These go to the server console, whose commands are
     slash-free. ``formatHumanResetCommands`` (``bridge/bot.js``) is NOT a mirror
-    of this list — it resets the LEARNER, and the learner's own sword arrives
+    of this list — it resets the LEARNER, and the learner's own gear arrives
     through the ``arena:spawn_learner_pad`` call inside it — but its output does
     keep a ``/`` because the bridge feeds it to ``bot.chat()``.
 
@@ -709,12 +824,7 @@ def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[st
             attacker's choosing (``op <them>``). :class:`ExhibitionConfig` owns
             the username rule and is reused rather than re-implemented.
     """
-    if not isinstance(challenger_username, str) or not challenger_username:
-        raise ValueError(
-            "challenger_username must be a non-empty Minecraft username, got "
-            f"{challenger_username!r}"
-        )
-    ExhibitionConfig(challenger_username=challenger_username)  # raises on a bad name
+    _validate_challenger_username(challenger_username)
     for label, value in (("x", anchor.x), ("z", anchor.z)):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(
@@ -732,12 +842,113 @@ def human_reset_commands(anchor: PadAnchor, challenger_username: str) -> List[st
         f"effect clear {challenger_username}",
         f"effect give {challenger_username} minecraft:instant_health 1 9 true",
         f"effect give {challenger_username} minecraft:saturation 1 19 true",
-        # Scoped clear THEN give: see the docstring. The clear is what keeps
-        # this idempotent across an evening of resets; the give is what makes
-        # the fight symmetric.
-        f"clear {challenger_username} {CHALLENGER_WEAPON}",
-        f"give {challenger_username} {CHALLENGER_WEAPON} 1",
+        *human_gear_commands(challenger_username),
     ]
+
+
+# ---------------------------------------------------------------------------
+# READING THE CHALLENGER'S GEAR BACK OFF THE SERVER (AC9).
+#
+# The bots' loadout is proved by the bridge's fail-closed reset gate, which
+# reads each bot's OWN connection (T3). A HUMAN HAS NO BOT CONNECTION, so that
+# gate cannot see them at all — and worn armor would be invisible to an
+# inventory check even if it could, because mineflayer's `inventory.items()`
+# spans slots 9-44 and the armor slots are 5-8. A `$`-macro or a mistyped
+# console line that silently did nothing would therefore leave a challenger
+# fighting an armored agent in their own clothes, with a clean log.
+#
+# So the reset ASKS THE SERVER, on the only channel this process has: five
+# `data get entity` reads down the same console pipe the gear went down, and a
+# scan of Paper's own log for the answers. Paper runs console input in order, so
+# the reads observe the world AFTER the re-gear rather than racing it.
+#
+# WHAT THIS IS, HONESTLY. It is a real server-authoritative read: the values
+# come from the server's own serialization of the player, not from anything this
+# process believes. It is NOT a structured reply channel — there is none; the
+# launcher's console pipe is write-only (`send_paper_console_commands` confirms
+# only that BYTES WERE WRITTEN) and the answers come back the same way an
+# operator would see them, as text in `paper.log`. Three consequences, all of
+# them stated in the log rather than papered over:
+#
+#   * a reply that is late, absent, or worded differently by some future Paper
+#     build reads as COULD NOT CONFIRM, never as confirmed;
+#   * "could not confirm" therefore does not prove the piece is missing, and the
+#     failure message says exactly that;
+#   * unlike the bots' gate this never refuses to play. A demo that will not
+#     start because a helmet is unconfirmed is worse than one that starts and
+#     says so loudly.
+# ---------------------------------------------------------------------------
+
+#: Slot number of each WORN piece inside a player's ``Inventory`` NBT list, read
+#: out of the pinned jar rather than recalled: ``Inventory.save`` (
+#: ``net/minecraft/world/entity/player/Inventory`` in
+#: ``server/versions/1.21.1/paper-1.21.1.jar``) writes the main items at their
+#: own index and then the armor list at ``index + 100``, and
+#: ``net/minecraft/world/entity/EquipmentSlot`` gives that armor list the order
+#: FEET=0, LEGS=1, CHEST=2, HEAD=3. Hence 100..103 = feet, legs, chest, head.
+#: NOT ``ArmorItems``: that tag belongs to Mob, and a Player writes ``Inventory``
+#: instead — a read against ``ArmorItems`` would silently find nothing on a
+#: perfectly armored person.
+ARMOR_NBT_SLOT: Dict[str, int] = {"feet": 100, "legs": 101, "chest": 102, "head": 103}
+
+#: The console's rendering of ``commands.data.entity.query``, which the pinned
+#: jar's ``assets/minecraft/lang/en_us.json`` gives as
+#: ``"%s has the following entity data: %s"``. Matched as a SUBSTRING and
+#: without pinning how the value is quoted, so the check survives cosmetic
+#: differences and fails closed (as "could not confirm") on real ones.
+DATA_QUERY_PHRASE = "has the following entity data:"
+
+#: How long to wait for Paper to answer the five reads. The JVM runs console
+#: input on the next tick and log4j flushes asynchronously, so an immediate read
+#: of the log is expected to come up empty; five seconds is far past both and
+#: still far short of an operator noticing a pause between matches.
+HUMAN_LOADOUT_READ_TIMEOUT_SECONDS = 5.0
+HUMAN_LOADOUT_READ_POLL_SECONDS = 0.25
+
+
+def _human_loadout_reads(challenger_username: str) -> List[Tuple[str, str, str]]:
+    """``(label, console command, item id the server must report)`` per piece.
+
+    Every expected value is a DISTINCT item id, which is what lets one scan of
+    the log resolve all five reads without depending on the order the replies
+    arrive in.
+    """
+    _validate_challenger_username(challenger_username)
+    reads = [
+        (
+            f"armor.{slot}",
+            f"data get entity {challenger_username} "
+            f"Inventory[{{Slot:{ARMOR_NBT_SLOT[slot]}b}}].id",
+            item,
+        )
+        for slot, item in CHALLENGER_ARMOR
+    ]
+    # The sword is read by CONTENT, not by slot, and that asymmetry is
+    # deliberate: `give` drops it in the first FREE inventory slot, which for a
+    # person carrying their own things is not a slot this process can predict.
+    # So this asks "does the server say they own an iron sword", which is the
+    # strongest true claim available -- it is NOT a proof they are holding it,
+    # and nothing here or in the log may say that it is.
+    reads.append(
+        (
+            "the sword",
+            f"data get entity {challenger_username} "
+            f'Inventory[{{id:"{CHALLENGER_WEAPON}"}}].id',
+            CHALLENGER_WEAPON,
+        )
+    )
+    return reads
+
+
+def human_loadout_read_commands(challenger_username: str) -> List[str]:
+    """The five server-authoritative read commands, in gear order.
+
+    Console lines, so no leading slash — same channel and same rules as
+    :func:`human_reset_commands`. Split out from the confirmation itself so the
+    ``--no-paper-console`` path can print exactly what an opped operator should
+    type by hand.
+    """
+    return [command for _label, command, _item in _human_loadout_reads(challenger_username)]
 
 
 def take_reset_request(path: Path) -> bool:
@@ -915,13 +1126,26 @@ def request_reset(
 
 
 def send_paper_console_commands(
-    proc: Any, commands: Sequence[str], *, log: Callable[[str], None] = _ascii_log
+    proc: Any,
+    commands: Sequence[str],
+    *,
+    log: Callable[[str], None] = _ascii_log,
+    what: str = "heal/reposition the human",
 ) -> bool:
     """Write ``commands`` into Paper's console. True iff all of them were sent.
 
     ``server/setup/start.sh`` ``exec``s the JVM, so the pipe :func:`run` opens
     on the start script IS the server console's stdin. Console lines carry no
     leading slash.
+
+    WRITE-ONLY, AND THAT IS THE WHOLE OF WHAT A ``True`` HERE MEANS: the bytes
+    reached the pipe. It says nothing about whether Paper parsed them, whether
+    the commands succeeded, or whether the world changed. Anything that needs to
+    know THAT has to read the server's answer back out of ``paper.log`` — see
+    :func:`confirm_human_loadout`, which is the only caller that does.
+
+    ``what`` names the job for the failure message, because "the commands did
+    not run" is only actionable if the operator is told which commands.
 
     Best-effort and non-fatal: Paper dying mid-exhibition surfaces here as a
     ``BrokenPipeError`` (an ``OSError``) and a launcher that aborted a match
@@ -937,6 +1161,7 @@ def send_paper_console_commands(
             "no console pipe to Paper (--no-paper-console, or a server this "
             "launcher did not start)",
             log=log,
+            what=what,
         )
         return False
     try:
@@ -945,7 +1170,10 @@ def send_paper_console_commands(
         stream.flush()
     except (OSError, ValueError) as exc:  # broken pipe, closed stream
         _log_unrun_commands(
-            commands, f"the Paper console rejected the write ({exc!r})", log=log
+            commands,
+            f"the Paper console rejected the write ({exc!r})",
+            log=log,
+            what=what,
         )
         return False
     for command in commands:
@@ -954,9 +1182,13 @@ def send_paper_console_commands(
 
 
 def _log_unrun_commands(
-    commands: Sequence[str], why: str, *, log: Callable[[str], None]
+    commands: Sequence[str],
+    why: str,
+    *,
+    log: Callable[[str], None],
+    what: str = "heal/reposition the human",
 ) -> None:
-    log(f"could not heal/reposition the human: {why}.")
+    log(f"could not {what}: {why}.")
     log("these console commands did NOT run:")
     for command in commands:
         log(f"  {command}")
@@ -1440,52 +1672,227 @@ def play_one_match(
     return result
 
 
+def _log_size(path: Path) -> int:
+    """Byte length of ``path``, or 0 if it cannot be stat-ed.
+
+    Used as the START of the region :func:`confirm_human_loadout` scans, so a
+    missing or unreadable log degrades to "scan from the beginning and confirm
+    nothing" rather than raising inside a best-effort reset.
+    """
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _log_text_since(path: Path, offset: int) -> str:
+    """Whatever has been appended to ``path`` since byte ``offset``.
+
+    Binary read plus a replacing decode, deliberately: this is a live server log
+    being appended to by another process, so a read can land mid-way through a
+    multi-byte character, and a UnicodeDecodeError inside a heal would take the
+    reset down over a cosmetic problem.
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _confirmed_loadout_ids(
+    text: str, challenger_username: str, expected: Sequence[str]
+) -> set:
+    """The item ids ``text`` shows the SERVER reporting for ``challenger_username``.
+
+    Only lines that carry both the challenger's name and the console's
+    ``data get`` reply phrase count, and the id has to appear on the VALUE side
+    of that phrase. That is what keeps a command echo, a chat message, or a
+    reply about some other player from confirming a piece nobody is wearing —
+    the failure mode this whole check exists to prevent, arriving through the
+    check itself.
+    """
+    seen = set()
+    for line in text.splitlines():
+        head, phrase, value = line.partition(DATA_QUERY_PHRASE)
+        if not phrase or challenger_username not in head:
+            continue
+        for item in expected:
+            if item in value:
+                seen.add(item)
+    return seen
+
+
+def confirm_human_loadout(
+    paper_proc: Any,
+    paper_log: Optional[Path],
+    challenger_username: str,
+    *,
+    log: Callable[[str], None] = _ascii_log,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    timeout: Optional[float] = None,
+) -> bool:
+    """Ask the server what the challenger is actually wearing, and check the
+    answer. True iff all five pieces came back confirmed.
+
+    See "READING THE CHALLENGER'S GEAR BACK OFF THE SERVER" above this module's
+    read-command builders for why this exists (a human has no bot connection,
+    and the bots' fail-closed gate can therefore not see them) and for exactly
+    how much it does and does not prove.
+
+    THE ORDER IS THE CORRECTNESS ARGUMENT. Paper runs console input in the order
+    it arrives, so reads written after the gear lines observe the world AFTER the
+    re-gear rather than racing it — and the scan window opens at the log's
+    CURRENT length, so a reply from an earlier reset can never be mistaken for
+    this one's.
+
+    NEVER FATAL, AND NEVER SILENT. An unconfirmed piece is logged loudly with
+    the commands to check it by hand, and the match is played anyway; the
+    message says "could not confirm", not "is missing", because a lost or
+    late reply looks exactly the same from here.
+
+    Args:
+        paper_proc: the Paper child, whose ``stdin`` is the console pipe.
+        paper_log: where Paper's stdout is being captured. ``None`` (or a path
+            that cannot be read) means there is nowhere for an answer to arrive,
+            which is reported rather than treated as a pass.
+        timeout: seconds to wait for the replies; defaults to
+            :data:`HUMAN_LOADOUT_READ_TIMEOUT_SECONDS`. Zero makes exactly one
+            attempt, which is what an offline test wants.
+    """
+    reads = _human_loadout_reads(challenger_username)
+    budget = HUMAN_LOADOUT_READ_TIMEOUT_SECONDS if timeout is None else timeout
+    if paper_log is None:
+        log(
+            f"CANNOT CONFIRM {challenger_username}'s gear: this launcher is not "
+            "capturing Paper's log, so there is nowhere for the server's answer "
+            "to arrive. The gear commands were still sent."
+        )
+        return False
+    paper_log = Path(paper_log)
+    # Opened BEFORE the reads are written: everything the server says from here
+    # on is an answer to THIS reset, never a leftover from the last one.
+    offset = _log_size(paper_log)
+    if not send_paper_console_commands(
+        paper_proc,
+        [command for _label, command, _item in reads],
+        log=log,
+        what=f"read {challenger_username}'s gear back off the server",
+    ):
+        return False
+    expected = [item for _label, _command, item in reads]
+    deadline = monotonic() + max(0.0, budget)
+    while True:
+        confirmed = _confirmed_loadout_ids(
+            _log_text_since(paper_log, offset), challenger_username, expected
+        )
+        if len(confirmed) == len(expected) or monotonic() >= deadline:
+            break
+        sleep(HUMAN_LOADOUT_READ_POLL_SECONDS)
+    unconfirmed = [
+        (label, command, item) for label, command, item in reads if item not in confirmed
+    ]
+    if not unconfirmed:
+        log(
+            f"server-authoritative read: {challenger_username} has all four iron "
+            "armor pieces WORN and an iron sword in their inventory. (It does "
+            "NOT prove the sword is in their HAND -- `give` picks a free slot, "
+            "and which slot a person selects is theirs to choose.)"
+        )
+        return True
+    log(
+        f"COULD NOT CONFIRM {len(unconfirmed)} of {len(expected)} gear slot(s) "
+        f"for {challenger_username}: "
+        + ", ".join(f"{label} ({item})" for label, _command, item in unconfirmed)
+        + "."
+    )
+    log(
+        f"Nothing in {paper_log} confirmed those within {budget:g}s. That is NOT "
+        "proof the gear is missing: a piece that silently failed to equip and a "
+        "reply that was late, lost or worded differently look identical from "
+        "here, and this does not claim to tell them apart. It IS the case where "
+        "a challenger fights an armored agent unarmored, so check it -- from an "
+        "opped account, or the server console:"
+    )
+    for _label, command, _item in unconfirmed:
+        log(f"  {command}")
+    log(
+        "Then re-run the reset (type `reset` in Minecraft chat) to re-issue the "
+        "gear commands -- `item replace` overwrites, so repeating it is safe."
+    )
+    return False
+
+
 def _reset_human_side(
     paper_proc: Any,
     anchor: PadAnchor,
     challenger_username: Optional[str],
     *,
     paper_console: bool,
+    paper_log: Optional[Path] = None,
     log: Callable[[str], None] = _ascii_log,
 ) -> bool:
-    """Heal, reposition and re-arm the human before the next match. True iff it
-    ran.
+    """Heal, reposition and re-gear the human before the next match, then read
+    the gear back off the server. True iff the commands were sent.
 
     The learner's half of the reset is the bridge's job and happens inside
-    :func:`play_one_match`'s ``env.reset()`` — sword included, via the
-    datapack. This is the half nothing else covers. Never fatal — an unhealed,
-    unarmed challenger is a worse match, a crashed launcher is no match at all
-    — but never silent either: every path that cannot run these says so and
-    prints what would have run.
+    :func:`play_one_match`'s ``env.reset()`` — sword, armor and all, via the
+    datapack, and proved by that side's fail-closed gate. This is the half
+    nothing else covers. Never fatal — an unhealed, unarmored challenger is a
+    worse match, a crashed launcher is no match at all — but never silent
+    either: every path that cannot run these says so and prints what would have
+    run.
+
+    The return value tracks the SEND, not the confirmation: a reset that got its
+    commands onto the console did its job even when the read-back cannot see the
+    answer, and :func:`confirm_human_loadout` does its own loud reporting.
     """
     if challenger_username is None:
         log(
-            "NOT healing or repositioning the human, and NOT arming them: no "
-            "--challenger-username was pinned, and nothing on the wire tells "
+            "NOT healing or repositioning the human, and NOT re-gearing them: "
+            "no --challenger-username was pinned, and nothing on the wire tells "
             "this process who claimed the challenger slot (the state message "
-            "has no field for it). Your challenger gets no iron sword, so they "
-            "fight the agent's sword bare-fisted; and if the last match ended "
-            "in the AGENT's death, they start this one on whatever health they "
-            "had left. Restart the exhibition with --challenger-username "
-            "<name> to fix it for the rest of the demo."
+            "has no field for it). Your challenger gets no iron sword and no "
+            "armor, so they fight an armored agent bare-fisted: 6 damage a hit "
+            "taken, and a bare hand's 1 arrives as 0.42 through the agent's "
+            "iron, which is roughly 48 connected punches to win; and if the "
+            "last match ended in the AGENT's death, they start this one on "
+            "whatever health they had left. "
+            "Restart the exhibition with --challenger-username <name> to fix it "
+            "for the rest of the demo."
         )
         return False
     commands = human_reset_commands(anchor, challenger_username)
     if not paper_console:
         log(
-            "--no-paper-console: not healing, repositioning or arming "
+            "--no-paper-console: not healing, repositioning or re-gearing "
             f"{challenger_username}. Run these from an opped account before "
             "the next match -- the gear lines matter every time, the heal "
             "only if the last match ended in the AGENT's death:"
         )
         for command in commands:
             log(f"  {command}")
+        log(
+            "Then confirm the armor actually went ON (a `give` would have put "
+            "it in the bag instead, which looks identical in chat) -- these "
+            "print the server's own answer:"
+        )
+        for command in human_loadout_read_commands(challenger_username):
+            log(f"  {command}")
         return False
     log(
-        f"healing, repositioning and arming {challenger_username} via the "
+        f"healing, repositioning and re-gearing {challenger_username} via the "
         "Paper console."
     )
-    return send_paper_console_commands(paper_proc, commands, log=log)
+    if not send_paper_console_commands(paper_proc, commands, log=log):
+        return False
+    # Same pipe, written after the gear lines, and Paper runs console input in
+    # order -- so this reads the world the re-gear left behind, not a race
+    # against it. Best-effort and self-reporting: the match is played either way.
+    confirm_human_loadout(paper_proc, paper_log, challenger_username, log=log)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1513,9 +1920,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "ARM THE NEXT CHALLENGER in an exhibition that is already running, "
-            "then exit. Heals, repositions and re-arms both fighters (one iron "
-            "sword each), releases the challenger slot and plays exactly ONE "
-            "more match -- one reset "
+            "then exit. Heals, repositions and re-gears both fighters (an iron "
+            "sword AND a full iron set each), releases the challenger slot and "
+            "plays exactly ONE more match -- one reset "
             "command, one match, never automatic. Starts nothing and never "
             "connects to the bridge (a second TCP client would evict the "
             "running agent); it hands a request file to the live launcher, "
@@ -1528,11 +1935,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help=(
             "do NOT open a console pipe to Paper. The pipe is how a reset "
-            "heals, repositions and arms the HUMAN (the datapack resets the "
-            "learner only), so turning it off means an unarmed challenger "
-            "against the agent's iron sword, and one who beat the agent "
-            "carries their leftover health into the next match; the commands "
-            "are printed instead. An escape hatch, not a default."
+            "gears the HUMAN and reads that gear back off the server (the "
+            "datapack resets the learner only), so turning it off means an "
+            "unarmed, UNARMORED challenger against an agent with an iron sword "
+            "and a full iron set, and one who beat the agent carries their "
+            "leftover health into the next match; the commands are printed "
+            "instead. An escape hatch, not a default."
         ),
     )
     parser.add_argument(
@@ -1845,6 +2253,7 @@ def run(
                 anchor,
                 exhibition_cfg.challenger_username,
                 paper_console=args.paper_console,
+                paper_log=paper_log,
                 log=log,
             )
     except ExhibitionLaunchError as exc:
