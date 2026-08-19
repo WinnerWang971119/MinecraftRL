@@ -191,9 +191,18 @@ off, cross-checked against the wire's privileged `state.opponent.health`:
 ```
 
 Pass is exit code 0. Per cycle it requires the recorded per-hit `damage_dealt`
-sequence `6, 6, 6, 2`, cumulative exactly 20, exactly one death, a clean post-respawn
-baseline, and reconciliation with the wire at ±1 window. Exit code 2 means "no
-verdict" (a transport abort), never "pass".
+sequence to match an expectation DERIVED from the target's armor, cumulative exactly
+20, exactly one death, a clean post-respawn baseline, and reconciliation with the wire
+at ±1 window.
+
+Since M4 both fighters wear a full iron set, so the expected sequence is **`3.12` six
+times then `1.28`** — seven hits, not four. It prints what it expects before the first
+cycle; compare against that line, not against a remembered one. `--target-armor none`
+restores the bare-handed `6, 6, 6, 2` for an A/B or a revert.
+
+Exit code 2 means "no verdict", never "pass" — either a transport abort, or a
+pre-flight refusal (e.g. a `--max-steps` too small for the derived kill, which is about
+twice as long armored).
 
 `--expect-anchor 512,0` points it at a non-zero pad. Read the module docstring before
 concluding anything from a red first cycle — see issue #28 above.
@@ -642,7 +651,7 @@ Rehearse the whole gate chain with `--dry-run`, which starts nothing and exits `
 
 | Milestone | Command | Pass condition | AC |
 |-----------|---------|----------------|-----|
-| Damage-channel gate | `eval.combat_probe --cycles 10` | per-hit `6,6,6,2`, cumulative 20, one death, reconciles with wire health | AC8 |
+| Damage-channel gate | `eval.combat_probe --cycles 10` | per-hit sequence derived from the target's armor (iron: `3.12` x6 then `1.28`), cumulative 20, one death, reconciles with wire health | AC8 |
 | M1 plumbing | `eval.run_random --episodes 100` | ≥100 eps, 0 crashes, RSS < 200 MB | AC3 |
 | M1 smoke + spectate | `eval.run_random --episodes 20` | 0 crashes, damage actually lands | AC10 |
 | M1 number | `eval.benchmark --duration 600` | transitions/s, p99, damage-exact, TPS | AC4 |

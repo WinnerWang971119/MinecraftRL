@@ -231,7 +231,7 @@ Commands assume the venv (`.venv/bin/python`); plain `python` works if you activ
 | Offline tests | `.venv/bin/python -m pytest` · `cd bridge && npm test` | Fakes + fixtures; no game needed |
 | Boot Paper | `bash server/setup/setup.sh` then `bash server/setup/start.sh` | `setup` is idempotent and re-copies the datapack into the world; `start.sh` resolves and pins Java 21. The `.ps1` files in [`server/setup/`](server/setup/) are Windows leftovers, unmaintained since the move to macOS and **not** kept in step with the shell scripts (their Java advice is wrong). macOS is the supported path |
 | Start the bridge | `cd bridge && npm start` | Start Paper **first** — bots connect before the port opens |
-| Damage-channel gate | `.venv/bin/python -m eval.combat_probe --cycles 10` | AC8, the go/no-go: per-hit `6,6,6,2`, cumulative 20, reconciled against the wire's opponent health |
+| Damage-channel gate | `.venv/bin/python -m eval.combat_probe --cycles 10` | AC8, the go/no-go. Per-hit expectation is DERIVED from the target's loadout, not hardcoded: against the iron set both fighters now wear it is `3.12` x6 then `1.28`, cumulative 20. `--target-armor none` reproduces the historical `6,6,6,2` |
 | M1 slice | `.venv/bin/python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555` | ≥100 eps, zero crashes |
 | M1 benchmark | `.venv/bin/python -m eval.benchmark --duration 600 --arenas 1` | Climb the rungs for the max; this is the AC4 **measurement** flag on `eval.benchmark` |
 | M2 training (single pad) | `.venv/bin/python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
