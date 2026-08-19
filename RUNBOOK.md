@@ -240,11 +240,13 @@ Read the printed summary: episodes completed, win/loss/timeout split, RSS growth
 (`crashes=` is on the first of the two `[done]` lines). This is the first proof the
 whole loop (rollout → store → sample → no-op update) survives the real bridge.
 
-**Budget the time.** An episode is capped at `MAX_EPISODE_STEPS = 400` decisions at
-`DECISION_INTERVAL_MS = 200` — 80 seconds — and a random policy mostly times out, so
-100 episodes is on the order of **2¼ hours** plus reset overhead. The 20-episode
-version (~25–30 min) is **AC10**, and is what
-[`docs/spectate.md`](docs/spectate.md) uses to give you something to watch.
+**Budget the time.** An episode is capped at `MAX_EPISODE_STEPS = 600` decisions at
+`DECISION_INTERVAL_MS = 200` — 120 seconds — and a random policy mostly times out, so
+100 episodes is on the order of **3⅓ hours** plus reset overhead. The 20-episode
+version (~40–45 min) is **AC10**, and is what
+[`docs/spectate.md`](docs/spectate.md) uses to give you something to watch. Both
+numbers moved with the cap: it was 400 decisions and 80 s before M4, so any budget
+you remember from an earlier run is a third short.
 
 ## Step 4 — M1 the number (AC4 / TC12)
 
@@ -595,15 +597,27 @@ Things that bite, all of them documented at length in the demo-day guide:
   player in the pad, so a bystander who dies to anything gets reported as the agent's
   win; and the launcher cannot heal the human between matches, because nothing on the
   wire says who claimed the slot. It warns you at startup and again at reset time.
-- **A reset restores health, food, position and the challenger's sword.** Both
-  fighters get exactly one iron sword: the learner from the datapack, the human from
-  the launcher's reset commands (a `clear` scoped to `minecraft:iron_sword`, then a
-  `give`, so repeated resets never pile up duplicates). Neither side gets armor.
+- **A reset restores health, food, position and the challenger's full loadout.** Both
+  fighters get an iron sword **and a full iron set** — helmet, chestplate, leggings,
+  boots: the learner from the datapack, the human from the launcher's reset commands.
+  The sword is a `clear` scoped to `minecraft:iron_sword` then a `give`, so repeated
+  resets never pile up duplicates; the four armor pieces are
+  `item replace entity <name> armor.<slot> with minecraft:iron_*`, which overwrites
+  the equipment slot and is therefore repeat-safe on its own. **`give` does not equip
+  armor** — it drops it in the inventory, which looks identical in chat and leaves the
+  wearer at zero armor points, so never substitute one for the other.
   **Match 1 of a launch is the exception** — a reset is what arms the human, and none
-  has happened yet, so the first challenger needs gear handed out before the
+  has happened yet, so the first challenger needs all five items handed out before the
   exhibition starts. There is no live command channel once it is running (Paper's
   stdin belongs to the launcher, and `ops.json` is rewritten to the two bots before
-  Paper boots).
+  Paper boots). The exact pre-gearing commands are in
+  [`docs/demo-day.md`](docs/demo-day.md).
+- **Every reset reads the human's gear back off the server and says what it found** —
+  either `server-authoritative read: … all four iron armor pieces WORN`, or
+  `COULD NOT CONFIRM n of 5 gear slot(s)` with the `data get entity` lines to check by
+  hand. Unlike the bots' reset gate this is **best-effort**: it logs and the match
+  plays anyway, so read the line rather than assuming it passed. The sword is
+  confirmed as owned, not held.
 - **The health check is an absence.** On first exhibition boot, `rl_deaths objective
   NOT confirmed` must **not** appear in `server/logs/exhibition/bridge.log`. Silence
   there is the read-back confirming that human death detection works.

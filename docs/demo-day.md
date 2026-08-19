@@ -99,14 +99,17 @@ the checkpoint loads, both ports are free, and the Node toolchain resolves.
 .venv/bin/python -m deploy.exhibition --challenger-username demo_player --dry-run
 ```
 
-**5. Gear the pinned name once, for the first match only.**
+**5. Gear the pinned name once, for the first match only. Five commands, not one.**
 
-Every reset arms the challenger with an iron sword, so from the second match
-on this is handled. Match 1 is the exception: it starts before anybody has
-joined, so there is nobody to arm yet. Join under the pinned name during a
-standalone Paper boot and hand it one sword — details and the exact command in
-[Gear](#gear-one-iron-sword-each). Do it tonight: during an exhibition there is
-no server console to type into.
+Every reset arms the challenger with an iron sword **and a full iron set**, so
+from the second match on this is handled. Match 1 is the exception: it starts
+before anybody has joined, so there is nobody to arm yet. Join under the pinned
+name during a standalone Paper boot and run all five lines — one `give` for the
+sword and four `item replace` lines for the armor, because **`give` cannot
+equip armor**. The exact commands, and why that distinction is the difference
+between an armored challenger and one carrying armor in their bag, are in
+[Gear](#gear-an-iron-sword-and-a-full-iron-set-both-sides). Do it tonight:
+during an exhibition there is no server console to type into.
 
 **6. Rehearse the chat keyword once, in game.**
 
@@ -231,10 +234,11 @@ nothing and never connects to the bridge.
 **Both triggers are one mechanism.** Each writes the same one-shot request file
 at `server/logs/exhibition/reset.request`, which the running launcher picks up
 within about a second — the chat keyword makes the *bridge* write it, since the
-bridge is already in game. The launcher then heals, repositions and re-arms the
-human through Paper's console, resets the learner (the datapack re-arms that
-side), releases the challenger slot, and plays **exactly one more match**. It
-cannot tell which trigger fired.
+bridge is already in game. The launcher then heals, repositions and re-gears the
+human through Paper's console — sword plus all four worn armor pieces — reads
+the gear back off the server and reports what it found, resets the learner (the
+datapack re-arms that side), releases the challenger slot, and plays **exactly
+one more match**. It cannot tell which trigger fired.
 
 **The next person joins under the same pinned username.** The pin is baked into
 the bridge's command line for the life of the launcher, and `--reset` refuses to
@@ -286,6 +290,13 @@ commands were not accepted.
 
 That check plus one real kill covers the whole death-detection path.
 
+**The gear has a separate, per-reset check, and it works the other way round —
+it speaks up when it is happy.** Every reset prints either a
+`server-authoritative read: ... all four iron armor pieces WORN` confirmation or
+a `COULD NOT CONFIRM n of 5 gear slot(s)` block. It is best-effort and never
+stops a match, so read it every time:
+[Gear](#gear-an-iron-sword-and-a-full-iron-set-both-sides).
+
 ---
 
 ## When something looks wrong
@@ -296,7 +307,8 @@ That check plus one real kill covers the whole death-detection path.
 |---|---|
 | `rl_deaths` sitting in the tab player list, counting up | The objective must be display-bound or the server broadcasts no score packets at all. The tab entry is the price of death detection working. |
 | The **first** reset logs the challenger on a `foreign_players` line | The exclusion only covers a *claimed* challenger, and on the first reset nothing has claimed yet. `eval/benchmark.py` reads that line as cross-pad contamination evidence, so an exhibition log looks contaminated to that tool. It is not. |
-| `No player was found` in the console after a reset | A pinned challenger who is not online right now. All six heal, reposition and gear commands run against a name nobody is holding. Harmless. |
+| `No player was found` in the console after a reset | A pinned challenger who is not online right now. All ten heal, reposition and gear commands run against a name nobody is holding. Harmless. |
+| `COULD NOT CONFIRM 5 of 5 gear slot(s)` on a reset where nobody was online | The same cause as the row above: the five gear read-backs also find nobody, so none of the five can be confirmed. Expected while the pad is empty. On a reset where the challenger *is* in game, it is not — see the next table. |
 | `reflex shield overrode the action on 4192/4200 decision step(s)` | The shield counts the idle wait before anyone joins, where the opponent reading is zeroed and therefore "blind". The number is dominated by waiting, not by the fight. The summary line is noise, not a verdict on the match. |
 | The agent stands still before a challenger joins | No claimant means a zeroed opponent block and no last-seen memory to turn toward. It wakes up when someone claims the slot. |
 
@@ -313,60 +325,172 @@ That check plus one real kill covers the whole death-detection path.
 | Match will not end | Correct. There is no timeout against a human. Somebody has to die. |
 | Typing `reset` in chat gets no reply | Check it was the whole message and nothing else — "reset?" and "reset now" do not count. If a plain `reset` still gets nothing, `server/logs/exhibition/bridge.log` says `in-game chat reset armed:` at startup when the feature is on; use `.venv/bin/python -m deploy.exhibition --reset` and carry on. |
 | The reply came but the match did not restart | The request was filed while the previous match was still running, so it was discarded when that match ended (the launcher terminal says so). Type `reset` again now that it has. |
+| `COULD NOT CONFIRM n of 5 gear slot(s)` while the challenger **is** in game | The server did not confirm those pieces. It is not proof they are missing, but it is the case where a human fights an armored agent unarmored, so spend the ten seconds: the block prints the exact `data get entity` lines — run them from the console or an opped account. If a piece really is absent, type `reset` in chat again; `item replace` overwrites, so re-issuing is safe. This never blocks the match on its own — see [Gear](#gear-an-iron-sword-and-a-full-iron-set-both-sides). |
+| The challenger says they are unarmored and it is match 1 | Pre-gearing was skipped or only the `give` was run. `give` puts armor in the bag, it does not wear it. Finish the match, then type `reset` — the reset equips all five properly. |
 
 ---
 
-## Gear: one iron sword each
+## Gear: an iron sword and a full iron set, both sides
 
-**Both fighters carry exactly one iron sword and no armor.** The agent's comes
-from the datapack, every reset. The challenger's comes from the reset itself —
-whichever way it was triggered — which sends two more lines through Paper's
-console:
+**Both fighters carry one iron sword and wear a full set of iron armor** —
+helmet, chestplate, leggings, boots. Five items each. The two sides are armed by
+different machinery that emits the same five lines.
+
+The agent's comes from the datapack, every reset
+([`spawn_learner_pad.mcfunction`](../server/arena/data/arena/function/spawn_learner_pad.mcfunction);
+the opponent bot's [`spawn_dummy_pad.mcfunction`](../server/arena/data/arena/function/spawn_dummy_pad.mcfunction)
+carries the identical block):
+
+```
+$give $(learner) minecraft:iron_sword 1
+$item replace entity $(learner) armor.head with minecraft:iron_helmet
+$item replace entity $(learner) armor.chest with minecraft:iron_chestplate
+$item replace entity $(learner) armor.legs with minecraft:iron_leggings
+$item replace entity $(learner) armor.feet with minecraft:iron_boots
+```
+
+The challenger's comes from the reset itself — whichever way it was triggered —
+which sends the same five, plus a scoped `clear` in front of the sword, through
+Paper's console (`human_gear_commands()` in
+[`deploy/exhibition.py`](../deploy/exhibition.py)):
 
 ```
 clear <their_mc_name> minecraft:iron_sword
 give <their_mc_name> minecraft:iron_sword 1
+item replace entity <their_mc_name> armor.head with minecraft:iron_helmet
+item replace entity <their_mc_name> armor.chest with minecraft:iron_chestplate
+item replace entity <their_mc_name> armor.legs with minecraft:iron_leggings
+item replace entity <their_mc_name> armor.feet with minecraft:iron_boots
 ```
 
-The `clear` is scoped to the sword, and that is what makes the pair safe to
-repeat: however many resets an evening runs, the challenger ends up holding
-exactly one sword at full durability, never a stack, and nothing else in their
-inventory is touched. No armor on either side — the agent never trained against
-an armored opponent, so armor would be a different fight, not a fairer one.
+**`give` cannot equip armor. That is the one thing to remember on this page.**
+`give` pushes a stack into the first free *inventory* slot and stops there;
+nothing in Minecraft moves a piece from a player's bag onto their body. Four
+`give`s leave a challenger *carrying* a full iron set at **zero** armor points —
+armored in the chat log, naked in the fight, taking 6 a hit where the agent
+takes 3.12 through its own iron. `item replace entity <name> armor.<slot> with
+<item>` writes the equipment slot itself, so the piece is worn the instant the
+command returns.
+
+The two halves are repeat-safe for different reasons, which is why the `clear`
+sits in front of the sword and nowhere else:
+
+- The four armor lines **overwrite** the slot rather than appending to a bag, so
+  an evening of resets leaves exactly one set, always at full durability. They
+  need no `clear`.
+- A bare `give` **stacks**, so the sword needs `clear <name>
+  minecraft:iron_sword` immediately before it. That clear is scoped to the sword
+  on purpose: a blanket `clear <name>` would empty a person's unrelated items,
+  which is no part of healing them between matches.
+
+Earlier versions of this page said neither side gets armor, on the grounds that
+the agent had never trained against an armored opponent. That reasoning now runs
+the other way: the agent is re-geared with a full iron set on every reset, so it
+is the *unarmored human* who is the mismatch.
 
 | Symptom | Fix |
 |---|---|
 | A challenger breaks their sword mid-match | Nothing to do. Arm the next challenger; the reset hands out a fresh one. |
-| A challenger is empty-handed | Match 1, no pinned name, or the console off (`--no-paper-console`). The first two are below. |
+| A challenger's armor breaks | Same. `item replace` writes a fresh piece into the slot on the next reset. |
+| A challenger is empty-handed, or in their own clothes | Match 1, no pinned name, or the console off (`--no-paper-console`). The first two are below. |
 
 **Arming needs the pinned `--challenger-username`.** Nothing on the wire tells
 the launcher who claimed the slot, so an unpinned exhibition prints a warning at
 reset time and arms nobody — the same reason [step 2](#2-get-the-challenger-in)
 wants the pin.
 
-**Match 1 of a launch is not armed.** The launcher arms on a reset, and match
-1 starts the moment the agent connects, before anybody has joined — arming a
-name nobody is holding would only print `No player was found`. A reset filed
-while match 1 is still running is discarded on purpose, so it cannot be used to
-catch up. Either the first challenger fights barehanded, or you gear the pinned
-name ahead of time from the standalone Paper console (`bash
+**Match 1 of a launch is not armed, and that now costs five items rather than
+one.** The launcher arms on a reset, and match 1 starts the moment the agent
+connects, before anybody has joined — arming a name nobody is holding would only
+print `No player was found`. A reset filed while match 1 is still running is
+discarded on purpose, so it cannot be used to catch up. Either the first
+challenger fights an armored agent barehanded and unarmored, or you gear the
+pinned name ahead of time from the standalone Paper console (`bash
 server/setup/start.sh`, RUNBOOK Step 1), which is interactive:
 
 ```
 give <pinned_name> minecraft:iron_sword 1
+item replace entity <pinned_name> armor.head with minecraft:iron_helmet
+item replace entity <pinned_name> armor.chest with minecraft:iron_chestplate
+item replace entity <pinned_name> armor.legs with minecraft:iron_leggings
+item replace entity <pinned_name> armor.feet with minecraft:iron_boots
 ```
 
-`give` needs an **online** player, the same way `tp` and `effect` do, so someone
-has to be joined under that name at the time — you, the night before, is fine.
-`keepInventory` is on and inventories are stored per username, so the sword is
-still there when the exhibition starts and survives every death after that.
+**Run all five.** The `give` is the sword only, and it mirrors the datapack's own
+`$give`. If you stop there — as this page used to tell you to — match 1 is an
+unarmored human against an armored agent, which is the exact failure this page
+exists to prevent. Do not substitute `give <pinned_name> minecraft:iron_helmet 1`
+for the second line: it puts a helmet in their bag and leaves their head bare.
+
+`give` and `item replace` both need an **online** player, the same way `tp` and
+`effect` do, so someone has to be joined under that name at the time — you, the
+night before, is fine. `keepInventory` is on and inventories are stored per
+username, so the sword and the worn set are still there when the exhibition
+starts and survive every death after that.
+
+Confirm it before you log off, from the same console:
+
+```
+data get entity <pinned_name> Inventory[{Slot:103b}].id
+```
+
+That is the head slot. `103, 102, 101, 100` are head, chest, legs, feet — a
+player's worn pieces live in the `Inventory` NBT list at `slot + 100`, not in
+`ArmorItems`, which is a mob tag and would read empty on a perfectly armored
+person. A reply naming `minecraft:iron_helmet` means it is on their head; no
+reply, or an empty one, means it is not.
 
 There is still no way to hand out gear **live**. During an exhibition Paper's
 console stdin belongs to the launcher process, and `server/ops.json` is
 rewritten to exactly `learner_bot` and `dummy_bot` before Paper boots, so no
 human account can be opped and nobody in the world can run a command. A reset is
 the only gear channel once the exhibition is up, which is exactly why it arms on
-every single one.
+every single one — all five items, every time.
+
+### Every reset says whether the gear went on. Read the line.
+
+After the gear commands, the reset asks the server what the challenger is
+actually wearing: five `data get entity` reads down the same console pipe, then
+a scan of Paper's log for the answers. Paper runs console input in order, so the
+reads observe the world the re-gear left behind rather than racing it. You get
+one of exactly two things in the launcher terminal.
+
+Good — all five confirmed:
+
+```
+[exhibition] server-authoritative read: <name> has all four iron armor pieces WORN and an iron sword in their inventory.
+```
+
+Bad — one or more unconfirmed:
+
+```
+[exhibition] COULD NOT CONFIRM 2 of 5 gear slot(s) for <name>: armor.head (minecraft:iron_helmet), armor.chest (minecraft:iron_chestplate).
+```
+
+followed by the exact `data get entity` lines for the pieces it could not
+confirm, so you can check them by hand from the console.
+
+**This check is best-effort, not fail-closed. It does not stop the match.**
+The two bots have a real gate: the bridge polls each bot's own connection for
+its worn armor and main-hand item on every reset and will not confirm a reset
+that does not match (`loadoutFailures` in [`bridge/bot.js`](../bridge/bot.js)).
+A human has no bot connection, so there is nothing to gate on — and a demo that
+refuses to start because a helmet is unconfirmed is worse than one that starts
+and says so. This check therefore logs loudly and plays anyway, which means
+**you have to read the line**. Nothing downstream will stop you if you don't.
+
+**"Could not confirm" is not "is missing."** A piece that silently failed to
+equip and a reply that was late, lost, or worded differently by some future
+Paper build look identical from here, and the message says so. Treat it as
+"unknown, and worth ten seconds", not as proof. If a hand-run `data get` shows
+the piece really is absent, type `reset` in chat again — `item replace`
+overwrites, so re-issuing is safe.
+
+**One honest limit: the sword is confirmed as OWNED, not HELD.** `give` picks a
+free inventory slot, not the selected one, and which slot a person holds is
+theirs to choose. The read asks "does the server say they own an iron sword",
+which is the strongest true claim available. If a challenger is swinging their
+fist, tell them to select the sword.
 
 ---
 
@@ -392,7 +516,7 @@ default; on a normal demo day you pass `--challenger-username` and nothing else.
 | `--checkpoints-dir <dir>` | `runs` | Directory listed in the refusal message when the checkpoint is missing. |
 | `--reset` | off | Arm the next challenger in a running exhibition, then exit. Takes only `--log-dir`. |
 | `--dry-run` | off | Run every gate, print the plan, start nothing. |
-| `--no-paper-console` | console on | Do not open Paper's stdin. Resets then print the heal and gear commands instead of running them. An escape hatch. |
+| `--no-paper-console` | console on | Do not open Paper's stdin. Resets then print the heal, gear and gear-check commands instead of running them, for you to run from an opped account. An escape hatch. |
 | `--mc-host` / `--mc-port` | `127.0.0.1` / `25565` | Minecraft server address. |
 | `--bridge-host` / `--bridge-port` | `127.0.0.1` / `5555` | Bridge address. |
 | `--node <path>` | `node` | Node executable. |
@@ -407,10 +531,42 @@ The launcher's own printed reset hint says bare `python -m deploy.exhibition
 
 ## What to expect from the agent
 
-Set expectations before the first match rather than after it.
+Set expectations before the first match rather than after it. The first three
+bullets are the honest answer to "how good is it?".
 
-- It was trained against a stationary dummy under a reward that was repaired
-  late. It closes distance and swings. It is not a PvP expert.
+- **Check which checkpoint you are running.** The launcher prints it at startup;
+  the default is `runs/m2_multi.pt`. Everything below depends on which one it is:
+  a pre-M4 checkpoint and one trained by self-play are different agents, and the
+  honest description of each is different.
+- **Nobody has played this matchup yet.** The iron loadout is new. As this was
+  written, **no armored match had been fought by anyone — bot or human.** Every
+  checkpoint in `runs/` was trained bare-handed. If yours is one of those, it has
+  never seen an opponent in armor and never had armor on itself, and the first
+  armored fight in this project's history may be the one you are about to run.
+  That is worth saying out loud rather than discovering in front of a teacher.
+- **What training now points at, and what it does not yet prove.** The pipeline
+  trains against a frozen *past self* that is armed and armored, and the
+  opponent-velocity channel — dead for the life of the project, the same defect
+  class that killed `damage_dealt` — has been repaired, so a policy trained from
+  here can perceive opponent motion for the first time. **That run has not
+  happened yet.** Do not describe the agent as self-play-trained unless the
+  checkpoint you loaded came out of such a run. A checkpoint from the older
+  regime fought a stationary dummy, under a reward repaired late, blind to
+  opponent motion: it closes distance and swings. It is not a PvP expert.
+- **Your movement does reach it now, but an old checkpoint will not use it.**
+  A human has no bot connection to read a velocity off, so the bridge finite-
+  differences your motion from two server-sent positions and puts that on the
+  wire (`_challengerVelocity` in [`bridge/bot.js`](../bridge/bot.js)) — three of
+  the agent's 23 observation features. A network trained while that channel was
+  a stale constant learned to ignore those three inputs, so do not expect a
+  pre-repair checkpoint to lead your movement or read a charge. It sees your
+  motion; it was never taught to care.
+- **Armor makes fights longer, not just tougher.** A fully-cooled iron-sword hit
+  loses about 48% to a full iron set: roughly **3.12** through instead of 6, so a
+  kill takes about **7** clean hits rather than 4. Expect matches to run
+  noticeably longer than a bare-handed one would. Training caps an episode at 600
+  decisions (**120 s**) for that reason — but there is **no timeout against a
+  human**, so somebody still has to die.
 - It cannot see behind itself, and it has a memory timeout. Circling works.
 - Once it commits to turning, it turns straight at you. See
   [the disclosure](#say-this-out-loud-before-the-first-match).

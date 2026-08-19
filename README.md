@@ -91,12 +91,24 @@ that need a sustained live run are still open.
 > that mattered — see
 > [`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md).
 
+> **The loadout changed, and no armored match has been played yet.** Both fighters —
+> learner, opponent bot, and the human challenger at the exhibition — now get an iron
+> sword **and a full iron set** (`spawn_learner_pad.mcfunction`,
+> `spawn_dummy_pad.mcfunction`, and `human_gear_commands()` in
+> [`deploy/exhibition.py`](deploy/exhibition.py)). Armor is applied with
+> `item replace entity … armor.<slot>`, never `give`: **`give` does not equip**, it
+> drops the piece in the inventory at zero armor points, which looks identical in a
+> chat log. A full iron set takes ~48% off an incoming iron-sword hit (6 → ~3.12), so
+> fights run ~1.75× longer and `MAX_EPISODE_STEPS` moved 400 → **600** (120 s). Every
+> checkpoint in `runs/` predates the change and was trained bare-handed.
+
 | Milestone | Question | Bar | Status |
 |-----------|----------|-----|:------:|
 | **M1 plumbing** (AC3) | does the loop survive the real bridge? | ≥100 episodes, 0 crashes, RSS growth < ~200 MB | ⬜ live run pending |
 | **M1 the number** (AC4) | how fast / how many pads? | transitions/s, p99 round-trip, damage-exact, max pads @≥19 TPS | ⬜ live run pending — the scale ladder in [`RUNBOOK.md`](RUNBOOK.md) is an empty table on purpose |
 | **Recurrence gate** (TC8b) | does the LSTM actually work? | memory fixture green, ablation fails | ✅ offline, re-confirm before trusting M2 |
 | **M2 learning** (AC6) | does the RL stack learn? | greedy win ≥95% / 100 eps, no spin-farming | ⬜ live training pending |
+| **M4 self-play** (AC7) | does it improve against itself? | `elo/learner_rated` rising, win rate vs pinned references not collapsing | ⬜ live run pending — `--opponent selfplay` exists; no self-play run has been done |
 
 Taking the stack live and collecting these acceptances is exactly what
 [`RUNBOOK.md`](RUNBOOK.md) walks through, in dependency order. **Done = the
@@ -226,7 +238,7 @@ Commands assume the venv (`.venv/bin/python`); plain `python` works if you activ
 | Multi-pad training | `PADS=N bash server/setup/setup.sh`, `bash server/setup/start-pads.sh --pads N` (wait for `FLEET READY`), then `.venv/bin/python -m agent.train --arenas N --port 5555 --max-episodes 10000 --checkpoint runs/m2_multi.pt --run-name m2_multi` | **One** Paper JVM, N enclosed pads 512 blocks apart, bridge port `5555+i`. `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
 | Watch it live | [`docs/spectate.md`](docs/spectate.md) | Join with your own client. Read its "Before you join" first — you spawn in **survival**, inside pad 0 |
 | Human exhibition | `.venv/bin/python -m deploy.exhibition --challenger-username <name>` | One command: Paper + bridge + the agent playing greedily from a checkpoint. Plays **one** match, then waits. Full procedure, the one-challenger protocol and the failure lookup table are in [`docs/demo-day.md`](docs/demo-day.md) |
-| Arm the next challenger | `.venv/bin/python -m deploy.exhibition --reset` | Separate command, second terminal. Heals and repositions both sides and plays exactly one more match. Never automatic |
+| Arm the next challenger | type `reset` in Minecraft chat, or `.venv/bin/python -m deploy.exhibition --reset` | One mechanism, two triggers; chat is the demo-day path. Heals, repositions and re-gears both sides (sword + full iron set), reads the human's gear back off the server, and plays exactly one more match. Never automatic |
 
 **Run order for anything live: Paper → bridge → Python driver.** Full ordered
 procedure, pass conditions, and what to watch (reward components, Q divergence) are

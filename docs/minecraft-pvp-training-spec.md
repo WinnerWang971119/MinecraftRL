@@ -30,7 +30,7 @@ We learn a policy π that wins **1-v-1 melee PvP** under a human-equivalent perc
 ### 1.1 Episode
 
 - **Reset:** teleport both agents to fixed spawn points, restore full health and identical gear, clear the `PerceptionFilter` memory.
-- **Termination (`done`):** either agent's health reaches 0, **or** a step/time cap is hit (`MAX_EPISODE_STEPS`, `TUNE` e.g. 400 decisions ≈ 80 s at 5 dps). A timeout is a draw (no terminal win/loss reward; see §3).
+- **Termination (`done`):** either agent's health reaches 0, **or** a step/time cap is hit (`MAX_EPISODE_STEPS`, currently **600 decisions ≈ 120 s** at 5 dps; it was 400 ≈ 80 s until the iron loadout made fights ~1.75× longer). A timeout is a draw (no terminal win/loss reward; see §3).
 - **Decision interval:** the agent acts every `ACTION_REPEAT` game ticks (`TUNE` e.g. 4 ticks ≈ 200 ms). The chosen macro runs for that interval; events are aggregated over it.
 
 ### 1.2 Observation, action, reward (summary; full observation table in the main spec)
@@ -77,7 +77,7 @@ r =  c_dmg_out * damage_dealt        # primary objective
 | `c_dmg_out` | reward per point of damage dealt | 1.0 (per HP) |
 | `c_dmg_in` | penalty per point of damage taken | 1.0 (symmetric or slightly < out) |
 | `c_step` | per-step penalty | small, e.g. 0.005 |
-| `c_aim` | aiming shaping (visibility-gated) | small, e.g. 0.01 |
+| `c_aim` | aiming shaping (visibility-gated) | **0.002 — and it must stay strictly below `c_step`** |
 | `R_terminal` | +W on win, −L on loss, 0 on timeout | W = L = 5–10 |
 
 **Prefer potential-based shaping** for any positional term (e.g. closing distance) so it provably does not change the optimal policy: `F(s,s') = γ·Φ(s') − Φ(s)`.
@@ -85,6 +85,7 @@ r =  c_dmg_out * damage_dealt        # primary objective
 **Anti-hacking review (re-check during tuning):**
 - `c_step` too large → suicide-rushing; too small → runs away forever. The single most important coefficient to tune.
 - An always-on aiming reward → spin-to-farm. That is why `c_aim` is gated on `opponent_visible` and is tiny.
+- **`c_aim < c_step`, strictly, and `RewardConfig` raises if it is not** (issue #25). Gating on visibility is not enough on its own: an agent that just stands and stares at a visible opponent collects `c_aim − c_step` every step forever, which at `c_aim ≥ c_step` is a non-negative flat optimum — a stand-still policy with nothing pushing it off, and in self-play an infinite mutual draw. The shipped values are `c_aim = 0.002` against `c_step = 0.005`; the old `0.01` inverted the pair and was the bug.
 - `damage_dealt`/`damage_taken` come from the raw `events` block — privileged and fair (§2.5).
 
 ---

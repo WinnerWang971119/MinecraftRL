@@ -156,11 +156,14 @@ class TestProjectedEpisodesFormula:
     def test_the_measured_episode_length_is_not_the_timeout(self):
         from agent.contract_config import MAX_EPISODE_STEPS
 
-        # 400 is the TIMEOUT — the length of an episode nobody won. Fights against
-        # the HARD tier drag most of the way toward it, but a mean AT the cap would
-        # mean every episode timed out, which is a broken env, not a measurement.
-        # It must also stay above the 17.0 from the greedy-vs-stationary-dummy
-        # eval, which is the easiest episode this env produces.
+        # MAX_EPISODE_STEPS (600 since M4, 400 when MEASURED_MEAN_EPISODE_STEPS
+        # was collected) is the TIMEOUT — the length of an episode nobody won.
+        # Deliberately compared against the CONSTANT rather than a literal, so
+        # the assertion keeps meaning what it says when the cap moves again.
+        # Fights against the HARD tier drag most of the way toward it, but a mean
+        # AT the cap would mean every episode timed out, which is a broken env,
+        # not a measurement. It must also stay above the 17.0 from the
+        # greedy-vs-stationary-dummy eval, the easiest episode this env produces.
         assert MEASURED_MEAN_EPISODE_STEPS != MAX_EPISODE_STEPS
         assert 17.0 < MEASURED_MEAN_EPISODE_STEPS < MAX_EPISODE_STEPS
 
