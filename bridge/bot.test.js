@@ -15,6 +15,10 @@
 //       BOTH read-back gates match their templates INCLUDING the gear the
 //       datapack gives (the exact configuration that failed live before
 //       regearing was implemented);
+//     - the FAIL-CLOSED LOADOUT half (T3, AC9): worn iron armor (slots 5-8) and
+//       the MAIN-HAND sword are checked for both bots, a missing piece REFUSES
+//       the reset rather than logging a warning, and the console line names
+//       which piece is missing on which bot;
 //     - a STALE reset that loses the epoch race applies none of its four
 //       post-gate effects, so a retry's live episode survives untouched;
 //     - a dummy `death` fired during the reset window is discarded by the
@@ -32,8 +36,11 @@
 //   Static datapack contracts (read from the committed .mcfunction files):
 //     - clear-before-give in both spawn functions, with no trailing clear (the
 //       coverage the deleted _regear tests used to provide);
-//     - the dummy is never given a weapon (the other half of the empty
-//       dummyResetTemplate.inventory);
+//     - the dummy IS armed, with exactly one iron sword — the other half of
+//       dummyResetTemplate.inventory === ['iron_sword'] (it used to be `[]`,
+//       and this assertion used to say "no weapon, ever");
+//     - both spawn functions apply the same four iron armor pieces bot.js's
+//       IRON_ARMOR_SET names, to the same four `armor.*` slots;
 //     - server/world/datapacks/arena is in sync with server/arena.
 //
 // MOCK FIDELITY — READ BEFORE ADDING A FAKE HERE.
@@ -42,6 +49,11 @@
 //   field). The fakes below therefore put `health` on the BOT and never on
 //   `entity`. A fake more capable than the real library is how the damage
 //   channel shipped dead — see bridge/actions.test.js for the full note.
+//   The same rule shapes `equipBot` below: `inventory.items()`,
+//   `inventory.slots` and `heldItem` are all derived from ONE declaration with
+//   the real slot numbering, so no fixture can report a held sword it has no
+//   slot for, or armor that `items()` can see. The whole point of the loadout
+//   gate is that the server answers those three questions differently.
 //
 // WHAT STILL NEEDS THE LIVE HANDSHAKE (server/compat_check.md):
 //   The datapack's /give landing in a real inventory within the gate's 3 s
@@ -91,6 +103,13 @@ const {
   toProtocolYaw,
   toProtocolPitch,
   assembleStateMsg,
+  snapshotBotState,
+  readbackMatchesTemplate,
+  loadoutFailures,
+  ARMOR_PIECES,
+  ARMOR_SLOT_INDEX,
+  IRON_ARMOR_SET,
+  IRON_WEAPON,
 } = require('./bot');
 // The REAL executor and the REAL weapon period drive the cooldown tests below:
 // MacroExecutor owns lastSwingTick, so a hand-rolled stand-in would be testing
@@ -110,10 +129,80 @@ const SPAWN = Object.freeze({ x: 0.5, y: 64.0, z: 0.5 });
 /** The dummy spawn: the learner spawn offset +3 on x (see handleReset). */
 const DUMMY_SPAWN = Object.freeze({ x: SPAWN.x + 3, y: SPAWN.y, z: SPAWN.z });
 
-/** A minimal chat-capturing mock bot the regear/reset path can drive. */
-function mockBot(username, { inventory = [], position = SPAWN } = {}) {
+/**
+ * Hotbar slot 0 in mineflayer's window-0 numbering (`QUICK_BAR_START`,
+ * node_modules/mineflayer/lib/plugins/simple_inventory.js:6). A `$clear`
+ * followed by a `$give` — the pad functions' exact ordering — lands the sword
+ * here; see WHERE THE `$give` ACTUALLY LANDS in bot.js for the read of the
+ * pinned jar that establishes it.
+ */
+const HOTBAR_START = 36;
+
+/**
+ * Install the inventory surface a mineflayer bot exposes on its OWN connection,
+ * derived from ONE declaration:
+ *
+ *   inventory.slots  the whole window — armor at 5-8, hotbar at 36-44;
+ *   inventory.items() slots 9-44 ONLY, the real Window.items() range;
+ *   heldItem         a GETTER over slot 36 + quickBarSlot, as mineflayer
+ *                    defines it (lib/plugins/inventory.js:49).
+ *
+ * `items` is positional from slot 36 up, and a `null` entry leaves that hotbar
+ * slot EMPTY — which is how a fixture models "owns a sword, is not holding it".
+ * Slot indices come from bot.js rather than being retyped, so a fixture cannot
+ * drift from the template it is built to satisfy.
+ *
+ * @param {object} bot The bot object to install onto (returned).
+ * @param {{items:(string|null)[], armor:object, quickBarSlot:number}} spec
+ */
+function equipBot(bot, { items, armor, quickBarSlot }) {
+  const state = { items: [...items] };
+  const rebuild = () => {
+    const slots = new Array(46).fill(null);
+    for (const piece of ARMOR_PIECES) {
+      const name = armor === null || armor === undefined ? null : armor[piece];
+      slots[ARMOR_SLOT_INDEX[piece]] = typeof name === 'string' ? { name } : null;
+    }
+    state.items.forEach((name, i) => {
+      slots[HOTBAR_START + i] = typeof name === 'string' ? { name } : null;
+    });
+    bot.inventory.slots = slots;
+  };
+  bot.quickBarSlot = quickBarSlot;
+  bot.inventory = {
+    slots: [],
+    // The real Window.items() is itemsRange(inventoryStart, inventoryEnd) with
+    // inventoryEnd stored as `end + 1` (prismarine-windows/lib/Window.js:16)
+    // and the loop exclusive of it — so slots 9..44 inclusive. Armor is outside.
+    items: () => bot.inventory.slots.slice(9, 45).filter((slot) => slot !== null),
+  };
+  Object.defineProperty(bot, 'heldItem', {
+    configurable: true,
+    get: () => bot.inventory.slots[HOTBAR_START + bot.quickBarSlot],
+  });
+  /** Model the async /give finally landing in the real inventory. */
+  bot.setInventory = (nextItems) => {
+    state.items = [...nextItems];
+    rebuild();
+  };
+  rebuild();
+  return bot;
+}
+
+/**
+ * A minimal chat-capturing mock bot the regear/reset path can drive.
+ *
+ * `armor` defaults to the full iron set the pad functions apply, so a fixture
+ * only has to speak up when it MEANS to model a failed equip.
+ */
+function mockBot(username, {
+  inventory = [],
+  position = SPAWN,
+  armor = IRON_ARMOR_SET,
+  quickBarSlot = 0,
+} = {}) {
   const chatLog = [];
-  return {
+  const bot = {
     username,
     chatLog,
     chat: (cmd) => chatLog.push(cmd),
@@ -122,24 +211,27 @@ function mockBot(username, { inventory = [], position = SPAWN } = {}) {
       position: { x: position.x, y: position.y, z: position.z },
       effects: {},
     },
-    inventory: { items: () => inventory.map((name) => ({ name })) },
   };
+  return equipBot(bot, { items: inventory, armor, quickBarSlot });
 }
 
 /**
  * A mock dummy that ALREADY satisfies its read-back gate: healed, at the +3 x
- * spawn, EMPTY-HANDED, no active effects. Without this the dummy gate
- * legitimately rejects the fake and burns its full 3 s timeout.
+ * spawn, holding an iron sword, wearing full iron, no active effects. Without
+ * this the dummy gate legitimately rejects the fake and burns its full 3 s
+ * timeout.
  *
- * The empty inventory is the template, not an omission: the datapack declares
- * the dummy "a passive target, no weapon" (spawn_dummy_pad.mcfunction only
- * /clear-s it) and the datapack is the sole reset authority, so nothing arms
- * the dummy any more. A fake holding a sword here would be a fake more capable
- * than the server — the mistake this suite exists to prevent.
+ * THE SWORD IS THE TEMPLATE, NOT AN INDULGENCE — and this docstring used to say
+ * the opposite. It read "the datapack declares the dummy a passive target, no
+ * weapon", which was true until the M4 iron loadout (#33) added
+ * `$give $(dummy) minecraft:iron_sword 1` to spawn_dummy_pad.mcfunction. The
+ * datapack is still the sole reset authority and this fake still mirrors it;
+ * what it mirrors changed. An empty-handed fake here is now the one that is
+ * LESS capable than the server.
  */
 function mockDummy(overrides = {}) {
   return mockBot('dummy_bot', {
-    inventory: [],
+    inventory: [IRON_WEAPON],
     position: DUMMY_SPAWN,
     ...overrides,
   });
@@ -152,14 +244,22 @@ function mockDummy(overrides = {}) {
  *
  * @param {string} username
  * @param {object} [opts]
- * @param {string[]} [opts.inventory] Items the gate reads back (mutable via setInventory).
+ * @param {(string|null)[]} [opts.inventory] Hotbar contents from slot 36 up
+ *   (mutable via setInventory); a null entry leaves that slot empty.
  * @param {{x:number,y:number,z:number}} [opts.position]
+ * @param {object|null} [opts.armor] Worn pieces; defaults to the full iron set.
+ * @param {number} [opts.quickBarSlot] Which hotbar slot the main hand points at.
  * @param {function} [opts.chat] Override to model a throwing/failing chat.
  */
-function liveBot(username, { inventory = ['iron_sword'], position = SPAWN, chat } = {}) {
+function liveBot(username, {
+  inventory = [IRON_WEAPON],
+  position = SPAWN,
+  armor = IRON_ARMOR_SET,
+  quickBarSlot = 0,
+  chat,
+} = {}) {
   const chatLog = [];
-  const state = { inventory: [...inventory] };
-  return Object.assign(new EventEmitter(), {
+  const bot = Object.assign(new EventEmitter(), {
     username,
     chatLog,
     chat: chat || ((cmd) => chatLog.push(cmd)),
@@ -168,12 +268,8 @@ function liveBot(username, { inventory = ['iron_sword'], position = SPAWN, chat 
       position: { x: position.x, y: position.y, z: position.z },
       effects: {},
     },
-    inventory: { items: () => state.inventory.map((name) => ({ name })) },
-    /** Model the async /give finally landing in the real inventory. */
-    setInventory(items) {
-      state.inventory = [...items];
-    },
   });
+  return equipBot(bot, { items: inventory, armor, quickBarSlot });
 }
 
 /**
@@ -710,7 +806,7 @@ test('dummyKnockbackImmune=false still sends NO override when the datapack reset
     },
   );
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   const realError = console.error;
   console.error = (msg) => errors.push(String(msg));
@@ -769,7 +865,7 @@ function nonImmuneArena(sent, readbackOptions = {}) {
     },
   );
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   answerResetLikeTheServer(arena);
   return arena;
@@ -1086,7 +1182,7 @@ test('handleReset acks ok:FALSE when both gates match but the datapack never con
   // Exactly the post-kill trap: both bots ALREADY look reset. No
   // answerResetLikeTheServer() here — the macro aborted, so no beacon arrives.
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   const realError = console.error;
   console.error = (msg) => errors.push(String(msg));
@@ -1112,7 +1208,7 @@ test('handleReset acks ok:true once BOTH beacons arrive, and re-arms the latch e
     readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
   });
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   answerResetLikeTheServer(arena);
 
@@ -1143,7 +1239,7 @@ test('the confirmation is WAITED for: a beacon that lands after the gates still 
   const sent = [];
   const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   answerResetLikeTheServer(arena, { delayMs: 200 });
 
@@ -1162,7 +1258,7 @@ test('a LATE beacon from the previous reset cannot confirm the next one (nonce)'
     readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
   });
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
 
   // Reset 1's beacons, arriving now — long after reset 1 gave up. Without the
@@ -1193,7 +1289,7 @@ test('only THIS pad\'s beacon confirms it — a neighbour\'s cannot', async () =
     { transport: { send: (msg) => sent.push(msg) }, readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 } },
   );
   arena.learner = liveBot('learner_3', { position: { x: 512.5, y: 64, z: 0.5 } });
-  arena.dummy = liveBot('dummy_3', { inventory: [], position: { x: 515.5, y: 64, z: 0.5 } });
+  arena.dummy = liveBot('dummy_3', { position: { x: 515.5, y: 64, z: 0.5 } });
   arena.wireDamageEvents();
   // Pad 4's beacons, and pad 3's own text with the roles swapped: neither may
   // confirm this pad. (The datapack addresses beacons by name, so this is
@@ -1257,10 +1353,12 @@ test('spawn_learner_pad clears BEFORE it gives, with no trailing clear', () => {
   );
 });
 
-test('spawn_dummy_pad clears before it gives, gives the dummy NO weapon, and ends with its beacon', () => {
+test('spawn_dummy_pad clears before it gives, arms the dummy with ONE iron sword, and ends with its beacon', () => {
   const lines = datapackLines('spawn_dummy_pad.mcfunction');
   const effectClear = lines.findIndex((line) => line.startsWith('$effect clear'));
   const lastEffectGive = lines.map((line) => line.startsWith('$effect give')).lastIndexOf(true);
+  const invClear = lines.findIndex((line) => line.startsWith('$clear $(dummy)'));
+  const give = lines.findIndex((line) => line.startsWith('$give '));
 
   assert.ok(effectClear >= 0 && lastEffectGive >= 0);
   assert.ok(effectClear < lastEffectGive, '$effect clear must precede every $effect give');
@@ -1269,18 +1367,55 @@ test('spawn_dummy_pad clears before it gives, gives the dummy NO weapon, and end
     0,
     'a trailing $effect clear would silently void the dummy heal and food restore',
   );
-  // The other half of the bridge/datapack template agreement: nothing arms the
-  // dummy, which is why dummyResetTemplate.inventory is [].
-  assert.equal(
-    lines.filter((line) => line.startsWith('$give ')).length,
-    0,
-    'the dummy is a passive target: no weapon, ever',
+  // The other half of the bridge/datapack template agreement.
+  //
+  // RETRACTED PREMISE, kept quoted so a grep for the old words lands here: this
+  // assertion used to read "the dummy is a passive target: no weapon, ever" and
+  // demanded ZERO `$give` lines, because dummyResetTemplate.inventory was `[]`.
+  // The M4 iron loadout (#33) armed the dummy, and the two halves must move
+  // together: with a sword in container slot 36 — inside items()'s 9-44 window
+  // — an empty template makes sameItemSet reject EVERY dummy read-back.
+  assert.ok(invClear >= 0 && give > invClear, '$clear must still precede the regear $give');
+  assert.deepEqual(
+    lines.filter((line) => line.startsWith('$give ')),
+    ['$give $(dummy) minecraft:iron_sword 1'],
+    'exactly one give, and it is the sword dummyResetTemplate.inventory expects',
   );
-  assert.ok(lines.some((line) => line.startsWith('$clear $(dummy)')), 'the dummy inventory is cleared');
   assert.ok(
     lines[lines.length - 1].startsWith('$tellraw $(dummy)'),
     'the causality beacon must stay the LAST line',
   );
+});
+
+test('both spawn functions equip the four armor slots bot.js\'s IRON_ARMOR_SET names', () => {
+  // The armor half of the same bridge/datapack agreement, and the half with no
+  // other safety net. Two different things can go wrong here and the bridge
+  // cannot tell them apart: an INVALID id or `armor.*` slot name aborts the
+  // whole macro at instantiation with nothing in the boot log, while a merely
+  // DIFFERENT-but-valid id applies cleanly and arms the fleet with gear the
+  // template does not expect. The loadout gate refuses the reset either way —
+  // which means a disagreement between these two files stops training dead.
+  // Fail it here, in CI, rather than at 25 live pads.
+  for (const [file, macroKey] of [
+    ['spawn_learner_pad.mcfunction', 'learner'],
+    ['spawn_dummy_pad.mcfunction', 'dummy'],
+  ]) {
+    const applied = {};
+    for (const line of datapackLines(file)) {
+      const parsed = new RegExp(
+        `^\\$item replace entity \\$\\(${macroKey}\\) armor\\.(\\w+) with minecraft:(\\w+)$`,
+      ).exec(line);
+      if (parsed !== null) {
+        applied[parsed[1]] = parsed[2];
+      }
+    }
+    assert.deepEqual(
+      applied,
+      { head: 'iron_helmet', chest: 'iron_chestplate', legs: 'iron_leggings', feet: 'iron_boots' },
+      `${file} must equip exactly the four pieces the reset template verifies`,
+    );
+    assert.deepEqual(applied, { ...IRON_ARMOR_SET }, `${file} must agree with bot.js IRON_ARMOR_SET`);
+  }
 });
 
 test('the datapack\'s knockback attribute id and default value are pinned against bot.js (T11c)', () => {
@@ -2706,7 +2841,7 @@ test('in BOT mode the scoreboard path is entirely absent and the dummy owns oppo
   const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
   arena.learner = liveBot('learner_bot');
   arena.learner._client = new EventEmitter();
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
 
   // Not one listener, so a stray packet cannot reach the aggregator even in
@@ -2823,7 +2958,7 @@ test('handleReset seeds _prevOpponentHealth from the CONFIRMED dummy readback, n
     readbackOptions: { ...SINGLE_POLL_GATE, healthEpsilon: 5 },
   });
   arena.learner = liveBot('learner_bot');
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.dummy.health = 18;
   arena.wireDamageEvents();
   answerResetLikeTheServer(arena);
@@ -2907,7 +3042,7 @@ test('a STALE reset that loses the epoch race applies NONE of its post-gate effe
   // The learner's /give has not landed yet, so its gate cannot match on the
   // first poll and the handler parks inside runReadbackGate.
   arena.learner = liveBot('learner_bot', { inventory: [] });
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
   answerResetLikeTheServer(arena);
 
@@ -2960,7 +3095,7 @@ test(
     const sent = [];
     const arena = new ArenaBots({}, { transport: { send: (msg) => sent.push(msg) } });
     arena.learner = liveBot('learner_bot', { inventory: [] });
-    arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+    arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
     arena.wireDamageEvents();
     answerResetLikeTheServer(arena);
     const spy = spyRecorders(arena);
@@ -3011,7 +3146,7 @@ test('handleReset rejects on a throwing chat(), sends no ack, and leaves the dam
       throw new Error('cannot chat: bot is not spawned');
     },
   });
-  arena.dummy = liveBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.wireDamageEvents();
 
   await assert.rejects(
@@ -3073,13 +3208,14 @@ test('handleReset rejects on a throwing chat(), sends no ack, and leaves the dam
 /**
  * An EventEmitter bot that satisfies BOTH the reset read-back gate and the step
  * path's snapshot, so one fixture can drive reset -> step -> step. Every added
- * field is one mineflayer really populates on a bot's own connection
- * (`heldItem`) or on its own entity (velocity/yaw/pitch/onGround) — the mock
- * fidelity rule at the top of this file still applies.
+ * field is one mineflayer really populates on its own entity
+ * (velocity/yaw/pitch/onGround) — the mock fidelity rule at the top of this
+ * file still applies. `heldItem` is NOT added here any more: liveBot derives it
+ * from the hotbar through equipBot, and re-stating it would let this fixture
+ * claim a sword no slot holds.
  */
 function cooldownBot(username, opts = {}) {
   const bot = liveBot(username, opts);
-  bot.heldItem = { name: 'iron_sword' };
   Object.assign(bot.entity, {
     username,
     velocity: { x: 0, y: 0, z: 0 },
@@ -3105,7 +3241,7 @@ function cooldownArena(sent) {
     readbackOptions: { timeoutMs: 0, pollIntervalMs: 1 },
   });
   arena.learner = cooldownBot('learner_bot');
-  arena.dummy = cooldownBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = cooldownBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.executor = new MacroExecutor(arena.learner);
   arena._waitTicksImpl = async () => {};
   arena.wireDamageEvents();
@@ -3302,7 +3438,7 @@ function oppArena(sent, errors = []) {
     },
   );
   arena.learner = drivenBot('learner_bot');
-  arena.dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = drivenBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.executor = new MacroExecutor(arena.learner);
   arena._waitTicksImpl = async () => {};
   arena.wireDamageEvents();
@@ -3471,7 +3607,7 @@ test('an injected opponent executor is used as-is and never rebound mid-run', as
   // deps.opponentExecutor mirrors deps.executor: whatever is already bound wins,
   // so a rebind on some later window cannot silently drop the swing gate's
   // accumulated state (and with it, the agreement with Python's shadow meter).
-  const dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  const dummy = drivenBot('dummy_bot', { position: DUMMY_SPAWN });
   const standIn = new MacroExecutor(dummy);
   const arena = new ArenaBots(
     {},
@@ -3610,7 +3746,7 @@ function receivePathArena() {
   server.on('error', (err) => errors.push(err));
   const arena = new ArenaBots({}, { transport: server });
   arena.learner = drivenBot('learner_bot');
-  arena.dummy = drivenBot('dummy_bot', { inventory: [], position: DUMMY_SPAWN });
+  arena.dummy = drivenBot('dummy_bot', { position: DUMMY_SPAWN });
   arena.executor = new MacroExecutor(arena.learner);
   arena._waitTicksImpl = async () => {};
   arena.wireTransport();
@@ -4429,7 +4565,9 @@ test('PROVENANCE: a HUMAN challenger emits no-reading defaults — a non-self on
     { transport: { send: () => {} } },
   );
   const handle = {
-    entity: { position: { x: 0, y: 64, z: 5 }, yaw: 0, pitch: 0, velocity: { x: 0, y: 0, z: 0 }, onGround: true },
+    // The velocity is deliberately loud and deliberately not zero: it stands for
+    // the stale knockback impulse a handle view really does carry (T20 below).
+    entity: { position: { x: 0, y: 64, z: 5 }, yaw: 0, pitch: 0, velocity: { x: 4, y: -4, z: 4 }, onGround: true },
     isBot: false,
     username: 'Steve',
   };
@@ -4439,9 +4577,120 @@ test('PROVENANCE: a HUMAN challenger emits no-reading defaults — a non-self on
   assert.equal(bots._opponentBot(), null, 'a human challenger has no bot connection');
   assert.equal(snapshot.on_ground, false, 'no connection means no reading, never the constructor constant');
   assert.equal(snapshot.held_item, '', 'no connection to read a held item from');
-  // The broadcast-backed kinematics still come from the handle — the removed
-  // fallback is scoped to the own-connection fields, not the whole block.
+  assert.equal(snapshot.velocity, null, 'nor a velocity — same own-connection rule (T20)');
+  // POSITION and facing DO still come from the handle: rel_entity_move and
+  // entity_move_look really do keep another player's `entity.position` current.
+  // Velocity is the field those same packets never write, which is why it moved
+  // to the own-connection side and a human now has no reading for it at all.
   assert.deepEqual(snapshot.pos, { x: 0, y: 64, z: 5 });
+  assert.deepEqual(
+    zeroedWire(snapshot).opponent.velocity,
+    [0, 0, 0],
+    'and "no reading" reaches the wire as the zero vector, never the handle\'s 4/-4/4',
+  );
+});
+
+/** Assemble a schema-valid `state` around one opponent snapshot, for wire assertions. */
+function zeroedWire(opponentSnapshot) {
+  const msg = assembleStateMsg({
+    self: {},
+    opponent: opponentSnapshot,
+    events: {},
+    wallDistances: [],
+    tick: 0,
+    codeVersion: 'test',
+  });
+  assert.doesNotThrow(() => validateOutbound(msg));
+  return msg;
+}
+
+test('PROVENANCE: _snapshotOpponent reads velocity from the opponent\'s OWN connection (T20)', () => {
+  // THE THIRD FIELD OF THE SAME DEFECT CLASS, and the one that shipped. Until
+  // T20 this was read from the handle the LEARNER's client resolved, and on the
+  // pinned protocol that view is very nearly a constant: `entity_velocity` is
+  // the ONLY handler that writes a non-self `entity.velocity`
+  // (node_modules/mineflayer/lib/plugins/entities.js:281) and the server sends
+  // it on knockback and explosions, not per tick. Walking arrives as
+  // `rel_entity_move` (:301) and `entity_move_look` (:320), which translate
+  // position and never touch velocity; `sync_entity_position` (:348) does write
+  // it but is the merged 1.21.3 packet, dead on this bridge's pinned 1.21.1.
+  //
+  // So `opp_vel_local` — indices 16-18, NOT the 14-16 the M4 plan names;
+  // FIELD_SLICES['opp_vel_local'] in env/observation_spec.py is slice(16, 19)
+  // — carried a stale impulse or a zero for the life of the project. The
+  // opponent's own connection is a real reading:
+  // prismarine-physics writes `bot.entity.velocity` for the SELF entity every
+  // simulated tick (node_modules/prismarine-physics/index.js:856).
+  //
+  // The two views below DISAGREE on purpose, and the pairing is then REVERSED,
+  // so this cannot pass by always reporting one of them.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  const walking = { x: 0.21, y: -0.0784, z: -0.34 };
+  const staleImpulse = { x: -0.9, y: 0.42, z: 0.9 };
+  bots.dummy = {
+    health: MAX_HEALTH,
+    heldItem: { name: 'iron_sword' },
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: walking,
+      onGround: true,
+    },
+  };
+  const staleHandle = {
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: staleImpulse,
+      onGround: true,
+    },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  assert.deepEqual(
+    bots._snapshotOpponent(staleHandle).velocity,
+    walking,
+    "velocity must come from the dummy's own connection, not the stale handle entity",
+  );
+
+  bots.dummy.entity.velocity = staleImpulse;
+  staleHandle.entity.velocity = walking;
+  assert.deepEqual(
+    bots._snapshotOpponent(staleHandle).velocity,
+    staleImpulse,
+    'the handle view must not be able to flip the emitted value in either direction',
+  );
+
+  // ...and it survives assembleStateMsg's field-by-field rebuild onto the wire.
+  assert.deepEqual(zeroedWire(bots._snapshotOpponent(staleHandle)).opponent.velocity, [
+    staleImpulse.x,
+    staleImpulse.y,
+    staleImpulse.z,
+  ]);
+});
+
+test('PROVENANCE: an opponent bot with no entity yet reports NO velocity, not the handle view', () => {
+  // Same rule as on_ground: a connection that exists but has not spawned its
+  // entity means "no reading", which the wire renders as the zero vector.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  bots.dummy = { health: MAX_HEALTH, entity: null };
+  const handle = {
+    entity: {
+      position: { x: 0, y: 64, z: 5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 3, y: 3, z: 3 },
+      onGround: true,
+    },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  assert.equal(bots._snapshotOpponent(handle).velocity, null);
+  assert.deepEqual(zeroedWire(bots._snapshotOpponent(handle)).opponent.velocity, [0, 0, 0]);
 });
 
 test('the zeroed opponent block (no opponent at all) carries both fields', () => {
@@ -4451,4 +4700,227 @@ test('the zeroed opponent block (no opponent at all) carries both fields', () =>
 
   assert.equal(snapshot.on_ground, false);
   assert.equal(snapshot.held_item, '');
+});
+
+// ===========================================================================
+// THE FAIL-CLOSED LOADOUT PROBE (T3, AC9).
+//
+// The datapack now equips both fighters with an iron sword AND a full iron set,
+// and NEITHER of the two things that can go wrong there is visible to the
+// inventory half of the read-back gate:
+//
+//   * `bot.inventory.items()` covers slots 9-44 only (the window-0 descriptor
+//     declares `inventory: { start: 9, end: 44 }`,
+//     bridge/node_modules/prismarine-windows/index.js:11). Worn armor is 5-8,
+//     so four silently-failed `$item replace` lines still read back a perfect
+//     `['iron_sword']`.
+//   * Slot 40 is INSIDE that window, so a sword the bot owns but is not
+//     holding satisfies a membership check while every ATTACK lands a bare
+//     fist.
+//
+// Combined with the `$`-macro silent-abort hazard — one bad value voids the
+// WHOLE function at instantiation, with nothing in the boot log — a failed
+// equip would otherwise ack a perfectly normal-looking reset and both bots
+// would fight naked for the length of a run.
+//
+// So the templates carry `armor` and `heldItem`, `loadoutFailures` checks them
+// against slots 5-8 and the main hand, and the check lives INSIDE
+// readbackMatchesTemplate: the reset cannot reach ok:true without it, and
+// env/mc_pvp_env.py answers a second ok:false by raising rather than starting
+// an episode from an unverified world. Logging alone would not do — a silently
+// unarmored fleet trains the wrong game for a day.
+// ===========================================================================
+
+/** Run `fn` with console.error captured, and hand back the captured lines. */
+async function withCapturedErrors(fn) {
+  const lines = [];
+  const real = console.error;
+  console.error = (...args) => lines.push(args.join(' '));
+  try {
+    await fn();
+  } finally {
+    console.error = real;
+  }
+  return lines;
+}
+
+/**
+ * A bot-mode arena whose two bots are FULLY equipped unless a case says
+ * otherwise, with the datapack's beacons answered — so the only thing a case
+ * can be failing is the loadout it deliberately broke.
+ */
+function loadoutArena(sent, { learner = {}, dummy = {} } = {}) {
+  const arena = new ArenaBots({}, {
+    transport: { send: (msg) => sent.push(msg) },
+    readbackOptions: SINGLE_POLL_GATE,
+  });
+  arena.learner = liveBot('learner_bot', learner);
+  arena.dummy = liveBot('dummy_bot', { position: DUMMY_SPAWN, ...dummy });
+  arena.wireDamageEvents();
+  answerResetLikeTheServer(arena);
+  return arena;
+}
+
+test('worn armor is INVISIBLE to the inventory gate — this is why template.inventory stays [iron_sword]', () => {
+  // THE DOCUMENTATION TEST FOR A FIX THAT MUST NEVER BE MADE. Adding the four
+  // armor pieces to `template.inventory` looks like the obvious way to verify
+  // them and would hard-fail EVERY reset forever: sameItemSet demands an exact
+  // set match against `items()`, and `items()` can never contain worn armor.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  const bot = mockBot('learner_bot', { inventory: [IRON_WEAPON] });
+  const snap = snapshotBotState(bot);
+
+  assert.deepEqual(snap.inventory, ['iron_sword'], 'items() sees the sword and nothing else...');
+  assert.deepEqual(
+    snap.armor,
+    { head: 'iron_helmet', chest: 'iron_chestplate', legs: 'iron_leggings', feet: 'iron_boots' },
+    '...even though all four pieces ARE worn, in slots 5-8',
+  );
+  assert.equal(
+    readbackMatchesTemplate(snap, bots.resetTemplate),
+    true,
+    'the shipped template accepts a fully equipped bot',
+  );
+
+  const armorInInventory = {
+    ...bots.resetTemplate,
+    inventory: ['iron_sword', 'iron_helmet', 'iron_chestplate', 'iron_leggings', 'iron_boots'],
+  };
+  assert.equal(
+    readbackMatchesTemplate(snap, armorInInventory),
+    false,
+    'listing armor under `inventory` would reject a bot that is wearing all of it',
+  );
+});
+
+test('the shipped reset templates declare the whole loadout — the fail-closed property lives here', () => {
+  // `armor`/`heldItem` are template-driven and OPTIONAL in the pure predicate,
+  // so the ONLY thing making the gate fail closed is that both shipped defaults
+  // declare them. Dropping a key would be a silent fail-OPEN, which is exactly
+  // the shape of the bug this whole task exists to prevent.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+
+  for (const [name, template] of [
+    ['resetTemplate', bots.resetTemplate],
+    ['dummyResetTemplate', bots.dummyResetTemplate],
+  ]) {
+    assert.deepEqual(
+      template.armor,
+      { head: 'iron_helmet', chest: 'iron_chestplate', legs: 'iron_leggings', feet: 'iron_boots' },
+      `${name} must require all four armor slots`,
+    );
+    assert.equal(template.heldItem, 'iron_sword', `${name} must require a HELD iron sword`);
+    assert.deepEqual(
+      template.inventory,
+      ['iron_sword'],
+      `${name}.inventory must stay the one items()-visible item`,
+    );
+  }
+});
+
+test('a missing armor piece REFUSES the reset and the log names the piece AND the bot (AC9)', async () => {
+  // CONTROL FIRST: the identical arena, fully equipped, acks ok:true and sends
+  // the post-reset observation. Without this the cases below would prove only
+  // that something failed, not that the loadout is what failed.
+  const okSent = [];
+  await loadoutArena(okSent).handleReset({ type: 'reset', episode: 0, seed: 0 });
+  assert.equal(okSent.length, 2, 'ack + first observation');
+  assert.equal(okSent[0].ok, true);
+
+  // The DUMMY's chestplate never landed. Everything else about the reset is
+  // healthy — position, health, effects, the sword, both beacons.
+  const sent = [];
+  const errors = await withCapturedErrors(() =>
+    loadoutArena(sent, { dummy: { armor: { ...IRON_ARMOR_SET, chest: null } } }).handleReset({
+      type: 'reset',
+      episode: 0,
+      seed: 0,
+    }),
+  );
+
+  assert.equal(sent.length, 1, 'ok:false sends NO state — the episode never starts');
+  assert.equal(sent[0].type, 'reset_ack');
+  assert.equal(sent[0].ok, false, 'the reset is REFUSED, not merely logged');
+  assert.equal(
+    errors.filter((line) => line.includes('loadout_incomplete')).length,
+    1,
+    'exactly one loadout line per refused reset',
+  );
+  const named = errors.find((line) => line.includes('loadout_incomplete'));
+  assert.ok(named.startsWith('[bridge] pad 0 loadout_incomplete '), `greppable and pad-tagged: ${named}`);
+  assert.ok(
+    named.includes('dummy:chest=iron_chestplate(got nothing)'),
+    `the line must name the piece and the bot: ${named}`,
+  );
+  assert.equal(named.includes('learner:'), false, 'and must not accuse the bot that was fine');
+
+  // BOTH BOTS ARE COVERED, and the report is per-bot rather than "something is
+  // wrong somewhere". A run that lost its armor on one side only is the case
+  // worth telling apart.
+  const bothSent = [];
+  const bothErrors = await withCapturedErrors(() =>
+    loadoutArena(bothSent, {
+      learner: { armor: { ...IRON_ARMOR_SET, feet: null } },
+      dummy: { armor: { ...IRON_ARMOR_SET, head: 'leather_helmet' } },
+    }).handleReset({ type: 'reset', episode: 0, seed: 0 }),
+  );
+
+  assert.equal(bothSent[0].ok, false);
+  const bothNamed = bothErrors.find((line) => line.includes('loadout_incomplete'));
+  assert.ok(bothNamed.includes('learner:feet=iron_boots(got nothing)'), bothNamed);
+  assert.ok(
+    bothNamed.includes('dummy:head=iron_helmet(got leather_helmet)'),
+    `a WRONG piece is named with what was found instead: ${bothNamed}`,
+  );
+});
+
+test('a sword the bot OWNS but does not HOLD fails the gate — membership is not the check', async () => {
+  // The hazard a naive `inventory.includes('iron_sword')` probe would miss
+  // entirely. The sword sits in hotbar slot 40, which is inside items()'s 9-44
+  // window, so the inventory half of the gate is satisfied; `quickBarSlot` 0
+  // points at the empty slot 36, so the bot punches for a bare-fist hit while
+  // "having" a sword all episode.
+  const emptyMainHand = [null, null, null, null, IRON_WEAPON];
+  const probe = liveBot('learner_bot', { inventory: emptyMainHand });
+  const snap = snapshotBotState(probe);
+  assert.deepEqual(snap.inventory, ['iron_sword'], 'a membership check would have passed here');
+  assert.equal(snap.heldItem, '', 'but the main hand is empty');
+
+  const sent = [];
+  const errors = await withCapturedErrors(() =>
+    loadoutArena(sent, { learner: { inventory: emptyMainHand } }).handleReset({
+      type: 'reset',
+      episode: 0,
+      seed: 0,
+    }),
+  );
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].ok, false, 'an unarmed learner must not be allowed to start an episode');
+  const named = errors.find((line) => line.includes('loadout_incomplete'));
+  assert.ok(named.includes('learner:held=iron_sword(got nothing)'), named);
+  assert.equal(named.includes('learner:head='), false, 'the armor was fine and is not named');
+});
+
+test('loadoutFailures reports nothing when complete, everything when nothing was read back', () => {
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  const complete = snapshotBotState(mockBot('learner_bot', { inventory: [IRON_WEAPON] }));
+
+  assert.deepEqual(loadoutFailures(complete, bots.resetTemplate), []);
+
+  // The gate timed out having observed nothing at all: every required piece is
+  // named, head to feet then the held weapon, so the operator sees the whole
+  // template rather than whichever field happened to be checked first.
+  assert.deepEqual(loadoutFailures(null, bots.resetTemplate), [
+    'head=iron_helmet(got nothing)',
+    'chest=iron_chestplate(got nothing)',
+    'legs=iron_leggings(got nothing)',
+    'feet=iron_boots(got nothing)',
+    'held=iron_sword(got nothing)',
+  ]);
+
+  // A template that declares neither half requires neither — that is what keeps
+  // the pure predicate usable with the pre-loadout templates transport.test.js
+  // builds, and it is precisely why the shipped-defaults test above exists.
+  assert.deepEqual(loadoutFailures(complete, { health: 20, inventory: [] }), []);
 });

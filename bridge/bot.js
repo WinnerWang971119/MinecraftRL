@@ -139,6 +139,77 @@ const DEFAULT_READBACK = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
+// THE IRON LOADOUT, AND WHY THE INVENTORY GATE CANNOT SEE HALF OF IT (T3, #33).
+//
+// Both fighters are now regeared by the datapack with an iron sword AND a full
+// iron set: spawn_learner_pad.mcfunction and spawn_dummy_pad.mcfunction each
+// end their re-gear block with one `$give ... iron_sword` and four
+// `$item replace entity $(...) armor.<slot> with minecraft:iron_*` lines.
+//
+// The gate's `inventory` check reads `bot.inventory.items()`, and that call
+// covers slots 9-44 ONLY: the window descriptor mineflayer creates for window 0
+// declares `inventory: { start: 9, end: 44 }`
+// (bridge/node_modules/prismarine-windows/index.js:11). Worn armor lives in
+// slots 5-8 and the main hand is slot 36 + quickBarSlot, so:
+//
+//   * ARMOR IS INVISIBLE to `items()`. A bot whose four `$item replace` lines
+//     silently did nothing still reads back a perfect `['iron_sword']`.
+//   * "HOLDING a sword" IS NOT "OWNING a sword". Slot 40 is inside the 9-44
+//     window, so a sword parked there satisfies the inventory check while
+//     `quickBarSlot` points at an empty slot 36 and every ATTACK lands a
+//     bare-fist hit.
+//
+// WHERE THE `$give` ACTUALLY LANDS, from the pinned jar rather than from
+// memory. `javap -p -c` on paper-1.21.1.jar reads Inventory.getFreeSlot() as
+// "first index of `items` whose stack isEmpty" — and `$give` only reaches it
+// after failing to stack onto an existing partial stack, of which the `$clear`
+// earlier in the same function leaves none, so it returns 0. It reads
+// Inventory.isHotbarSlot(i) as `0 <= i < 9`, and
+// InventoryMenu's constructor as adding, in order, the result slot (0), the
+// 2x2 craft grid (1-4), four ArmorSlots (5-8), the three 9-wide rows at
+// `items` index + 9 (9-35), and finally nine hotbar slots at `items` index
+// itself (36-44). So a regeared sword is at container slot 36 — hotbar index 0
+// — which is what makes the main-hand check meaningful rather than tautological.
+//
+// Both matter because a `$`-macro function that hits ONE bad value aborts in
+// FULL, at instantiation, with nothing in the boot log (see the macro-contract
+// notes above formatResetPadCommand). Without the checks below a failed equip
+// would ack a normal-looking reset and both bots would fight naked for the
+// length of a run, with clean logs.
+//
+// So the reset template carries an `armor` map and a `heldItem` string
+// alongside `inventory`, and `loadoutFailures` checks them by reading slots 5-8
+// and the main hand directly. See snapshotBotState for why the bot's OWN
+// connection is the source rather than a `/data get entity` console round trip.
+// ---------------------------------------------------------------------------
+
+/** The four armor pieces, head->feet — the order failures are reported in. */
+const ARMOR_PIECES = Object.freeze(['head', 'chest', 'legs', 'feet']);
+
+/**
+ * Window-0 slot index of each armor piece. Mirrors mineflayer's own map
+ * (`armorSlots` in node_modules/mineflayer/lib/plugins/simple_inventory.js:11,
+ * whose `torso` is spelled `chest` here to match the datapack's `armor.chest`).
+ */
+const ARMOR_SLOT_INDEX = Object.freeze({ head: 5, chest: 6, legs: 7, feet: 8 });
+
+/** The item that must be IN THE MAIN HAND — not merely somewhere in the bag. */
+const IRON_WEAPON = 'iron_sword';
+
+/**
+ * The four worn pieces the pad functions apply, keyed by ARMOR_PIECES. Mirrors
+ * the `$item replace entity $(...) armor.<slot> with minecraft:<item>` lines in
+ * both spawn_*_pad.mcfunction files; a drift between the two is exactly what
+ * the loadout half of the gate exists to catch.
+ */
+const IRON_ARMOR_SET = Object.freeze({
+  head: 'iron_helmet',
+  chest: 'iron_chestplate',
+  legs: 'iron_leggings',
+  feet: 'iron_boots',
+});
+
+// ---------------------------------------------------------------------------
 // OPPONENT SOURCE (T1). The bridge has exactly two kinds of opponent:
 //
 //   'bot'   — this pad's dummy Mineflayer bot (the training path). It has its
@@ -916,13 +987,23 @@ function formatAttributeGetCommand(dummyUsername, attribute) {
 // readback shape (free-form by contract, but the gate reads these fields):
 //   { health: number,
 //     position: {x,y,z},
-//     inventory: string[]   // sorted item identifiers actually present
+//     inventory: string[]   // item identifiers present in slots 9-44
+//     armor: {head,chest,legs,feet}  // worn item id per slot, null if empty
+//     heldItem: string      // MAIN-HAND item id, "" when the hand is empty
 //     effects: string[] }   // active effect identifiers (empty == cleared)
 // template shape:
 //   { health: number,
 //     position: {x,y,z},
-//     inventory: string[]   // required gear, identifiers
+//     inventory: string[]   // required gear visible to items(), identifiers
+//     armor: {head,chest,legs,feet}  // required worn ids; OPTIONAL (see below)
+//     heldItem: string      // required MAIN-HAND id; OPTIONAL (see below)
 //     requireNoEffects: boolean }
+//
+// `armor`/`heldItem` are TEMPLATE-DRIVEN and optional: a template declaring
+// neither requires neither, which is what keeps the pure predicate usable with
+// the pre-loadout templates its own unit tests build. Both shipped templates
+// (ArenaBots.resetTemplate / .dummyResetTemplate) DO declare them, and a test
+// pins that so the fail-closed property cannot be lost by editing a default.
 // ---------------------------------------------------------------------------
 
 /**
@@ -958,6 +1039,15 @@ function readbackMatchesTemplate(readback, template, tol = {}) {
   // Inventory: the regeared gear must match the template set exactly (no missing
   // gear, no leftover items from the previous episode). Order-independent.
   if (!sameItemSet(readback.inventory, template.inventory)) {
+    return false;
+  }
+
+  // THE LOADOUT HALF (T3, AC9): worn armor and the MAIN-HAND weapon, neither of
+  // which the check above can see — see THE IRON LOADOUT block above. Folded
+  // into the gate rather than bolted on after it so it is POLLED: the armor
+  // packets land asynchronously, exactly like the `/give` the inventory check
+  // already waits out, and a one-shot read after the gates would be racing them.
+  if (loadoutFailures(readback, template).length !== 0) {
     return false;
   }
 
@@ -1017,6 +1107,56 @@ function sameItemSet(actual, expected) {
     }
   }
   return true;
+}
+
+/**
+ * PURE: name every loadout piece the template REQUIRES and the read-back does
+ * not confirm. Empty result == fully equipped.
+ *
+ * Reported strings are machine-greppable and self-describing —
+ * `chest=iron_chestplate(got nothing)`, `held=iron_sword(got wooden_sword)` —
+ * because the console line they end up on is the only evidence an operator gets
+ * that a datapack macro aborted, and "the reset failed" alone does not say
+ * which of the five pieces went missing on which bot.
+ *
+ * A null/undefined read-back (the gate timed out before observing anything) is
+ * treated as confirming nothing, so every required piece is named.
+ *
+ * @param {object|null|undefined} readback A snapshotBotState() output, or null.
+ * @param {object} template The reset template; `armor`/`heldItem` optional.
+ * @returns {string[]} One entry per unconfirmed piece, head->feet then held.
+ */
+function loadoutFailures(readback, template) {
+  const spec = template === null || typeof template !== 'object' ? {} : template;
+  const observed = readback === null || typeof readback !== 'object' ? {} : readback;
+  const failures = [];
+
+  const requiredArmor = spec.armor;
+  if (requiredArmor !== null && typeof requiredArmor === 'object') {
+    const worn =
+      observed.armor !== null && typeof observed.armor === 'object' ? observed.armor : {};
+    for (const piece of ARMOR_PIECES) {
+      const required = requiredArmor[piece];
+      // A piece the template does not name is not required — the template is
+      // the contract, and a partial one must not be silently widened here.
+      if (typeof required !== 'string' || required.length === 0) {
+        continue;
+      }
+      const actual = typeof worn[piece] === 'string' ? worn[piece] : '';
+      if (actual !== required) {
+        failures.push(`${piece}=${required}(got ${actual === '' ? 'nothing' : actual})`);
+      }
+    }
+  }
+
+  if (typeof spec.heldItem === 'string' && spec.heldItem.length > 0) {
+    const held = typeof observed.heldItem === 'string' ? observed.heldItem : '';
+    if (held !== spec.heldItem) {
+      failures.push(`held=${spec.heldItem}(got ${held === '' ? 'nothing' : held})`);
+    }
+  }
+
+  return failures;
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,8 +1376,10 @@ function buildEventsBlock(agg) {
  *   on_ground, health, held_item, attack_cooldown}; yaw/pitch protocol-convention.
  * @param {object} parts.opponent Raw opponent snapshot {pos, yaw, pitch,
  *   velocity, on_ground, health, held_item} (health is PRIVILEGED — reward-only
- *   downstream); yaw/pitch protocol-convention. `on_ground`/`held_item` come
- *   from the opponent's OWN connection upstream — see `_snapshotOpponent`.
+ *   downstream); yaw/pitch protocol-convention. `velocity`, `on_ground` and
+ *   `held_item` all come from the opponent's OWN connection upstream — see
+ *   `_snapshotOpponent`. `pos`/`yaw`/`pitch` come from the handle, which real
+ *   broadcast packets do keep current for another player.
  * @param {object} parts.events Drained EventAggregator block.
  * @param {number[]} parts.wallDistances Arena wall-distance probe (fixed order).
  * @param {number} parts.tick End-of-window server tick (>= 0 integer).
@@ -1311,12 +1453,71 @@ function resolveCodeVersion() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Read the four WORN armor pieces off a bot's OWN connection (LIVE).
+ *
+ * WHY THE OWN CONNECTION AND NOT A `/data get entity <name>` CONSOLE ROUND
+ * TRIP. Both are server-authoritative, and this one is worth justifying rather
+ * than assuming. `bot.inventory.slots` is filled from the server's own
+ * `window_items` / `set_slot` packets for window 0 (mineflayer's
+ * lib/plugins/inventory.js:746 and :729). Mineflayer does also write those
+ * slots CLIENT-side, but only while performing a client action — a window
+ * click (prismarine-windows' Window.acceptClick), a craft, a book edit — and
+ * this bridge performs none of them: it never calls clickWindow, equip,
+ * craft or setQuickBarSlot (grep bridge/*.js). So no local prediction can
+ * exist here to agree with a failed equip; every value read below arrived from
+ * the server.
+ *
+ * A `/data get` would instead add a chat round trip whose reply has to be
+ * parsed out of a translated ChatMessage and given its own timeout budget (see
+ * _confirmAttributeOverrides for how much machinery that is), and it would
+ * resolve AFTER the gates rather than being polled BY them — which matters,
+ * because the equip lands asynchronously and the gate is the thing that waits.
+ * The own-connection read is cheaper for the same authority.
+ *
+ * NOTE the asymmetry with `_snapshotOpponent`: this is only ever called on a
+ * bot whose connection we hold, which is the same single-source rule that
+ * block enforces — never a cross-client read of another player's slots.
+ *
+ * @param {object} bot A Mineflayer bot (or a mock exposing the same shape).
+ * @returns {{head:string|null, chest:string|null, legs:string|null, feet:string|null}}
+ */
+function readArmorSlots(bot) {
+  const slots =
+    bot && bot.inventory !== null && typeof bot.inventory === 'object' && Array.isArray(bot.inventory.slots)
+      ? bot.inventory.slots
+      : null;
+  const worn = {};
+  for (const piece of ARMOR_PIECES) {
+    const item = slots === null ? null : slots[ARMOR_SLOT_INDEX[piece]];
+    worn[piece] = item && typeof item.name === 'string' ? item.name : null;
+  }
+  return worn;
+}
+
+/**
+ * Held-item identifier string, or "" when the hand is empty / the bot is not
+ * ready. Mineflayer's `heldItem` is a getter over
+ * `inventory.slots[QUICK_BAR_START + quickBarSlot]` (lib/plugins/inventory.js:49),
+ * so this reports what is ACTUALLY in the main hand, not what the bot owns.
+ *
+ * @param {object|null} bot A Mineflayer bot (or a mock exposing `heldItem`).
+ * @returns {string}
+ */
+function heldItemName(bot) {
+  if (bot && bot.heldItem && typeof bot.heldItem.name === 'string') {
+    return bot.heldItem.name;
+  }
+  return '';
+}
+
+/**
  * Snapshot the fields the read-back gate inspects from a (live or mock) bot.
  * Tolerant of a not-yet-populated bot (returns null fields) so a poll before
  * spawn simply fails the gate rather than throwing.
  *
  * @param {object} bot A Mineflayer bot (or a mock exposing the same shape).
- * @returns {{health:number|null, position:{x,y,z}|null, inventory:string[], effects:string[]}}
+ * @returns {{health:number|null, position:{x,y,z}|null, inventory:string[],
+ *   armor:{head,chest,legs,feet}, heldItem:string, effects:string[]}}
  */
 function snapshotBotState(bot) {
   const position =
@@ -1344,6 +1545,12 @@ function snapshotBotState(bot) {
     health: bot && typeof bot.health === 'number' ? bot.health : null,
     position,
     inventory,
+    // THE TWO FIELDS items() CANNOT SEE (T3) — worn armor (slots 5-8) and what
+    // is actually in the main hand. Both ride in the reset_ack `readback`,
+    // whose schema is free-form by design (schema.json "reset_ack"), so adding
+    // them changes no validator.
+    armor: readArmorSlots(bot),
+    heldItem: heldItemName(bot),
     effects,
   };
 }
@@ -1570,31 +1777,49 @@ class ArenaBots {
     // The reset template the read-back gate checks against — the bridge's
     // independent VERIFICATION of what the datapack's arena:reset_pad macro
     // APPLIES. It must mirror server/arena/.../spawn_learner_pad.mcfunction:
-    // learner feet at (anchor+0.5, 64, anchor+0.5) holding exactly one iron
-    // sword, healed, with no active effects. At anchor (0,0) this is the same
-    // literal template as before the pad topology existed (AC11).
+    // learner feet at (anchor+0.5, 64, anchor+0.5) HOLDING one iron sword and
+    // WEARING the full iron set, healed, with no active effects. At anchor
+    // (0,0) the position/health/inventory half is the same literal template as
+    // before the pad topology existed (AC11).
+    //
+    // `inventory` STAYS `['iron_sword']` and must not gain the armor pieces:
+    // items() reads slots 9-44 and worn armor is 5-8, so listing armor there
+    // would make sameItemSet demand four items the window can never contain and
+    // hard-fail EVERY reset. The armor is verified by `armor` below instead.
     this.resetTemplate =
       deps.resetTemplate ||
       Object.freeze({
         health: MAX_HEALTH,
         position: { x: this.padOrigin.x + 0.5, y: 64.0, z: this.padOrigin.z + 0.5 },
-        inventory: ['iron_sword'],
+        inventory: [IRON_WEAPON],
+        armor: IRON_ARMOR_SET,
+        heldItem: IRON_WEAPON,
         requireNoEffects: true,
       });
 
     // The DUMMY's read-back template. Same footprint as the learner's, offset
-    // +3 on x (spawn_dummy_pad parks it at anchor+3.5), but with an EMPTY
-    // inventory: the datapack declares the dummy "a passive target, no weapon"
-    // and only ever /clear-s it. The bridge used to arm the dummy with an iron
-    // sword itself and then expect to read one back; with the datapack as the
-    // sole reset authority nothing gives it a sword, so expecting one here
-    // would hard-fail this gate on EVERY reset and burn the full 3 s timeout.
-    // The datapack owns the template; this mirrors it.
+    // +3 on x (spawn_dummy_pad parks it at anchor+3.5), and — since the M4 iron
+    // loadout (#33) — the SAME gear: one held iron sword plus the full iron set.
+    //
+    // RETRACTED, AND THE RETRACTION IS THE POINT. This template was `[]`, under
+    // a comment that read "the datapack declares the dummy a passive target, no
+    // weapon". That was true of the datapack until T2, which added
+    // `$give $(dummy) minecraft:iron_sword 1` to spawn_dummy_pad.mcfunction.
+    // A sword lands in container slot 36, inside items()'s 9-44 window, so an
+    // empty template here makes sameItemSet reject EVERY dummy read-back and
+    // burn the full 3 s gate timeout on every reset. The datapack still owns
+    // the template; this still mirrors it — the datapack simply changed.
+    //
+    // Arming the opponent is not cosmetic. The M4 plan's own arithmetic for a
+    // bare fist against full iron is ~0.4 HP a punch — roughly 50 connected
+    // hits to kill — so within one 600-step episode nothing would terminate and
+    // every self-play match would be scored a draw.
     //
     // THE GATE VERIFIES LESS THAN THE DATAPACK APPLIES. Health, position,
-    // inventory and active effects are checked; food, saturation and the
-    // knockback/movement attributes are NOT observable through mineflayer's own
-    // connection in the same way and are not checked here. A passing gate means
+    // inventory, worn armor, the main-hand item and active effects are checked;
+    // food, saturation and the knockback/movement attributes are NOT observable
+    // through mineflayer's own connection in the same way and are not checked
+    // here (the attributes get their own `base get` read-back). A passing gate means
     // "the observable template matched", not "the full template was applied" —
     // the causality beacon covers the did-it-run half, and AC18's live 20-
     // episode stationarity check remains the real backstop for the rest.
@@ -1607,7 +1832,9 @@ class ArenaBots {
           y: this.resetTemplate.position.y,
           z: this.resetTemplate.position.z,
         },
-        inventory: [],
+        inventory: [IRON_WEAPON],
+        armor: IRON_ARMOR_SET,
+        heldItem: IRON_WEAPON,
         requireNoEffects: this.resetTemplate.requireNoEffects,
       });
 
@@ -2939,6 +3166,39 @@ class ArenaBots {
       );
     }
 
+    // THE LOADOUT REPORT (T3, AC9). The gate has already REFUSED this reset —
+    // loadoutFailures is part of readbackMatchesTemplate, so an unequipped bot
+    // cannot reach ok:true, and the env answers ok:false by retrying once and
+    // then raising BridgeError (env/mc_pvp_env.py, "an episode from an
+    // unverified state"). That is the fail-closed half, and it is structural.
+    //
+    // This line is the DIAGNOSTIC half: without it, a fleet that quietly lost
+    // its `$item replace` lines reports the same generic gate timeout as a bot
+    // that landed a block off its spawn, and the operator has no way to tell
+    // an aborted macro from a slow teleport. Naming the piece and the bot is
+    // the difference between a five-minute fix and a wasted training window.
+    //
+    // Computed only for a FAILED gate: a matched gate has already proven the
+    // whole loadout, so there is nothing to report. In 'human' mode the dummy
+    // gate resolves ok:true vacuously (there is no second connection to read),
+    // so the dummy branch cannot fire there.
+    const loadoutMissing = [];
+    for (const failure of result.ok ? [] : loadoutFailures(result.readback, this.resetTemplate)) {
+      loadoutMissing.push(`learner:${failure}`);
+    }
+    for (const failure of dummyResult.ok
+      ? []
+      : loadoutFailures(dummyResult.readback, this.dummyResetTemplate)) {
+      loadoutMissing.push(`dummy:${failure}`);
+    }
+    if (loadoutMissing.length > 0) {
+      console.error(
+        `[bridge] pad ${this.padIndex} loadout_incomplete ${loadoutMissing.join(' ')} ` +
+          '— reset REFUSED (ok:false); arena:spawn_learner_pad / arena:spawn_dummy_pad ' +
+          'may have aborted at instantiation, which the server log does not record',
+      );
+    }
+
     // PER-OPPONENT MOBILITY OVERRIDE (T11c). Gated on `confirmed`, not merely
     // on the position/health read-back gates: `confirmed` requires the
     // dummy's OWN beacon (spawn_dummy_pad.mcfunction's last line) to have
@@ -4211,12 +4471,50 @@ class ArenaBots {
     // entity_equipment broadcasts, but the field's only consumer is the
     // self-play mirror, which seats bot opponents only, so the single-source
     // rule stands and nothing is lost.
+    //
+    // PROVENANCE FOR `velocity` — THE SAME RULE, AND IT WAS BEING BROKEN (T20).
+    // This field used to be read from `entity`, the handle resolved through the
+    // LEARNER's client, and on the pinned protocol that is very nearly a
+    // constant. Exactly THREE handlers in mineflayer 4.37.1 write a non-self
+    // `entity.velocity` (node_modules/mineflayer/lib/plugins/entities.js), and
+    // on the version this bridge pins — `version: '1.21.1'` in
+    // DEFAULT_BOT_CONFIG above — only one of them can ever fire:
+    //   :281 `entity_velocity` — fires, but the server sends it on abrupt
+    //        momentum changes (knockback, explosions), NOT per tick;
+    //   :351 `sync_entity_position` — the merged 1.21.3 packet, dead here;
+    //   :275 `spawn_entity_living` — mineflayer's own comment one line above it
+    //        says the packet was removed in 1.19 and merged into
+    //        `spawn_entity`, which sets no velocity at all. Dead here too.
+    // Ordinary walking arrives as `rel_entity_move` (:301) and
+    // `entity_move_look` (:320), and both TRANSLATE `entity.position` while
+    // leaving velocity untouched.
+    //
+    // So for a walking opponent the handle's velocity was a stale knockback
+    // impulse that never decays, or a zero — and `opp_vel_local` has never
+    // carried opponent motion. Same defect class as `damage_dealt` and as
+    // `on_ground` above.
+    //
+    // CORRECTION TO THE M4 PLAN, which calls that field "obs 14-16". It is
+    // indices 16-18: env/observation_spec.py's layout puts opp_facing_sin at
+    // 14 and opp_facing_cos at 15, and FIELD_SLICES['opp_vel_local'] is
+    // slice(16, 19). Three of the 23 features either way.
+    //
+    // The opponent's OWN connection is a real reading: prismarine-physics
+    // writes `bot.entity.velocity` for the SELF entity every simulated tick
+    // (node_modules/prismarine-physics/index.js:856, PlayerState.apply).
+    //
+    // A HUMAN challenger has no connection, so there is no reading and this
+    // emits the zero vector — assembleStateMsg's toVec3(null) — alongside the
+    // no-reading `health` 0, `on_ground` false and `held_item` "" this block
+    // already carries in that state. Deliberately NOT the handle view: a
+    // fabricated value is worse than an absent one, which is the lesson the
+    // rest of this block is written from.
     const ownEntity = bot !== null && bot.entity ? bot.entity : null;
     return {
       pos: entity ? entity.position : null,
       yaw: entity ? toProtocolYaw(entity.yaw) : 0,
       pitch: entity ? toProtocolPitch(entity.pitch) : 0,
-      velocity: entity ? entity.velocity : null,
+      velocity: ownEntity ? ownEntity.velocity : null,
       on_ground: ownEntity ? Boolean(ownEntity.onGround) : false,
       // PRIVILEGED raw true health — reward-only downstream, never the obs.
       health: bot && typeof bot.health === 'number' ? bot.health : 0,
@@ -4226,12 +4524,13 @@ class ArenaBots {
     };
   }
 
-  /** Held-item identifier string, or "" when the hand is empty / bot not ready. */
+  /**
+   * Held-item identifier string, or "" when the hand is empty / bot not ready.
+   * Delegates to the module-level reader so the wire producer and the reset
+   * gate's loadout check can never disagree about what "held" means.
+   */
   _heldItemName(bot) {
-    if (bot && bot.heldItem && typeof bot.heldItem.name === 'string') {
-      return bot.heldItem.name;
-    }
-    return '';
+    return heldItemName(bot);
   }
 
   /** Arena wall-distance probe (LIVE raycast). Empty until T8 wires the geometry. */
@@ -4354,6 +4653,13 @@ module.exports = {
   formatAttributeGetCommand,
   formatResetConfirmation,
   readbackMatchesTemplate,
+  loadoutFailures,
+  readArmorSlots,
+  heldItemName,
+  ARMOR_PIECES,
+  ARMOR_SLOT_INDEX,
+  IRON_ARMOR_SET,
+  IRON_WEAPON,
   computeAttackCooldown,
   snapshotBotState,
   normalizeYaw,
