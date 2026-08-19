@@ -1,4 +1,4 @@
-"""test_selfplay_driver — the frozen past-self opponent and its wiring (T10, M4).
+"""test_selfplay_driver — the frozen past-self opponent and its wiring (T10/T11b, M4).
 
 Every pin here exists because the corresponding failure is SILENT: the run keeps
 going, every log line still says ``selfplay``, and the only symptom is an Elo
@@ -27,6 +27,22 @@ curve that means nothing when somebody reads it the next morning.
   receive an ``OpponentView``, and a dummy step line must still carry no
   ``opp_action`` at all.
 
+T11b adds the CLI half of the same story, where the failures are quieter still:
+
+* **``--reference-promote-grad-steps`` arriving as a LIST.** ``argparse``
+  ``nargs=2`` yields one, ``TrainConfig`` rejects one, and the reason it rejects
+  one is that a list field makes ``hash(cfg)`` raise somewhere unrelated.
+* **A warm start that is not the checkpoint the run was sized against** (AC14).
+  It loads cleanly into the same architecture, and snapshot 0 — the pinned
+  reference both Elo series are measured against — is seeded from it.
+* **Two runs sharing one pool of past selves.** The pool directory is derived
+  from ``--run-name``; unset, every run resolves to ``runs/selfplay/snapshots``
+  and a second run silently resumes the first one's snapshots and Elo series.
+* **The middle hop of the mirror chain.** ``_eval_via_designated_arena`` forwards
+  ``mirror_opponent`` to ``_eval_against_opponent``; every OTHER test of the eval
+  path monkeypatches that function out, so without the pin here the forwarding
+  line can be deleted with a fully green suite.
+
 House conventions: no sockets, no live server, no Minecraft — every bridge and
 every pad here is a fake, and torch is optional via ``pytest.importorskip``.
 """
@@ -34,6 +50,9 @@ every pad here is a fake, and torch is optional via ``pytest.importorskip``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import os
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -1378,3 +1397,642 @@ class TestTheSnapshotSeedRoles:
             for role in _OPPONENT_ROLES
         ]
         assert len(set(seeds)) == len(seeds)
+
+
+# ===========================================================================
+# T11b — the CLI: choices, casts, the checksum gate, the run's own record.
+# ===========================================================================
+
+#: A ``--warm-start`` value for tests that never open the file. ``TrainConfig``
+#: validates only that the path is a non-empty string, and nothing on the
+#: config-building path reads the bytes — the checksum gate below is the one
+#: place that does, and it is a no-op without ``--warm-start-sha256``.
+_UNREAD_WARM_START = "runs/never-opened-by-this-test.pt"
+
+
+def _parse(argv: List[str]):
+    """Parse ``argv`` with the REAL training parser."""
+    from agent.train import _build_parser
+
+    return _build_parser().parse_args(argv)
+
+
+def _cli_cfg(argv: List[str]) -> TrainConfig:
+    """Build the run's config exactly as ``main()`` does, from the real parser."""
+    from agent.train import _config_from_args
+
+    return _config_from_args(_parse(argv))
+
+
+def _selfplay_argv(warm_start: str, *extra: str) -> List[str]:
+    """The smallest argv that parses into a valid self-play config."""
+    return [
+        "--arenas", "2",
+        "--opponent", "selfplay",
+        "--warm-start", str(warm_start),
+        *extra,
+    ]
+
+
+def _sha256_of(path) -> str:
+    """The digest ``--warm-start-sha256`` is compared against."""
+    digest = hashlib.sha256()
+    with open(str(path), "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class TestTheOpponentFlagAcceptsSelfPlay:
+    """``--opponent selfplay`` has to be spellable before anything else matters."""
+
+    def test_every_config_choice_is_reachable_from_the_cli(self):
+        pytest.importorskip("torch")
+        from agent.train_config import _OPPONENT_CHOICES
+
+        # A choice TrainConfig accepts but argparse rejects is a mode nobody can
+        # run; the reverse (argparse accepts, TrainConfig rejects) fails in
+        # `_config_from_args` below. Both directions are covered here.
+        for choice in sorted(_OPPONENT_CHOICES):
+            assert _parse(["--opponent", choice]).opponent == choice
+
+    def test_an_unknown_opponent_is_still_refused(self):
+        pytest.importorskip("torch")
+
+        with pytest.raises(SystemExit):
+            _parse(["--opponent", "shadowboxing"])
+
+    def test_the_default_is_still_the_dummy(self):
+        pytest.importorskip("torch")
+
+        assert _parse([]).opponent == "dummy"
+
+    def test_the_choice_reaches_the_config(self):
+        pytest.importorskip("torch")
+
+        assert _cli_cfg(_selfplay_argv(_UNREAD_WARM_START)).opponent == "selfplay"
+
+
+class TestTheSelfPlayFlagsReachTheConfig:
+    """Every knob defaults to ``None`` so ``TrainConfig`` owns the defaults."""
+
+    def test_omitted_flags_keep_the_dataclass_defaults(self):
+        pytest.importorskip("torch")
+
+        cfg = _cli_cfg(_selfplay_argv(_UNREAD_WARM_START))
+        default = TrainConfig()
+
+        assert cfg.snapshot_every_grad_steps == default.snapshot_every_grad_steps
+        assert cfg.snapshot_sampling == default.snapshot_sampling
+        assert cfg.opponent_epsilon == default.opponent_epsilon
+        assert cfg.reference_promote_grad_steps == (
+            default.reference_promote_grad_steps
+        )
+        assert cfg.elo_k == default.elo_k
+        assert cfg.elo_initial == default.elo_initial
+        assert cfg.warm_start_sha256 is None
+
+    def test_every_flag_overrides_its_field(self):
+        pytest.importorskip("torch")
+
+        digest = "a" * 64
+        cfg = _cli_cfg(
+            _selfplay_argv(
+                _UNREAD_WARM_START,
+                "--snapshot-every-grad-steps", "250",
+                "--snapshot-sampling", "uniform",
+                "--opponent-epsilon", "0.05",
+                "--reference-promote-grad-steps", "300", "900",
+                "--elo-k", "16",
+                "--elo-initial", "1200",
+                "--warm-start-sha256", digest,
+            )
+        )
+
+        assert cfg.snapshot_every_grad_steps == 250
+        assert cfg.snapshot_sampling == "uniform"
+        assert cfg.opponent_epsilon == pytest.approx(0.05)
+        assert cfg.reference_promote_grad_steps == (300, 900)
+        assert cfg.elo_k == pytest.approx(16.0)
+        assert cfg.elo_initial == pytest.approx(1200.0)
+        assert cfg.warm_start_sha256 == digest
+
+    def test_the_promote_steps_arrive_as_a_tuple_not_a_list(self):
+        """THE trap on this path, and the reason the cast is ``tuple``.
+
+        ``argparse`` ``nargs=2`` hands over a LIST. ``TrainConfig`` rejects a
+        non-tuple outright — because a list field on a frozen dataclass makes
+        ``hash(cfg)`` raise at whatever unrelated call site hashes the config
+        first, arbitrarily far from the CLI that produced it.
+        """
+        pytest.importorskip("torch")
+        from agent.train import _config_from_args
+
+        args = _parse(
+            _selfplay_argv(
+                _UNREAD_WARM_START, "--reference-promote-grad-steps", "300", "900"
+            )
+        )
+        assert isinstance(args.reference_promote_grad_steps, list), (
+            "argparse no longer yields a list for nargs=2; this test exists to "
+            "pin the list -> tuple cast that fact requires"
+        )
+
+        cfg = _config_from_args(args)
+
+        assert isinstance(cfg.reference_promote_grad_steps, tuple)
+        assert cfg.reference_promote_grad_steps == (300, 900)
+        assert all(
+            isinstance(step, int) for step in cfg.reference_promote_grad_steps
+        ), "T18 promotes on `grad_step == step`, an equality against an int counter"
+        # The consequence the tuple is FOR: the frozen config stays hashable.
+        assert isinstance(hash(cfg), int)
+
+    def test_an_out_of_order_pair_is_still_refused(self):
+        pytest.importorskip("torch")
+
+        with pytest.raises(ValueError, match="strictly increasing"):
+            _cli_cfg(
+                _selfplay_argv(
+                    _UNREAD_WARM_START,
+                    "--reference-promote-grad-steps", "900", "300",
+                )
+            )
+
+    def test_an_unknown_sampling_mode_is_refused_by_argparse(self):
+        pytest.importorskip("torch")
+
+        with pytest.raises(SystemExit):
+            _parse(_selfplay_argv(_UNREAD_WARM_START, "--snapshot-sampling", "elo"))
+
+    def test_a_selfplay_run_does_not_stop_on_the_m2_gate(self):
+        """The M2 gate scores the STATIONARY dummy; it is not self-play's finish.
+
+        A warm-started agent can clear it in its first eval, which would end a
+        24-hour self-play run minutes in on a verdict about a different opponent.
+        """
+        pytest.importorskip("torch")
+        from agent.train import _resolve_stop_on_pass
+
+        cfg = _cli_cfg(_selfplay_argv(_UNREAD_WARM_START))
+
+        assert _resolve_stop_on_pass(None, cfg) is False
+        # An explicit flag still wins, on this path as on every other.
+        assert _resolve_stop_on_pass(True, cfg) is True
+
+
+class TestTheWarmStartChecksumGate:
+    """AC14's second half: the bytes on disk, not just the shape of the digest.
+
+    ``TrainConfig`` validates that ``warm_start_sha256`` LOOKS like a SHA-256 and
+    never opens the file. A self-play run seeds snapshot 0 — the pool's first
+    PINNED member, never dropped and never evicted — entirely from that file, and
+    a stale path or the wrong run's checkpoint loads perfectly cleanly into the
+    same architecture. The night then runs against a permanent reference opponent
+    nobody can identify afterwards.
+    """
+
+    def test_a_matching_checksum_is_accepted(self, tmp_path):
+        pytest.importorskip("torch")
+        from agent.train import _verify_warm_start_checksum
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _cli_cfg(
+            _selfplay_argv(warm, "--warm-start-sha256", _sha256_of(warm))
+        )
+
+        assert _verify_warm_start_checksum(cfg) is None
+
+    def test_a_mismatch_names_both_digests(self, tmp_path):
+        pytest.importorskip("torch")
+        from agent.train import _verify_warm_start_checksum
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        actual = _sha256_of(warm)
+        expected = "b" * 64
+        cfg = _cli_cfg(_selfplay_argv(warm, "--warm-start-sha256", expected))
+
+        with pytest.raises(ValueError) as excinfo:
+            _verify_warm_start_checksum(cfg)
+
+        message = str(excinfo.value)
+        # BOTH, because "checksum mismatch" alone cannot tell an operator whether
+        # they pasted the wrong checksum or aimed at the wrong checkpoint.
+        assert actual in message
+        assert expected in message
+        assert str(warm) in message
+
+    def test_a_changed_file_stops_matching(self, tmp_path):
+        """The gate reads the FILE, not a cached or config-level value."""
+        pytest.importorskip("torch")
+        from agent.train import _verify_warm_start_checksum
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        cfg = _cli_cfg(
+            _selfplay_argv(warm, "--warm-start-sha256", _sha256_of(warm))
+        )
+        _verify_warm_start_checksum(cfg)
+
+        # Same path, different bytes: exactly the swapped-checkpoint case.
+        _write_constant_action_checkpoint(tmp_path / "warm.pt", Macro.JUMP)
+
+        with pytest.raises(ValueError, match="checksum MISMATCH"):
+            _verify_warm_start_checksum(cfg)
+
+    def test_no_checksum_verifies_nothing(self):
+        """Ordinary warm-started runs are untouched — the file is never opened."""
+        pytest.importorskip("torch")
+        from agent.train import _verify_warm_start_checksum
+
+        cfg = _cli_cfg(_selfplay_argv(_UNREAD_WARM_START))
+
+        assert cfg.warm_start_sha256 is None
+        assert _verify_warm_start_checksum(cfg) is None
+
+    def test_a_missing_checkpoint_is_named(self, tmp_path):
+        pytest.importorskip("torch")
+        from agent.train import _verify_warm_start_checksum
+
+        missing = str(tmp_path / "gone.pt")
+        cfg = _cli_cfg(_selfplay_argv(missing, "--warm-start-sha256", "c" * 64))
+
+        with pytest.raises(FileNotFoundError, match="gone.pt"):
+            _verify_warm_start_checksum(cfg)
+
+    def test_main_refuses_a_mismatch_before_it_builds_anything(
+        self, tmp_path, monkeypatch
+    ):
+        """The gate runs before the logger and before the fleet is touched."""
+        pytest.importorskip("torch")
+
+        import eval.logging as logging_module
+
+        import agent.train as train_module
+
+        monkeypatch.setattr(
+            logging_module,
+            "MetricsLogger",
+            lambda **_k: pytest.fail(
+                "a run directory was created before the warm start was verified"
+            ),
+        )
+        monkeypatch.setattr(
+            train_module,
+            "_main_multi_arena",
+            lambda *_a, **_k: pytest.fail(
+                "the run started against an unverified warm start"
+            ),
+        )
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+
+        with pytest.raises(ValueError, match="checksum MISMATCH"):
+            train_module.main(
+                _selfplay_argv(warm, "--warm-start-sha256", "d" * 64)
+            )
+
+
+class TestTheSingleArenaRefusalCoversSelfPlay:
+    """TC27. The existing ``cfg.opponent != "dummy"`` check already covers it.
+
+    Pinned rather than re-implemented: the single-arena loop steps no opponent
+    policy at all, so a self-play run there would fight the bridge's stationary
+    dummy while every log line and the logger's config record said ``selfplay``.
+    """
+
+    def test_one_arena_selfplay_is_refused(self, capsys):
+        pytest.importorskip("torch")
+        from agent.train import main
+
+        code = main(
+            ["--arenas", "1", "--opponent", "selfplay",
+             "--warm-start", _UNREAD_WARM_START]
+        )
+
+        assert code == 1
+        stderr = capsys.readouterr().err
+        assert "needs --arenas >1" in stderr
+        assert "selfplay" in stderr
+
+    def test_two_arenas_selfplay_passes_the_refusal(self, tmp_path, monkeypatch):
+        """The complement: the gate refuses ONE arena, not the mode itself."""
+        pytest.importorskip("torch")
+
+        import eval.logging as logging_module
+
+        import agent.train as train_module
+
+        monkeypatch.setattr(logging_module, "MetricsLogger", _NullLogger)
+        monkeypatch.setattr(train_module, "_main_multi_arena", lambda *_a, **_k: 0)
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+
+        assert train_module.main(_selfplay_argv(warm)) == 0
+
+
+class _NullLogger:
+    """A ``MetricsLogger`` stand-in that records the config it was handed."""
+
+    #: Last config dict any instance was constructed with.
+    last_config: Dict[str, Any] = {}
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).last_config = dict(kwargs.get("config") or {})
+
+    def log(self, *_a: Any, **_k: Any) -> None:
+        pass
+
+    def summary(self, *_a: Any, **_k: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class TestTheRunRecordsWhatItFought:
+    """``summary.json`` has to name the opponent AND the knobs that shaped it.
+
+    ``opponent: selfplay`` alone proves only that the flag parsed. Which past
+    self was drawn, how often a new one was archived and what its rating meant
+    are the difference between a readable Elo curve and a number nobody can
+    reconstruct — the same provenance gap the reward coefficients are recorded
+    for.
+    """
+
+    def _recorded_config(self, monkeypatch, argv: List[str]) -> Dict[str, Any]:
+        import eval.logging as logging_module
+
+        import agent.train as train_module
+
+        _NullLogger.last_config = {}
+        monkeypatch.setattr(logging_module, "MetricsLogger", _NullLogger)
+        monkeypatch.setattr(train_module, "_main_multi_arena", lambda *_a, **_k: 0)
+        assert train_module.main(argv) == 0
+        return _NullLogger.last_config
+
+    def test_the_selfplay_knobs_are_recorded(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+
+        warm = _write_default_checkpoint(tmp_path / "warm.pt")
+        digest = _sha256_of(warm)
+        config = self._recorded_config(
+            monkeypatch,
+            _selfplay_argv(
+                warm,
+                "--run-name", "m4_selfplay",
+                "--warm-start-sha256", digest,
+                "--snapshot-every-grad-steps", "250",
+                "--snapshot-sampling", "uniform",
+                "--opponent-epsilon", "0.05",
+                "--reference-promote-grad-steps", "300", "900",
+                "--elo-k", "16",
+                "--elo-initial", "1200",
+            ),
+        )
+
+        assert config["opponent"] == "selfplay"
+        assert config["warm_start"] == str(warm)
+        assert config["warm_start_sha256"] == digest
+        assert config["snapshot_every_grad_steps"] == 250
+        assert config["snapshot_sampling"] == "uniform"
+        assert config["opponent_epsilon"] == pytest.approx(0.05)
+        assert config["reference_promote_grad_steps"] == [300, 900]
+        assert config["elo_k"] == pytest.approx(16.0)
+        assert config["elo_initial"] == pytest.approx(1200.0)
+        assert config["snapshot_pool_dir"] == os.path.join(
+            "runs", "m4_selfplay", "snapshots"
+        )
+        # summary.json is written with json.dump, so anything unserializable
+        # here would take the whole run record down at close() time.
+        json.dumps(config)
+
+    def test_a_dummy_run_records_no_pool(self, monkeypatch):
+        pytest.importorskip("torch")
+
+        config = self._recorded_config(monkeypatch, ["--arenas", "2"])
+
+        assert config["opponent"] == "dummy"
+        assert config["snapshot_pool_dir"] is None
+
+
+# ===========================================================================
+# W2 — the snapshot pool directory follows --run-name (T11b).
+# ===========================================================================
+
+
+class TestThePoolDirectoryFollowsTheRunName:
+    """A pool nobody passes is a pool two runs SHARE.
+
+    ``train_multi_arena``'s ``snapshot_dir`` default resolves to
+    ``runs/selfplay/snapshots`` for every run alike, and
+    ``build_snapshot_opponents`` RELOADS a directory that already holds a
+    ``pool.json`` rather than reseeding it. So a second self-play run under a
+    different ``--run-name`` would silently inherit the first run's past selves,
+    its head-to-head statistics and its Elo series — with no error, and a
+    ``pool_size`` line at startup that looks perfectly healthy.
+    """
+
+    def _snapshot_dir_the_cli_passes(
+        self, monkeypatch, argv: List[str]
+    ) -> Optional[str]:
+        """Run ``_main_multi_arena`` with the loop stubbed; return its kwarg."""
+        import distributed.launcher as launcher_module
+
+        import agent.train as train_module
+
+        monkeypatch.setattr(
+            launcher_module, "SubprocessArenaLauncher", lambda **_k: MagicMock()
+        )
+        captured: Dict[str, Any] = {}
+
+        def _stub_loop(_cfg, **kwargs):
+            captured.update(kwargs)
+            return train_module.MultiArenaResult(
+                trainer=MagicMock(),
+                passed_m2=False,
+                grad_steps=0,
+                episodes_received=0,
+            )
+
+        monkeypatch.setattr(train_module, "train_multi_arena", _stub_loop)
+
+        args = _parse(argv)
+        train_module._main_multi_arena(
+            args,
+            _cli_cfg(argv),
+            logger=None,
+            checkpoint_hook=None,
+        )
+        assert "snapshot_dir" in captured, (
+            "_main_multi_arena passed no snapshot_dir at all, so the loop falls "
+            "back to runs/selfplay/snapshots for every run"
+        )
+        return captured["snapshot_dir"]
+
+    def test_the_pool_lives_under_the_run_name(self, monkeypatch):
+        pytest.importorskip("torch")
+        from agent.train import snapshot_pool_directory
+
+        directory = self._snapshot_dir_the_cli_passes(
+            monkeypatch,
+            _selfplay_argv(_UNREAD_WARM_START, "--run-name", "m4_selfplay"),
+        )
+
+        assert directory == snapshot_pool_directory("m4_selfplay")
+        assert directory == os.path.join("runs", "m4_selfplay", "snapshots")
+
+    def test_two_run_names_get_two_pools(self, monkeypatch):
+        """The failure this exists for: one pool of past selves, two learners."""
+        pytest.importorskip("torch")
+        from agent.train import snapshot_pool_directory
+
+        first = self._snapshot_dir_the_cli_passes(
+            monkeypatch, _selfplay_argv(_UNREAD_WARM_START, "--run-name", "run_a")
+        )
+        second = self._snapshot_dir_the_cli_passes(
+            monkeypatch, _selfplay_argv(_UNREAD_WARM_START, "--run-name", "run_b")
+        )
+
+        assert first != second
+        # Neither may land on the loop's own name-blind fallback.
+        assert snapshot_pool_directory("selfplay") not in (first, second)
+
+    @pytest.mark.parametrize("opponent", ["dummy", "scripted"])
+    def test_a_non_selfplay_run_passes_no_directory(self, monkeypatch, opponent):
+        """No pool is built off the self-play path, so none is named."""
+        pytest.importorskip("torch")
+
+        directory = self._snapshot_dir_the_cli_passes(
+            monkeypatch,
+            ["--arenas", "2", "--opponent", opponent, "--run-name", "m4_selfplay"],
+        )
+
+        assert directory is None
+
+
+# ===========================================================================
+# W1 — the MIDDLE hop of the mirror chain (T11b).
+# ===========================================================================
+
+
+class _IdleEnv:
+    """The designated arena's parked env: all the eval handoff reads is this."""
+
+    def __init__(self) -> None:
+        self._transport = object()
+
+
+class _IdleCollector:
+    """A collector that parks on demand, recording the pause/resume protocol."""
+
+    def __init__(self, env: Optional[_IdleEnv]) -> None:
+        self._env = env
+        self.calls: List[str] = []
+
+    def pause(self) -> None:
+        self.calls.append("pause")
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        return True
+
+    def current_env(self) -> Optional[_IdleEnv]:
+        return self._env
+
+    def resume(self) -> None:
+        self.calls.append("resume")
+
+
+class _OneCollectorPool:
+    """The slice of ``ActorPool`` the eval handoff touches."""
+
+    def __init__(self, collector: Optional[_IdleCollector]) -> None:
+        self._collector = collector
+
+    def collector_for(self, arena_id: int) -> Optional[_IdleCollector]:
+        return self._collector if arena_id == 0 else None
+
+
+class TestTheEvalHandoffForwardsTheMirror:
+    """The one hop of the ``mirror_opponent`` chain nothing else pins.
+
+    ``TestTheMirrorReachesBothEnvConstructionSites`` covers the two ENDS: the
+    multi-arena loop hands ``_eval_via_designated_arena`` the flag, and
+    ``_eval_against_opponent`` builds its env with whatever flag it is given.
+    The hop BETWEEN them is invisible to both, because every test that names
+    ``_eval_via_designated_arena`` monkeypatches it out — delete its
+    ``mirror_opponent=mirror_opponent`` line and the whole suite still passes.
+
+    What that costs: the eval env is built without the mirror, so
+    ``opponent_observation()`` raises inside the eval at the FIRST eval cycle —
+    roughly an hour into a 24-hour run.
+    """
+
+    def _drive(self, monkeypatch, *, mirror: bool, opponent: Any, collector):
+        """Run the REAL handoff with only the INNER eval stubbed out."""
+        import agent.train as train_module
+
+        recorded: Dict[str, Any] = {}
+
+        def _record(**kwargs: Any) -> str:
+            recorded.update(kwargs)
+            return "outcome"
+
+        monkeypatch.setattr(train_module, "_eval_against_opponent", _record)
+
+        returned = train_module._eval_via_designated_arena(
+            trainer=MagicMock(),
+            pool=_OneCollectorPool(collector),
+            designated_arena=0,
+            evaluate=lambda *_a, **_k: None,
+            policy_cls=lambda *_a, **_k: None,
+            n_episodes=1,
+            timeout_cap=64,
+            env_max_episode_steps=64,
+            eval_step_cap=4,
+            logger=None,
+            is_live=False,
+            base_seed=0,
+            log=None,
+            pause_timeout=1.0,
+            opponent=opponent,
+            mirror_opponent=mirror,
+        )
+        return returned, recorded
+
+    @pytest.mark.parametrize("mirror", [True, False])
+    def test_the_flag_reaches_the_inner_eval(self, monkeypatch, mirror):
+        pytest.importorskip("torch")
+
+        env = _IdleEnv()
+        collector = _IdleCollector(env)
+        opponent = object()
+
+        returned, recorded = self._drive(
+            monkeypatch, mirror=mirror, opponent=opponent, collector=collector
+        )
+
+        assert returned == "outcome", "the inner eval's outcome must reach the caller"
+        assert "mirror_opponent" in recorded, (
+            "_eval_via_designated_arena dropped mirror_opponent: the eval env is "
+            "then built without the observation mirror and "
+            "opponent_observation() raises at the first eval cycle"
+        )
+        assert recorded["mirror_opponent"] is mirror
+        # The same hop carries the eval's own opponent and the BORROWED
+        # connection; a drop of either is the same class of silent defect.
+        assert recorded["opponent"] is opponent
+        assert recorded["shared_transport"] is env._transport
+        assert collector.calls == ["pause", "resume"]
+
+    def test_a_skipped_eval_still_resumes_the_collector(self, monkeypatch):
+        """No env to borrow: eval is skipped, and the arena is not left parked."""
+        pytest.importorskip("torch")
+
+        collector = _IdleCollector(None)
+
+        returned, recorded = self._drive(
+            monkeypatch, mirror=True, opponent=None, collector=collector
+        )
+
+        assert returned is None
+        assert recorded == {}, "no env means the inner eval must not run at all"
+        assert collector.calls == ["pause", "resume"]
