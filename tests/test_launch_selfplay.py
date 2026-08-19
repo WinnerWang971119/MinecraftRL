@@ -52,9 +52,13 @@ WHAT IS PINNED, AND WHY EACH PIN EXISTS:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
+import subprocess
+import sys
 import types
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -196,6 +200,11 @@ def make_canary_measurements(**overrides: Any) -> Dict[str, Any]:
     """
     document: Dict[str, Any] = {
         "measured_at_run": "m4_selfplay_canary",
+        # -- provenance: the checkpoint the canary's verdict was earned on ----
+        # The digest MUST equal `make_plan()`'s warm_start.sha256: the healthy
+        # baseline is a canary and a launch that hashed the SAME file.
+        "warm_start": "/Users/diego/Documents/MinecraftRL/runs/m4.best.pt",
+        "warm_start_sha256": "a" * 64,
         "max_episode_steps": 600,
         # -- the probe: both seats at the run's terminal epsilons -------------
         "armored_mean_episode_length_probe": 132.0,
@@ -1058,6 +1067,58 @@ def test_an_unusable_warm_start_refuses(mutation: Dict[str, Any]) -> None:
     assert "WARM_START_UNUSABLE" in codes
 
 
+def test_a_canary_proven_on_a_different_warm_start_refuses() -> None:
+    """The tab-completion failure: canary GREEN on m4.best.pt, launch on m4.pt.
+
+    Every other digest comparison hashes the file it is checking, so it cannot
+    fire here — the wrong file hashes to its own digest perfectly cleanly. Only
+    the canary's RECORDED digest meets this launch's computed one as two
+    independent namings of the checkpoint.
+    """
+    plan = make_plan()
+    plan["canary"]["measurements"]["warm_start_sha256"] = "b" * 64
+    verdict = evaluate(plan)
+    assert "WARM_START_CANARY_MISMATCH" in refusal_codes(verdict)
+    mismatch = next(
+        c for c in verdict.refusals if c.code == "WARM_START_CANARY_MISMATCH"
+    )
+    # Both digests AND both paths: the operator diagnoses "which file did each
+    # side hash", not two hex strings by eye.
+    assert "b" * 64 in mismatch.detail
+    assert "a" * 64 in mismatch.detail
+    assert "runs/m4.best.pt" in mismatch.detail
+
+
+def test_a_canary_that_hashed_the_same_file_clears_the_cross_check() -> None:
+    """The healthy fixture records the digest the launch computed: no refusal."""
+    verdict = evaluate(make_plan())
+    assert "WARM_START_CANARY_MISMATCH" not in refusal_codes(verdict)
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [None, "", "   ", 42],
+    ids=["null", "empty", "blank", "not_a_string"],
+)
+def test_a_canary_without_a_recorded_digest_refuses(recorded: Any) -> None:
+    """Absent evidence is a refusal, never a pass — the gate's standing rule."""
+    plan = make_plan()
+    plan["canary"]["measurements"]["warm_start_sha256"] = recorded
+    codes = refusal_codes(evaluate(plan))
+    assert "WARM_START_CANARY_MISMATCH" in codes
+
+
+def test_a_pre_field_canary_measurement_refuses_rather_than_passing() -> None:
+    """A measurements file from the previous canary revision has no
+    `warm_start_sha256` key at all. Fail-closed means the operator re-runs the
+    canary (which now records it) instead of launching on an unproven pairing.
+    """
+    plan = make_plan()
+    del plan["canary"]["measurements"]["warm_start_sha256"]
+    codes = refusal_codes(evaluate(plan))
+    assert "WARM_START_CANARY_MISMATCH" in codes
+
+
 @pytest.mark.parametrize("run_name", ["m4", "m3", "m2_multi", ""])
 def test_a_colliding_run_name_refuses(run_name: str) -> None:
     """`runs/m4.*` is a completed run AND this run's warm-start source."""
@@ -1673,3 +1734,169 @@ def test_compare_cli_rejects_an_unknown_document_version(tmp_path: Any) -> None:
 def test_cli_usage_is_exit_two(tmp_path: Any) -> None:
     assert sizing_module.main([]) == 2
     assert sizing_module.main(["nonsense", str(tmp_path / "x.json")]) == 2
+
+
+# ---------------------------------------------------------------------------
+# The shell preflight's own contract. The functions under test are extracted
+# VERBATIM from the script — the same no-second-copy rule the heredoc
+# extraction enforces — and run under bash with the script's own log/warn/die,
+# so the exit codes observed here are the exit codes the operator gets.
+# Offline: nothing in this section opens a socket.
+# ---------------------------------------------------------------------------
+
+
+def test_the_script_parses() -> None:
+    """`bash -n` parses without executing — a broken quote would only show up
+    live, at 20:00 on the launch night."""
+    result = subprocess.run(
+        ["bash", "-n", SCRIPT_PATH], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "LAUNCH_MC_PROBE_PY",
+        "LAUNCH_SIZING_PY",
+        "LAUNCH_SHA_PY",
+        "LAUNCH_LOAD_PY",
+        "LAUNCH_SMOKE_COLLECT_PY",
+        "LAUNCH_PLAN_COLLECT_PY",
+        "LAUNCH_COMPARE_COLLECT_PY",
+    ],
+)
+def test_every_embedded_python_block_compiles(name: str) -> None:
+    """A syntax error in a heredoc is invisible until the phase that runs it."""
+    compile(extract_heredoc(name), f"{SCRIPT_PATH}:{name}", "exec")
+
+
+def _shell_function(name: str) -> str:
+    """One top-level shell function's text, verbatim, definition to close."""
+    text = "\n".join(_script_lines())
+    marker = f"{name}() {{"
+    assert text.count(marker) == 1, marker
+    start = text.index(marker)
+    return text[start : text.index("\n}", start) + 2]
+
+
+def _shell_logger_defs() -> str:
+    """The script's OWN log/warn/die one-liners, so exit codes cannot drift."""
+    lines = [
+        line for line in _script_lines() if re.match(r"^(log|warn|die)\(\)\s+\{", line)
+    ]
+    assert len(lines) == 3, lines
+    return "\n".join(lines)
+
+
+def run_require_warm_start(
+    warm_start: str, expect: Optional[str]
+) -> "subprocess.CompletedProcess[str]":
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f"PYTHON_BIN={shlex.quote(sys.executable)}",
+            f"WARM_START={shlex.quote(warm_start)}",
+            f"EXPECT_SHA256={shlex.quote(expect or '')}",
+            'WARM_START_SHA256=""',
+            "usage() { :; }",
+            _shell_logger_defs(),
+            _shell_function("sha256_file"),
+            _shell_function("check_expected_sha256"),
+            _shell_function("require_warm_start"),
+            "require_warm_start",
+            'printf "COMPUTED=%s\\n" "${WARM_START_SHA256}"',
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+
+
+def test_a_matching_expected_digest_clears_the_preflight(tmp_path: Any) -> None:
+    payload = b"the frozen M3 checkpoint"
+    checkpoint = tmp_path / "m4.best.pt"
+    checkpoint.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    result = run_require_warm_start(str(checkpoint), digest)
+    assert result.returncode == 0, result.stderr
+    assert f"COMPUTED={digest}" in result.stdout
+    assert "matches --expect-sha256" in result.stdout
+    assert "WARNING" not in result.stderr
+
+
+def test_a_mismatched_expected_digest_refuses_naming_both(tmp_path: Any) -> None:
+    """The refusal must carry BOTH digests and the absolute path it hashed."""
+    payload = b"the REJECTED 30k-step net"
+    checkpoint = tmp_path / "m4.pt"
+    checkpoint.write_bytes(payload)
+    computed = hashlib.sha256(payload).hexdigest()
+    expected = "1" * 64
+    result = run_require_warm_start(str(checkpoint), expected)
+    assert result.returncode == 2
+    assert "WARM_START_DIGEST_MISMATCH" in result.stderr
+    assert computed in result.stderr
+    assert expected in result.stderr
+    assert str(checkpoint) in result.stderr
+
+
+def test_omitting_the_flag_still_hashes_and_names_what_was_not_checked(
+    tmp_path: Any,
+) -> None:
+    """No flag, no new refusal — but the hole is announced, and by name."""
+    payload = b"the frozen M3 checkpoint"
+    checkpoint = tmp_path / "m4.best.pt"
+    checkpoint.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    result = run_require_warm_start(str(checkpoint), None)
+    assert result.returncode == 0, result.stderr
+    # Unchanged behavior: the digest is still computed and exported.
+    assert f"COMPUTED={digest}" in result.stdout
+    # The prominent line: what was not verified, and the flag that would.
+    assert "--expect-sha256" in result.stderr
+    assert "NOTHING" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["xyz", "A" * 64, "a" * 63, "a" * 65, "1d3d0c60"],
+    ids=["not_hex", "uppercase", "too_short", "too_long", "truncated"],
+)
+def test_a_malformed_expected_digest_is_refused_up_front(malformed: str) -> None:
+    """A value that can never match must refuse at parse time, not report a
+    baffling "mismatch" after the fleet checks have already run. This drives
+    the REAL script: the validation sits before the interpreter check, so the
+    run dies before it writes or connects to anything."""
+    result = subprocess.run(
+        ["bash", SCRIPT_PATH, "plan", "--expect-sha256", malformed],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "64 lowercase hex" in result.stderr
+
+
+def test_the_digest_gate_sits_on_the_smoke_plan_and_launch_path() -> None:
+    """A function nobody calls gates nothing.
+
+    `require_warm_start` is the one preflight shared by smoke, plan and launch
+    (launch runs plan), so the call is pinned INSIDE it, directly after the
+    digest is computed and logged.
+    """
+    body = _shell_function("require_warm_start")
+    assert (
+        'log "  sha256 ${WARM_START_SHA256}"\n    check_expected_sha256' in body
+    )
+
+
+def test_the_smoke_usage_text_matches_what_cmd_smoke_checks() -> None:
+    """`cmd_smoke` gates on the canary measurements file EXISTING — which the
+    canary writes on refused runs too — while the GREEN requirement lives in
+    plan/launch. The usage text claimed smoke "Requires ... the canary to be
+    GREEN"; this pins the correction so the drift cannot return."""
+    text = "\n".join(_script_lines())
+    smoke_help = text[text.index("  smoke     bounded") : text.index("  plan      derive")]
+    assert "canary to be GREEN" not in smoke_help
+    assert "EXIST" in smoke_help
+    assert "enforced by plan/launch" in smoke_help
