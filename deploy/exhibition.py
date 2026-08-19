@@ -155,6 +155,17 @@ write failure is reported with the commands that did not run, and
 ``--challenger-username``: nothing on the wire tells this process who claimed
 the slot, so an unpinned exhibition gets a warning at reset time instead of a
 heal.
+AND MATCH 1 ARMS ITSELF (T22). The reset is what gears the human, and match 1
+starts the moment the AGENT connects — before anybody has joined — so the first
+challenger of a launch used to be the only person in the queue who fought an
+armored agent in their own clothes, unless the operator had pre-geared the
+pinned name by hand the night before. :class:`ChallengerJoinArmer` removes that
+preparation step: it watches Paper's log (the same file the gear read-back
+scans, and the only presence signal this process has) for the server announcing
+the PINNED name joining, then sends exactly the six gear lines a reset sends
+and reads the result back the same way. Fail-open and idempotent, so it can
+fire twice, fire alongside a reset, or never fire at all, and the worst case is
+the demo the operator had before it existed.
 
 TEARDOWN IS ``BaseException``-PROOF, not ``Exception``-proof, AND IT IS WHERE
 BOTH STOP SIGNALS LAND. Ctrl-C is the normal way an exhibition ends, so the
@@ -223,7 +234,10 @@ __all__ = [
     "ExhibitionLaunchError",
     "ExhibitionTerminated",
     "CheckpointError",
+    "ChallengerJoinArmer",
+    "arm_challenger_gear",
     "build_bridge_argv",
+    "challenger_joined",
     "confirm_human_loadout",
     "drain_reset_request",
     "find_toolchain_problems",
@@ -722,8 +736,11 @@ def _validate_challenger_username(challenger_username: str) -> None:
 
 
 def human_gear_commands(challenger_username: str) -> List[str]:
-    """The five Paper CONSOLE lines that re-gear the human: one held iron sword,
-    four WORN iron pieces.
+    """The five Paper CONSOLE lines that re-gear the human: one iron sword in
+    their INVENTORY, four WORN iron pieces.
+
+    The sword is OWNED, not HELD, and the distinction is real rather than
+    pedantic — see the last paragraph. Nothing here can put it in their hand.
 
     Mirrors the LEARNER's re-gear block line for line
     (``spawn_learner_pad.mcfunction``: ``$give $(learner) minecraft:iron_sword
@@ -758,6 +775,24 @@ def human_gear_commands(challenger_username: str) -> List[str]:
       the clear narrow: widening it to a blanket ``clear <name>`` (which the
       dummy's template does use) would empty a person's unrelated items, which
       is no part of heal-and-reposition.
+
+    AND THE ARMOR LINES DO TAKE SOMETHING, which has to be said in the same
+    breath as that last sentence or the two disagree: ``item replace``
+    DESTROYS whatever the challenger was already wearing (the pinned jar's
+    ``ItemCommands.setEntityItem`` calls ``SlotAccess.set(stack.copy())`` — the
+    old piece is overwritten, not dropped and not returned), so a person who
+    joined in their own armor loses all four pieces of it. That is accepted
+    rather than overlooked: there is no way to fill an equipment slot without
+    emptying it, and the demo's whole premise is both fighters in the same iron.
+    IT IS ONE OF TWO PLACES THIS LIST TOUCHES A PERSON'S BELONGINGS, and that
+    count used to read "the one place". ``clear <name> minecraft:iron_sword``
+    matches by item TYPE, not by provenance, so a challenger who walked in
+    carrying their OWN iron sword — enchanted, renamed, however they came by it
+    — loses it to the clear, unreturned, exactly as the armor lines take what
+    they were wearing. Keeping the clear SCOPED is still what stops the cost
+    there and is not undone by saying so: the blanket ``clear <name>`` the
+    dummy's template uses would empty everything else they own as well.
+    ``docs/demo-day.md`` warns the operator about both, in one breath.
 
     WHAT THIS CANNOT DO is make the challenger HOLD the sword. ``give`` chooses
     a free slot, not the selected one, and a person's hand is theirs; the sword
@@ -1599,6 +1634,7 @@ def play_one_match(
     policy: Any,
     *,
     reflex_blind_steps: int = 0,
+    before_decision: Optional[Callable[[], Any]] = None,
     log: Callable[[str], None] = _ascii_log,
 ) -> str:
     """Play exactly one match to completion, greedily, with no learning.
@@ -1633,6 +1669,14 @@ def play_one_match(
             explicitly — see the module docstring's REFLEX SHIELD section for
             why that makes it structurally impossible for training to enable
             this by accident.
+        before_decision: Called once at the TOP of every decision step, before
+            the policy is asked for an action, and never after the match has
+            ended. ``run()`` passes :meth:`ChallengerJoinArmer.poll`, which is
+            how match 1 gets armed without a reset: the launcher is blocked in
+            this loop for the whole of a match, so this is the only place it
+            can notice the challenger joining. Whatever it returns is ignored,
+            and it defaults to ``None`` — every training and eval caller gets
+            exactly the loop that predates it.
         log: Where match/shield summary lines go.
 
     Returns a short human-readable outcome string.
@@ -1646,6 +1690,8 @@ def play_one_match(
     blind_streak = 0
     reflex_overrides = 0
     while not done:
+        if before_decision is not None:
+            before_decision()
         action = policy.act(obs)
         action, blind_streak, fired = _reflex_shield_action(
             obs, action, blind_streak, reflex_blind_steps=reflex_blind_steps
@@ -1701,22 +1747,127 @@ def _log_text_since(path: Path, offset: int) -> str:
         return ""
 
 
+def _is_username_char(char: str) -> bool:
+    """True iff ``char`` could be part of a Minecraft username.
+
+    The real rule is ``[A-Za-z0-9_]``; ``isalnum()`` is deliberately WIDER than
+    that. Accepting more characters here only makes :func:`_line_subject_is`
+    reject more lines, which is the safe direction for a test whose failure
+    mode is a FALSE confirmation.
+    """
+    return char.isalnum() or char == "_"
+
+
+#: ``chat.type.emote``'s leading marker. The pinned jar's
+#: ``assets/minecraft/lang/en_us.json`` renders an emote as ``"* %s %s"`` — what
+#: ``/me <text>`` produces, at permission level 0, for every player in the world
+#: — so a head shaped like ``[..INFO]: * Steve `` ends with the speaker's own
+#: name and carries the speaker's own words where a server reply's would be.
+#: :func:`_line_subject_is` refuses it, alongside ``chat.type.text``'s
+#: ``"<%s> %s"``.
+EMOTE_MARKER = "*"
+
+
+def _line_subject_is(head: str, challenger_username: str) -> bool:
+    """True iff ``head`` — everything on a console line BEFORE the phrase being
+    matched — names exactly ``challenger_username`` as that line's subject.
+
+    Both phrases this module matches (:data:`DATA_QUERY_PHRASE`,
+    :data:`PLAYER_JOIN_PHRASE`) are rendered by the server as ``<display name>
+    <phrase> ...``, so the subject is whatever the head ENDS with. That is the
+    one thing the reply format guarantees, and it is what identity is anchored
+    on here.
+
+    RETRACTED, AND IT SHIPPED WRONG: :func:`_confirmed_loadout_ids` used to ask
+    ``challenger_username in head`` — a plain substring test — while claiming in
+    its own docstring that it stopped "a command echo, a chat message, or a
+    reply about some other player". It stopped the third only, and only for
+    names that do not contain each other. Both surviving cases are reachable
+    with legal usernames and ordinary chat:
+
+    * ANOTHER PLAYER WHOSE NAME CONTAINS THIS ONE. ``Steve2`` and ``xSteve``
+      are both valid Minecraft usernames (``[A-Za-z0-9_]{3,16}``) and both
+      contain ``Steve``, so in a queue of similarly-named people one person's
+      reply confirmed another's gear. Anchoring on the END of the head kills
+      ``Steve2``; requiring a non-username character in FRONT of the match
+      kills ``xSteve``.
+    * A CHAT MESSAGE. Chat lands on the same console and its text is whatever
+      a player typed — including a verbatim copy of a server reply about
+      themselves.
+
+    AND CHAT HAS MORE THAN ONE SHAPE, WHICH THIS DOCSTRING USED TO DENY. The
+    line above read "a head carrying a ``<...>`` speaker is therefore never a
+    server reply and is refused outright" — but ``<...>`` is ``chat.type.text``
+    and nothing else. The pinned jar's ``en_us.json`` also gives
+    ``chat.type.emote`` as ``"* %s %s"``, i.e. what ``/me`` renders as, and
+    ``/me`` needs no permission level at all. ``[..INFO]: * Steve joined the
+    game`` therefore left a head ending in ``Steve`` preceded by a space and
+    walked straight through the rule above it. Only the SPEAKER can reach it
+    (an emote's subject is whoever typed it), so it could never arm the wrong
+    person — but it let the challenger themselves ``/me joined the game`` to
+    re-trigger the whole gear block mid-fight (fresh full-durability armor, and
+    a ``clear``+``give`` swapping a damaged sword for a new one, repeatable),
+    and ``/me has the following entity data: "minecraft:iron_helmet"`` to forge
+    the server-authoritative confirmation the operator is told to trust. Both
+    shapes are refused now; see :data:`EMOTE_MARKER`.
+
+    THIS IS A REJECT LIST, NOT AN ALLOW LIST, AND THAT IS A CHOICE. The tighter
+    rule — demand the subject be preceded by exactly the log prefix's ``]: `` —
+    refuses every shape at once, including ones nobody has enumerated. It also
+    refuses every DISPLAY name that carries a decoration, and a display name is
+    precisely what both phrases interpolate: a scoreboard team prefix turns a
+    perfectly real reply into ``[team] Steve has the following entity data:
+    ...``, which would then never confirm. That decorated head is untrusted for
+    a DIFFERENT reason — a prefix is operator-controlled text and can contain an
+    item id — and the guard that covers it is :func:`_confirmed_loadout_ids`'s
+    VALUE-side check. An allow-list here would make that guard unreachable, and
+    an unreachable guard is an untested one. So both guards stay, and each keeps
+    its own bite.
+
+    None of these was reachable from the launcher's own command stream, and the
+    emote was reachable only by the one person it cannot mis-target — but a
+    comment that asserts the opposite of what the code does is the exact class
+    of thing this run's reviews keep finding, and the cheapest fix is to make
+    the code true.
+    """
+    if not challenger_username:
+        return False
+    opened = head.find("<")
+    if opened != -1 and head.find(">", opened + 1) != -1:
+        return False  # chat.type.text: a player typing, not the server answering.
+    head = head.rstrip()
+    if not head.endswith(challenger_username):
+        return False
+    before = head[: len(head) - len(challenger_username)]
+    if before.rstrip().endswith(EMOTE_MARKER):
+        # chat.type.emote (`/me`), whose subject IS the speaker: their own words
+        # follow their own name, exactly where the server's would. `rstrip()`
+        # first so `* Steve` and `*Steve` are both refused.
+        return False
+    return not before or not _is_username_char(before[-1])
+
+
 def _confirmed_loadout_ids(
     text: str, challenger_username: str, expected: Sequence[str]
 ) -> set:
     """The item ids ``text`` shows the SERVER reporting for ``challenger_username``.
 
-    Only lines that carry both the challenger's name and the console's
-    ``data get`` reply phrase count, and the id has to appear on the VALUE side
-    of that phrase. That is what keeps a command echo, a chat message, or a
-    reply about some other player from confirming a piece nobody is wearing —
-    the failure mode this whole check exists to prevent, arriving through the
-    check itself.
+    A line counts only when it carries the console's ``data get`` reply phrase
+    AND :func:`_line_subject_is` says the challenger is the subject of that
+    reply — see there for the two ways a substring test says yes to a line that
+    is about somebody else, or about nobody at all.
+
+    The id then has to appear on the VALUE side of the phrase, which is a
+    separate guard and not a redundant one: the head is a display name, and a
+    display name is operator-controlled text (a scoreboard team prefix, say)
+    that can contain anything, including an item id. Only what the server
+    reported as the VALUE is evidence. Both halves of that sentence are what
+    keeps a false confirmation from arriving through the confirmation itself.
     """
     seen = set()
     for line in text.splitlines():
         head, phrase, value = line.partition(DATA_QUERY_PHRASE)
-        if not phrase or challenger_username not in head:
+        if not phrase or not _line_subject_is(head, challenger_username):
             continue
         for item in expected:
             if item in value:
@@ -1893,6 +2044,344 @@ def _reset_human_side(
     # against it. Best-effort and self-reporting: the match is played either way.
     confirm_human_loadout(paper_proc, paper_log, challenger_username, log=log)
     return True
+
+
+# ---------------------------------------------------------------------------
+# ARMING THE CHALLENGER ON JOIN (T22) — why match 1 needs no preparation.
+#
+# The reset is what gears the human, and match 1 starts the moment the AGENT
+# connects, before anybody has joined. So the first challenger of every launch
+# was the one person in the queue who fought an armored agent in their own
+# clothes — unless the operator had joined under the pinned name during a
+# standalone Paper boot the night before and typed six console commands by
+# hand. That is a rehearsal step, and an operator who does not get a rehearsal
+# (or simply forgets) loses match 1 in front of the audience rather than in
+# private. Nothing else in this launcher requires preparation; this did.
+#
+# THE SIGNAL IS PAPER'S OWN JOIN ANNOUNCEMENT, on a channel this launcher
+# already reads. `run()` captures Paper's stdout to `paper.log`
+# unconditionally (`--no-paper-console` turns off stdin, not stdout) and
+# `confirm_human_loadout` already scans that file for the server's answers.
+# Nothing on the WIRE reports who claimed the slot — the state message has no
+# field for it, which is the whole reason `--challenger-username` has to be
+# pinned — so the server's log is the only presence signal this process has,
+# and unlike anything this process believes, it is authoritative.
+#
+# FAIL-OPEN, DELIBERATELY, for T15's reason: a person's inventory is theirs,
+# this launcher cannot prove anything about it, and the match has to play
+# regardless. A join line that never matches (an account renamed between
+# sessions, a future Paper build that words the announcement differently) puts
+# the demo exactly where it was before this existed — match 1 unarmed, every
+# match after it armed by the reset — and never anywhere worse.
+# ---------------------------------------------------------------------------
+
+#: Vanilla's ``multiplayer.player.joined`` message, ``"%s joined the game"``,
+#: which the server writes to the console for every player entering the world.
+#: Matched as a SUBSTRING, and only ever as evidence to ARM — never to refuse
+#: anything — so a rewording costs the demo nothing it did not already lack.
+PLAYER_JOIN_PHRASE = "joined the game"
+
+
+def challenger_joined(text: str, challenger_username: str) -> bool:
+    """True iff ``text`` carries the server announcing THIS player joining.
+
+    Identity is anchored by :func:`_line_subject_is`, the same way the gear
+    read-back's is and for the same reasons: the announcement's subject is the
+    display name its head ends with, and a longer name that merely contains
+    this one is somebody else.
+
+    IT REFUSES THE TWO PLAYER-AUTHORED CHAT SHAPES, which is a narrower claim
+    than the one this used to make ("a chat line is never an announcement at
+    all"). ``<Steve> Bob joined the game`` (``chat.type.text``) and ``* Steve
+    joined the game`` (``chat.type.emote`` — what ``/me joined the game``
+    produces, from any player, at permission level 0) are both refused. Nothing
+    here enumerates every rendering a future Paper build might add, and it does
+    not have to: an unrecognized shape costs the demo a join-arm, which is where
+    it stood before T22. The emote was worth closing anyway, because the
+    challenger could use it to re-gear themselves mid-fight — see
+    :func:`_line_subject_is`.
+    """
+    if not challenger_username:
+        return False
+    for line in text.splitlines():
+        head, phrase, _rest = line.partition(PLAYER_JOIN_PHRASE)
+        if phrase and _line_subject_is(head, challenger_username):
+            return True
+    return False
+
+
+def _read_appended(path: Path, offset: int) -> Tuple[str, int]:
+    """The whole lines appended to ``path`` since byte ``offset``, and the new
+    offset to resume from.
+
+    Stops at the LAST newline in what it read and reports the offset just past
+    it, leaving any partial trailing line in the file for the next call to read
+    whole. That matters because this polls a log another process is appending
+    to: a read that landed mid-write would otherwise split a join announcement
+    across two polls, and neither half would match.
+
+    Degrades to ``("", offset)`` on an unreadable log rather than raising —
+    this runs inside a live match.
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return "", offset
+    cut = chunk.rfind(b"\n")
+    if cut < 0:
+        return "", offset
+    complete = chunk[: cut + 1]
+    return complete.decode("utf-8", "replace"), offset + len(complete)
+
+
+def arm_challenger_gear(
+    paper_proc: Any,
+    challenger_username: Optional[str],
+    *,
+    paper_console: bool,
+    paper_log: Optional[Path] = None,
+    log: Callable[[str], None] = _ascii_log,
+) -> bool:
+    """Gear the challenger NOW — exactly the gear block a reset sends, and
+    nothing else. True iff it reached the console.
+
+    GEAR ONLY, deliberately — for one reason that stands and one that has to be
+    stated honestly rather than assumed away.
+
+    THE TELEPORT IS EXCLUDED, and that half needs nothing else: a player who has
+    this instant joined is not fighting yet, so moving them the moment they
+    arrive yanks somebody who is still finding their bearings, and the next
+    reset puts them on the opponent slot anyway.
+
+    THE HEAL IS EXCLUDED ON A WEAKER ARGUMENT, AND THE OLD ONE WAS FALSE. This
+    used to say a joining player "is already at full health and already lands
+    inside the pad". That is true of a FIRST join and of no other one. The
+    server is offline-mode, so UUIDs are derived from the name: the same pinned
+    name is the same UUID and therefore the same
+    ``world/playerdata/<uuid>.dat``, which persists HEALTH and POSITION across a
+    disconnect, across a queue handoff to a different human under that name, and
+    across a relaunch of this launcher. The very cases
+    :class:`ChallengerJoinArmer` says it arms — "somebody who disconnects and
+    comes back, or the next person in the queue joining under the same pinned
+    name" — are exactly the cases that come back on leftover health, standing
+    where the last holder logged out. Concretely: the operator Ctrl-Cs after a
+    match the agent lost, relaunches, the same person rejoins, and match 1 is
+    now geared but not healed.
+
+    That gap is real and it is BOUNDED to the one match a returning player
+    rejoins into: the next reset heals and repositions them
+    (:func:`human_reset_commands`), and ``docs/demo-day.md`` tells the operator
+    so rather than leaving it buried here. The heal lines are cheap enough that
+    adding them would be defensible; they are out because this function's whole
+    contract — "exactly the gear block a reset sends, and nothing else" — is
+    what makes it idempotent AGAINST that reset by construction and is what
+    every drift test pins. A second, longer command list would need its own
+    idempotence argument, for a health gap the reset already closes.
+
+    IDEMPOTENT, AND IDEMPOTENT AGAINST THE RESET IN PARTICULAR — which is why
+    it calls :func:`human_gear_commands` instead of owning a second copy of the
+    list. ``item replace`` overwrites the equipment slot, and the sword's
+    sword-scoped ``clear`` immediately before its ``give`` is what stops a
+    join-arm followed by a reset-arm from leaving two swords in the bag. Fire it
+    as often as it likes: the challenger ends up wearing exactly one set and
+    carrying exactly one sword.
+
+    NEVER FAIL-CLOSED, per T15: a person's inventory is theirs, this launcher
+    cannot prove anything about it, and an unarmed challenger is a worse match
+    while a refused launch is no match at all. Every path that cannot run these
+    says so and prints what would have run.
+    """
+    if challenger_username is None:
+        log(
+            "NOT arming the challenger: no --challenger-username was pinned, "
+            "so this process has no name to recognize in the server's join "
+            "announcement and no name to gear -- the same limitation the reset "
+            "reports, for the same reason (nothing on the wire tells this "
+            "process who claimed the slot). Restart the exhibition with "
+            "--challenger-username <name> to fix it for the rest of the demo."
+        )
+        return False
+    commands = human_gear_commands(challenger_username)
+    if not paper_console:
+        log(
+            f"--no-paper-console: not arming {challenger_username}. Run these "
+            "from an opped account before the match gets going -- the four "
+            "`item replace` lines are what WEAR the armor, and a `give` would "
+            "only put it in their bag:"
+        )
+        for command in commands:
+            log(f"  {command}")
+        log(
+            "Then confirm the armor actually went ON -- these print the "
+            "server's own answer:"
+        )
+        for command in human_loadout_read_commands(challenger_username):
+            log(f"  {command}")
+        return False
+    log(
+        f"arming {challenger_username} via the Paper console: an iron sword "
+        "and a full iron set -- the same gear block every reset sends."
+    )
+    if not send_paper_console_commands(
+        paper_proc, commands, log=log, what=f"arm {challenger_username}"
+    ):
+        return False
+    # Same pipe, written after the gear lines, and Paper runs console input in
+    # order -- so this reads the world the gear left behind rather than racing
+    # it. The operator gets the identical confirmation line for match 1 that
+    # every later match already got.
+    confirm_human_loadout(paper_proc, paper_log, challenger_username, log=log)
+    return True
+
+
+class ChallengerJoinArmer:
+    """Watches Paper's log for the pinned challenger and gears them on arrival.
+
+    ONE INSTANCE PER LAUNCH, polled from inside :func:`play_one_match`. That is
+    not an arbitrary hook point: the launcher is blocked in that loop for the
+    whole of a match, and match 1 — the only match the reset cannot reach — is
+    exactly the one whose challenger has not joined yet when it starts.
+
+    SINGLE-THREADED ON PURPOSE. A background thread tailing the log would have
+    to write the gear lines into the same Paper console pipe the reset path
+    writes to, and two writers interleaving console commands is a race with no
+    upside. Polling from the decision loop costs one cheap tail-read of
+    ``paper.log`` per ~200 ms window and cannot interleave with anything.
+
+    THE COST OF THAT, STATED: arming pauses the agent for as long as the
+    read-back takes — one :data:`HUMAN_LOADOUT_READ_POLL_SECONDS` poll on a
+    healthy server, at worst :data:`HUMAN_LOADOUT_READ_TIMEOUT_SECONDS` when
+    nothing answers. The bridge sets no deadline on the next action, so the
+    agent simply holds still for that long, once, at the instant somebody joins
+    and before they have walked into range.
+
+    IT ARMS ON EVERY JOIN, not only the first: somebody who disconnects and
+    comes back, or the next person in the queue joining under the same pinned
+    name mid-match, is a challenger who needs gear just as much. That is safe
+    precisely because :func:`arm_challenger_gear` is idempotent.
+    """
+
+    def __init__(
+        self,
+        paper_proc: Any,
+        paper_log: Optional[Path],
+        challenger_username: Optional[str],
+        *,
+        paper_console: bool,
+        log: Callable[[str], None] = _ascii_log,
+    ) -> None:
+        self._paper_proc = paper_proc
+        self._paper_log = None if paper_log is None else Path(paper_log)
+        self._challenger_username = challenger_username
+        self._paper_console = paper_console
+        self._log = log
+        # The window opens at byte ZERO, not at the log's current length, and
+        # that is the opposite of `confirm_human_loadout`'s rule for a reason:
+        # `run()` opens paper.log with "wb" for every launch, so the whole file
+        # IS this launch. Somebody who hit Join the instant the Minecraft port
+        # went green -- plausible on demo day, and up to a `wait_for_port` poll
+        # interval before this object exists -- is then still armed on the
+        # first poll instead of silently missed. `resync()` is how the reset
+        # path moves the window forward when it has handled a join itself.
+        self._offset = 0
+        #: How many joins have been ANSWERED with an arming attempt. Not how
+        #: many succeeded: it is incremented before `arm_challenger_gear` is
+        #: called, so it also counts the `--no-paper-console` pass (which prints
+        #: the commands rather than running them) and a console pipe that
+        #: rejected the write. `poll()`'s return value is the one that reports
+        #: whether the gear actually reached the server. Kept for tests and for
+        #: an operator reading the log back afterwards; nothing branches on it.
+        self.arm_count = 0
+        if challenger_username is None:
+            log(
+                "WARNING: nobody will be armed when a challenger joins -- no "
+                "--challenger-username is pinned, and the server's join "
+                "announcement is only evidence if this process knows which "
+                "name to look for. Match 1 goes out unarmed, and so does every "
+                "match after it (the reset reports the same limitation, for "
+                "the same reason)."
+            )
+
+    @property
+    def watching(self) -> bool:
+        """True iff :meth:`poll` can do anything at all."""
+        return self._challenger_username is not None and self._paper_log is not None
+
+    def resync(self) -> None:
+        """Skip past everything the log holds right now, arming nothing.
+
+        Called when a reset is TRIGGERED, and before the reset's own commands go
+        out. Without it at all, a join announced while the launcher sat idle
+        between matches would still be sitting unread in the window, and the
+        next match's first poll would arm somebody the reset is about to arm —
+        harmless, since the commands are idempotent, but it prints a second
+        confirmation block and teaches the operator that the line means less
+        than it does.
+
+        THE CALL SITE IS THE CORRECTNESS ARGUMENT, AND IT SHIPPED ON THE WRONG
+        SIDE OF THE RESET. Running this AFTER ``_reset_human_side`` closes the
+        window over everything that reset did — including the up to
+        :data:`HUMAN_LOADOUT_READ_TIMEOUT_SECONDS` seconds
+        :func:`confirm_human_loadout` spends waiting for an answer that cannot
+        come, which is the ordinary case between matches: nobody is holding the
+        pinned name during a queue swap, so there is nothing to read back and
+        the full budget is burned every time. A challenger who joined inside
+        those seconds had their announcement written to ``paper.log`` BEFORE
+        this stat-ed the file, so it was skipped — while the reset's own ``item
+        replace`` lines had already run against nobody. They then played a whole
+        match unarmed: the exact failure T22 exists to remove, displaced from
+        match 1 to match N, on the utterly ordinary sequence "operator types
+        ``reset``, next person walks up and joins a couple of seconds later".
+
+        Resyncing at the TRIGGER instead can at worst arm somebody the reset
+        also armed, inside a window now measured in the microseconds between
+        this call and the reset's first console write. That costs a duplicate
+        confirmation block, and a duplicate arm is free by construction — ``item
+        replace`` overwrites and the sword's scoped ``clear`` prevents stacking.
+        It can no longer DROP one, and a dropped arm costs a whole match.
+
+        (Capturing the log length inside ``_reset_human_side`` and handing it
+        back would compute the SAME offset — nothing between the two writes to
+        ``paper.log`` — so it buys no fewer duplicates, only a return value
+        three early-return paths would have to invent a meaning for.)
+        """
+        if self._paper_log is not None:
+            self._offset = _log_size(self._paper_log)
+
+    def poll(self) -> bool:
+        """Read whatever the server has logged since the last look; arm if the
+        pinned challenger joined in it. True iff it armed on this call.
+
+        Nothing here can take a live match down. An unreadable log reads as
+        "nothing new" (:func:`_read_appended`), a dead console pipe is already
+        non-fatal and self-reporting (:func:`send_paper_console_commands`), and
+        the one raising path left -- a username the command builders refuse --
+        cannot fire for the launcher's own value, which ``ExhibitionConfig``
+        validated before Paper was started.
+        """
+        if not self.watching:
+            return False
+        text, self._offset = _read_appended(self._paper_log, self._offset)
+        if not text or not challenger_joined(text, self._challenger_username):
+            return False
+        # States what is being ATTEMPTED, not what is guaranteed: under
+        # `--no-paper-console` the very next line is "not arming <name>", and a
+        # promise retracted one line later reads worse than no promise at all.
+        self._log(
+            f"{self._challenger_username} joined the game -- gearing them now, "
+            "without waiting for a reset. The next line says whether the gear "
+            "went out."
+        )
+        self.arm_count += 1
+        return arm_challenger_gear(
+            self._paper_proc,
+            self._challenger_username,
+            paper_console=self._paper_console,
+            paper_log=self._paper_log,
+            log=self._log,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2182,6 +2671,21 @@ def run(
             raise ExhibitionLaunchError("Paper did not come up in time.")
         log(f"Paper is up on {args.mc_host}:{args.mc_port}.")
 
+        # --- T22: match 1 arms itself. Built HERE, before the bridge, so its
+        # window covers the whole of this launch's paper.log -- a challenger who
+        # joined while Paper was still finishing its boot, or while the bridge
+        # was starting, is armed on the first poll rather than missed. The bots'
+        # own join lines fall inside that window too and are ignored, because
+        # they are not the pinned name. Polled from inside play_one_match below;
+        # see ChallengerJoinArmer.
+        join_armer = ChallengerJoinArmer(
+            paper_proc,
+            paper_log,
+            exhibition_cfg.challenger_username,
+            paper_console=args.paper_console,
+            log=log,
+        )
+
         # --- Bridge (human opponent mode) ------------------------------------
         log(f"starting the bridge (log: {bridge_log}): {' '.join(bridge_argv)}")
         with open(bridge_log, "wb") as handle:
@@ -2226,7 +2730,11 @@ def run(
         while True:
             log(f"--- match {match_number} ---")
             play_one_match(
-                env, policy, reflex_blind_steps=exhibition_cfg.reflex_blind_steps, log=log
+                env,
+                policy,
+                reflex_blind_steps=exhibition_cfg.reflex_blind_steps,
+                before_decision=join_armer.poll,
+                log=log,
             )
             log(
                 "no auto-restart: a death ends the match and nothing starts "
@@ -2248,6 +2756,16 @@ def run(
             wait_for_reset_request(request_path, sleep=sleep)
             match_number += 1
             log(f"reset requested -- arming match {match_number}.")
+            # BEFORE the reset, never after it. A join announced while this
+            # launcher sat idle is about to be geared by the reset below, so
+            # dropping it here keeps the two from arming the same person twice
+            # and printing two confirmations for one match. Resyncing AFTERWARDS
+            # would also swallow a join that landed DURING the reset -- most of
+            # which is `confirm_human_loadout` waiting out its full timeout,
+            # because a reset between challengers has nobody to read back -- and
+            # that person's gear commands had already gone out against an empty
+            # name. See ChallengerJoinArmer.resync.
+            join_armer.resync()
             _reset_human_side(
                 paper_proc,
                 anchor,
