@@ -51,6 +51,7 @@ Owner: T16 (DQN core track)
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import threading
@@ -4411,13 +4412,18 @@ def _build_parser() -> "Any":
         "measurement --arenas.",
     )
     parser.add_argument(
-        "--opponent", type=str, default="dummy", choices=("dummy", "scripted"),
+        "--opponent", type=str, default="dummy",
+        choices=("dummy", "scripted", "selfplay"),
         help="who the agent fights (default: dummy). 'dummy' is the M1/M2 "
         "stationary dummy served entirely by the bridge - no opponent action ever "
         "goes on the wire. 'scripted' steps the ScriptedBot curriculum in Python "
-        "and threads its macro through as opp_action; it requires --arenas >1 "
-        "(the single-arena loop steps no opponent policy and refuses rather than "
-        "silently fighting the dummy).",
+        "and threads its macro through as opp_action. 'selfplay' steps a FROZEN "
+        "past self drawn from the run's snapshot pool and threads its macro "
+        "through the same way; it additionally requires --warm-start (the pool's "
+        "snapshot 0 is that checkpoint) and builds every env with the "
+        "opponent-seat observation mirror. Both non-dummy choices require "
+        "--arenas >1 (the single-arena loop steps no opponent policy and refuses "
+        "rather than silently fighting the dummy).",
     )
     # -- curriculum knobs (all default to TrainConfig's own values) ----------
     # Every one of these defaults to None and is applied only when given, so
@@ -4473,11 +4479,83 @@ def _build_parser() -> "Any":
         "the fresh-init 1.0 would spend the whole decay window acting mostly at "
         "random and throw the warm start away.",
     )
+    # -- self-play knobs (T11b; all default to None -> the config) ------------
+    # Same None-default rule as the curriculum block above: TrainConfig owns
+    # every default, so an argparse default can never drift away from the
+    # dataclass it configures. Each of these is read by the run ONLY when
+    # --opponent selfplay, and each says so, because a knob that silently does
+    # nothing on the path the operator is actually running is worse than absent.
+    parser.add_argument(
+        "--warm-start-sha256", type=str, default=None,
+        help="expected SHA-256 of the --warm-start checkpoint, as 64 lowercase hex "
+        "characters. The run REFUSES to start when the file on disk hashes to "
+        "anything else, naming BOTH digests. Omitted, nothing is verified. A "
+        "self-play run seeds snapshot 0 - the pool's first PINNED member, never "
+        "dropped and never evicted - entirely from this file, so the wrong "
+        "checkpoint becomes a permanent reference opponent; and a stale path or a "
+        "half-copied file loads perfectly cleanly into the same architecture.",
+    )
+    parser.add_argument(
+        "--snapshot-every-grad-steps", type=int, default=None,
+        help="--opponent selfplay only: learner gradient steps between snapshot-pool "
+        "archive events, each of which freezes the PUBLISHED weights as a new past "
+        "self the collectors can be drawn against (default: TrainConfig's 1000). "
+        "Read by the archive hook (T18), not by this module.",
+    )
+    parser.add_argument(
+        "--snapshot-sampling", type=str, default=None, choices=("uniform", "pfsp"),
+        help="--opponent selfplay only: how each episode's opponent snapshot is "
+        "drawn (default: TrainConfig's pfsp). 'pfsp' weights the pool toward the "
+        "snapshots the learner is roughly even with; 'uniform' draws every live "
+        "member with equal probability and is the documented fallback if PFSP has "
+        "to be cut.",
+    )
+    # NOTE for T12/T13, deliberately NOT fixed here: this flag is a RUN-WIDE
+    # value. `SnapshotOpponentDriver` binds `cfg.opponent_epsilon` once in its
+    # constructor (`self._epsilon`) and records it on every `MatchResult`, so
+    # there is currently no way to build the ε=0 opponent a RATED eval match
+    # needs — `MatchResult.rated_eligible` is True only when BOTH epsilons are
+    # exactly 0.0, so `elo/learner_rated` (AC7) stays empty by construction
+    # until an eval-side driver can carry its own epsilon. Passing 0 to this
+    # flag is NOT that fix: it would also make the frozen opponent greedy in
+    # every TRAINING episode, which is the deterministic lock-in the nonzero
+    # default exists to prevent.
+    parser.add_argument(
+        "--opponent-epsilon", type=float, default=None,
+        help="--opponent selfplay only: exploration epsilon applied to the FROZEN "
+        "snapshot opponent, never to the learner (default: TrainConfig's 0.02). It "
+        "never decays. Do not set it to 0 for a whole run: a greedy learner facing "
+        "a greedy snapshot can lock the pair into one deterministic episode "
+        "replayed until morning.",
+    )
+    parser.add_argument(
+        "--reference-promote-grad-steps", type=int, nargs=2, default=None,
+        metavar=("FIRST", "SECOND"),
+        help="--opponent selfplay only: the two grad steps at which pinned reference "
+        "snapshots 2 and 3 are promoted (default: TrainConfig's 5000 15000). Must "
+        "be strictly increasing. Reference 1 is snapshot 0, pinned at creation from "
+        "the warm start, and is not listed here. Read by the promotion hook (T18), "
+        "not by this module.",
+    )
+    parser.add_argument(
+        "--elo-k", type=float, default=None,
+        help="--opponent selfplay only: Elo K-factor, the largest rating swing one "
+        "rated match can produce (default: TrainConfig's 24).",
+    )
+    parser.add_argument(
+        "--elo-initial", type=float, default=None,
+        help="--opponent selfplay only: the learner's Elo before any rated match "
+        "(default: TrainConfig's 1000). A snapshot's rating is frozen at creation "
+        "from the learner's rating at that moment; only the learner's own rating "
+        "moves afterwards.",
+    )
     parser.add_argument(
         "--stop-on-pass", dest="stop_on_pass", action="store_true", default=None,
         help="stop the run as soon as an eval clears the M2 gate. DEFAULT: on for "
-        "--opponent dummy, OFF for --opponent scripted (the M2 gate is defined "
-        "against the stationary dummy, so it is not this retrain's finish line).",
+        "--opponent dummy, OFF for every other opponent (the M2 gate is defined "
+        "against the STATIONARY dummy, so clearing it says nothing about a run "
+        "that fights a scripted bot or a past self, and a warm-started agent can "
+        "clear it in its first eval).",
     )
     parser.add_argument(
         "--no-stop-on-pass", dest="stop_on_pass", action="store_false",
@@ -4491,8 +4569,8 @@ def _build_parser() -> "Any":
         "the episodes that many pads are projected to collect overnight) - every "
         "pad claims from ONE shared episode counter, so a single-arena number is "
         "spent N times too fast. The projection assumes an UNMEASURED mean episode "
-        "length; set this flag from the smoke run's measured mean (do NOT use 400, "
-        "which is the timeout, not a typical episode).",
+        "length; set this flag from the smoke run's measured mean (do NOT use 600, "
+        "which is MAX_EPISODE_STEPS - the truncation cap, not a typical episode).",
     )
     parser.add_argument(
         "--replay-capacity", type=int, default=None,
@@ -4577,6 +4655,18 @@ _CONFIG_OVERRIDE_FLAGS: Tuple[Tuple[str, str, Callable[[Any], Any]], ...] = (
     ("eval_opponent_preset", "eval_opponent_preset", str),
     ("warm_start", "warm_start", str),
     ("warm_start_eps_start", "warm_start_eps_start", float),
+    ("warm_start_sha256", "warm_start_sha256", str),
+    ("snapshot_every_grad_steps", "snapshot_every_grad_steps", int),
+    ("snapshot_sampling", "snapshot_sampling", str),
+    ("opponent_epsilon", "opponent_epsilon", float),
+    # `tuple`, NOT a passthrough. argparse `nargs=2` hands over a LIST, and
+    # `TrainConfig.__post_init__` rejects a non-tuple outright: a list field on a
+    # frozen dataclass makes `hash(cfg)` raise at whatever unrelated call site
+    # hashes the config first, arbitrarily far from this line. The entries are
+    # already `int` — the flag declares `type=int`.
+    ("reference_promote_grad_steps", "reference_promote_grad_steps", tuple),
+    ("elo_k", "elo_k", float),
+    ("elo_initial", "elo_initial", float),
     ("eps_decay_episodes", "eps_decay_episodes", int),
     ("replay_capacity", "replay_capacity", int),
     ("min_replay", "min_replay", int),
@@ -4630,12 +4720,82 @@ def _config_from_args(args: Any) -> TrainConfig:
     return dataclasses.replace(TrainConfig(), **overrides)
 
 
+#: Bytes read per hashing iteration in :func:`_verify_warm_start_checksum`. A
+#: checkpoint is a few MB today; a fixed-size loop costs nothing now and keeps a
+#: future larger net from being read into memory whole just to fingerprint it.
+_HASH_CHUNK_BYTES: int = 1 << 20
+
+
+def _verify_warm_start_checksum(cfg: TrainConfig) -> None:
+    """Refuse to start when ``--warm-start``'s bytes disagree with its checksum.
+
+    AC14's second half. ``TrainConfig`` validates only the SHAPE of
+    ``warm_start_sha256`` (64 lowercase hex characters) and never opens the
+    file; this is the only place the checkpoint's actual bytes are hashed.
+
+    A no-op unless ``cfg.warm_start_sha256`` is set, so every run that does not
+    pass ``--warm-start-sha256`` is unaffected.
+
+    Why the gate earns its own failure mode: a self-play run seeds snapshot 0 —
+    the pool's first PINNED member, which by
+    :class:`~opponents.snapshot_pool.SnapshotPool`'s corruption policy is never
+    dropped and never evicted — entirely from this file. A stale path, the wrong
+    run's checkpoint or a half-copied file loads perfectly cleanly into the same
+    architecture, and the run then spends the night measured against a permanent
+    reference opponent nobody can identify afterwards.
+
+    Args:
+        cfg: The run config, read for ``warm_start`` and ``warm_start_sha256``.
+
+    Raises:
+        ValueError: ``warm_start`` is unset (unreachable through
+            ``TrainConfig``, which already refuses that pair), or the file's
+            SHA-256 is not ``warm_start_sha256``. The mismatch message carries
+            BOTH digests: "checksum mismatch" alone cannot tell an operator
+            whether they pasted the wrong checksum or aimed at the wrong file.
+        FileNotFoundError: ``warm_start`` names no existing file. Raised here,
+            before a logger or a fleet exists, rather than inside ``Trainer``.
+    """
+    expected = cfg.warm_start_sha256
+    if expected is None:
+        return
+    if cfg.warm_start is None:
+        # Unreachable via TrainConfig (it rejects a checksum with no warm start),
+        # kept so this function cannot hash the literal string "None" if it is
+        # ever called with a config built some other way.
+        raise ValueError(
+            "warm_start_sha256 is set but warm_start is None: there is no "
+            f"checkpoint to hash against {expected}"
+        )
+    path = str(cfg.warm_start)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"--warm-start {path!r} is not an existing file, so the "
+            f"--warm-start-sha256 {expected} cannot be verified against it. "
+            "Fix the path (an absolute one survives a change of working "
+            "directory) or drop the checksum."
+        )
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise ValueError(
+            "warm-start checksum MISMATCH - refusing to start. "
+            f"--warm-start {path!r} hashes to {actual}, but "
+            f"--warm-start-sha256 says {expected}. Either the checkpoint is not "
+            "the one this run was sized against, or the checksum was copied "
+            "from a different file; do not start until you know which."
+        )
+
+
 def _resolve_stop_on_pass(explicit: Optional[bool], cfg: TrainConfig) -> bool:
     """Resolve ``--stop-on-pass`` / ``--no-stop-on-pass``, defaulting by opponent.
 
     An explicit flag always wins. With neither, the default is ``True`` for the
-    dummy (today's M2 behavior, unchanged) and ``False`` for the scripted
-    opponent.
+    dummy (today's M2 behavior, unchanged) and ``False`` for every other
+    opponent — the scripted curriculum and self-play alike.
 
     The asymmetry is not a preference, it is what the gate MEANS. ``passed_m2``
     is AC6's gate: >= 95% win rate **against the stationary dummy**. A retrain
@@ -4787,14 +4947,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     # are stamped the same way (TrainConfig validates every one of them).
     cfg = _config_from_args(args)
 
+    # The rest of the config validation, continued from TrainConfig into the one
+    # check that has to touch the disk. FIRST, so no later early return can skip
+    # it, and before the logger exists so a refused run leaves no run directory.
+    _verify_warm_start_checksum(cfg)
+    if cfg.warm_start_sha256 is not None:
+        print(
+            f"[train] warm start {cfg.warm_start} verified: "
+            f"sha256={cfg.warm_start_sha256}",
+            file=sys.stderr,
+        )
+
     # Refuse the one combination that cannot be honored, before anything starts:
-    # the single-arena loop steps no opponent policy, so --opponent scripted there
-    # would quietly train against the stationary dummy instead.
+    # the single-arena loop steps no opponent policy, so --opponent scripted or
+    # selfplay there would quietly train against the stationary dummy instead.
     if int(args.arenas) < 2 and cfg.opponent != "dummy":
         print(
             f"[train] FATAL: --opponent {cfg.opponent} needs --arenas >1. The "
-            "single-arena loop never steps an opponent policy (the dummy is served "
-            "by the bridge), so it would silently train against the stationary "
+            "single-arena loop never steps an opponent policy - neither the "
+            "scripted curriculum nor a self-play snapshot (the dummy is served "
+            "by the bridge) - so it would silently train against the stationary "
             "dummy while this run's config claimed otherwise. Re-run with "
             "--arenas N (N >= 2) against a booted pad fleet. Aborting.",
             file=sys.stderr,
@@ -4845,6 +5017,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             "per_actor_eps_alpha": cfg.per_actor_eps_alpha,
             "replay_capacity": cfg.replay_capacity,
             "min_replay": cfg.min_replay,
+            # WHO THIS RUN FOUGHT. `opponent` above proves only that the flag
+            # parsed; these decide which past self was drawn, how often a new
+            # one was archived, and what its rating meant. Recorded on every run
+            # (they are constants either way) — the loop reads them only when
+            # opponent == "selfplay".
+            "warm_start_sha256": cfg.warm_start_sha256,
+            "snapshot_every_grad_steps": cfg.snapshot_every_grad_steps,
+            "snapshot_sampling": cfg.snapshot_sampling,
+            "opponent_epsilon": cfg.opponent_epsilon,
+            # `list`, not the tuple: `json.dump` writes a tuple as a JSON array
+            # anyway, so converting here keeps summary.json and a W&B config the
+            # same shape rather than backend-dependent.
+            "reference_promote_grad_steps": list(cfg.reference_promote_grad_steps),
+            "elo_k": cfg.elo_k,
+            "elo_initial": cfg.elo_initial,
+            # Where this run's past selves live — through the SAME helper
+            # `_main_multi_arena` hands the loop, so the record and the pool
+            # cannot name two directories. None off the self-play path, which
+            # builds no pool at all.
+            "snapshot_pool_dir": (
+                snapshot_pool_directory(args.run_name)
+                if cfg.opponent == "selfplay"
+                else None
+            ),
             **reward_cfg,
         },
     )
@@ -4984,6 +5180,11 @@ def _main_multi_arena(
       * ``--mc-port`` is handed to BOTH the launcher (which refuses to spawn a bridge
         against an unreachable JVM) and the pool's :func:`~distributed.actor.jvm_alive`
         watchdog (whose ``False`` aborts the run). One value, one meaning.
+      * A self-play run's ``snapshot_dir`` is resolved HERE, from ``--run-name``
+        via :func:`snapshot_pool_directory`, and handed to
+        :func:`train_multi_arena`. Left unset, the loop's own fallback names
+        ``runs/selfplay/snapshots`` for every run alike, and a second run would
+        silently inherit the first's past selves and its Elo series.
       * A :class:`~distributed.actor.ShutdownSignal` is created HERE, before the
         launcher, because the launcher takes its ``sleep`` at construction. The pool
         sets it on stop/abort, so a shutdown that lands while a collector is inside
@@ -5059,6 +5260,18 @@ def _main_multi_arena(
     # walk — with clean logs the whole way.
     dummy_knockback_immune = cfg.opponent == "dummy"
 
+    # WHERE THIS RUN'S PAST SELVES LIVE. Derived from --run-name here rather than
+    # left to train_multi_arena's `snapshot_dir=None` fallback, which resolves to
+    # runs/selfplay/snapshots for EVERY run regardless of its name: a second
+    # self-play run would then reload the first one's pool, resample its
+    # snapshots and continue its Elo series as though the two learners were one.
+    # `None` off the self-play path, where the loop never reads it — and
+    # `args.run_name` is read only there, deliberately without a getattr
+    # fallback, because a default would be a shared pool by another name.
+    snapshot_dir = (
+        snapshot_pool_directory(args.run_name) if cfg.opponent == "selfplay" else None
+    )
+
     # The shutdown signal must exist BEFORE the launcher: the launcher takes its
     # polling sleep as a constructor argument, and that sleep is the only hook that
     # can interrupt its bounded wait from outside.
@@ -5103,6 +5316,7 @@ def _main_multi_arena(
         checkpoint_every_grad_steps=getattr(
             args, "checkpoint_every_grad_steps", None
         ),
+        snapshot_dir=snapshot_dir,
         logger=logger,
         checkpoint_hook=checkpoint_hook,
         best_checkpoint_hook=best_checkpoint_hook,
