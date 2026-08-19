@@ -96,11 +96,15 @@ SMOKE_PROMOTE_FIRST=800         # pinned reference #2
 SMOKE_PROMOTE_SECOND=1600       # pinned reference #3
 SMOKE_CHECKPOINT_EVERY=500
 # Pin epsilon at the run's TERMINAL value for the whole smoke. The smoke
-# measures CAPACITY, not learning, and `eps_decay_episodes=1` puts every arena
-# at `eps_end`=0.05 from its first episode — the same regime the canary's probe
-# measured the armored episode length in (learner 0.05 / opponent 0.02) and the
-# regime the long run spends >85% of its episodes in. Measuring throughput at
-# 0.25 instead would describe a fight nobody is going to have all night.
+# measures CAPACITY, not learning, and `eps_decay_episodes=1` collapses the
+# whole decay into GLOBAL episode 0: that one episode runs at
+# `effective_eps_start`=0.25 (the warm start's, since the smoke passes
+# --warm-start) and every episode after it at `eps_end`=0.05 — one episode in
+# the ~2,000 a smoke of this length collects. That is the regime the canary's
+# probe measured the armored episode length in (learner 0.05 / opponent 0.02)
+# and the one the long run spends >85% of its episodes in. Measuring
+# throughput at 0.25 throughout would describe a fight nobody is going to
+# have all night.
 SMOKE_EPS_DECAY_EPISODES=1
 SMOKE_RSS_SAMPLE_SECONDS=15
 SMOKE_SNAPSHOT_LOAD_REPEATS=5
@@ -732,21 +736,27 @@ def parse_etime(text: Any) -> Optional[float]:
 # refusal can name what it is refusing to use.
 # ---------------------------------------------------------------------------
 
-#: Which of the canary's three episode-length figures sizes a TRAINING run, and
-#: why. The probe's is measured at learner eps=0.05 / opponent eps=0.02 — the
-#: run's TERMINAL epsilons — and a run whose decay spans 15% of its episodes
-#: fights the other 85% at (or near) exactly those values. The greedy-eval
-#: figure is a different regime (eps=0 both sides) and belongs to eval sizing,
-#: which is where it is used below.
+#: Which of the canary's armored episode-length figures sizes a TRAINING run,
+#: and why. The probe's is measured at learner eps=0.05 / opponent eps=0.02 —
+#: the run's TERMINAL epsilons — and a run whose decay spans 15% of its episodes
+#: fights the other 85% at (or near) exactly those values. The periodic eval's
+#: figure is a DIFFERENT regime — one seat is the fixed scripted yardstick that
+#: ``agent.train.build_eval_opponent`` returns even on a self-play run, not the
+#: trained net — and belongs to eval sizing, which is where it is used below.
+#:
+#: There is no eps=0-both-sides episode length anywhere in the canary: the rated
+#: reference gauntlet is the only greedy-vs-greedy regime and it reports Elo,
+#: never a length. A key by that name was removed from T17's measurement.
 EPISODE_LENGTH_SOURCES: Dict[str, Tuple[str, str]] = {
     "probe": (
         "armored_mean_episode_length_probe",
         "canary probe (learner eps=0.05 / opponent eps=0.02 — the run's terminal "
         "epsilons, and the demo's regime)",
     ),
-    "eval_greedy": (
-        "armored_mean_episode_length_eval_greedy",
-        "canary training-run greedy eval (eps=0 both sides)",
+    "eval_vs_scripted": (
+        "armored_mean_episode_length_eval_vs_scripted",
+        "canary training-run periodic eval, fought against the FIXED SCRIPTED "
+        "yardstick named in eval_opponent",
     ),
 }
 
@@ -954,20 +964,34 @@ def derive_sizing(
     # An eval episode is played on ONE borrowed arena at the per-arena rate, so
     # its wall cost is steps / 4.8782 s. That model reproduces the measured
     # "100 episodes == 97 minutes" figure exactly: 100 x 285 / 4.8782 == 5842 s.
-    greedy_length = _num(measurements.get("armored_mean_episode_length_eval_greedy"))
-    if greedy_length is None or greedy_length <= 0.0:
+    #
+    # The length used here is the canary's PERIODIC-EVAL figure, whose opponent
+    # is the fixed scripted yardstick — ``eval_opponent`` names the driver, and
+    # is carried through to the report so the regime can never be read off the
+    # number alone. The canary writes this figure only when the cycle it probed
+    # produced one, so its absence is an ordinary outcome, not a missing field.
+    eval_length = _num(
+        measurements.get("armored_mean_episode_length_eval_vs_scripted")
+    )
+    eval_opponent = measurements.get("eval_opponent")
+    out["eval_opponent"] = eval_opponent
+    if eval_length is None or eval_length <= 0.0:
         # Fall back to the SAME measured armored length, never to a constant.
-        greedy_length = length
+        eval_length = length
+        out["eval_opponent"] = None
         out["eval_length_source"] = (
-            "no greedy-eval length in the canary measurement; using the probe's "
-            "armored length instead"
+            "the canary recorded no scripted-eval length for this cycle; using "
+            "the probe's armored length instead"
         )
     else:
-        out["eval_length_source"] = "canary greedy eval (eps=0 both sides)"
-    out["eval_episode_length_steps"] = greedy_length
+        out["eval_length_source"] = (
+            "canary periodic eval vs the fixed scripted yardstick"
+            + (f", {eval_opponent}" if eval_opponent else "")
+        )
+    out["eval_episode_length_steps"] = eval_length
     out["eval_episode_seconds"] = (
-        greedy_length / MEASURED_PER_ARENA_TRANSITIONS_PER_S
-        if greedy_length and greedy_length > 0.0
+        eval_length / MEASURED_PER_ARENA_TRANSITIONS_PER_S
+        if eval_length and eval_length > 0.0
         else None
     )
 
@@ -1778,7 +1802,9 @@ def check_eval_sizing(plan: Mapping[str, Any], sizing: Mapping[str, Any]) -> Lis
                 "the eval cycle cost could not be computed",
                 "without an armored eval-episode length there is no way to know "
                 "whether a cycle costs half an hour or two.",
-                "check the canary's greedy-eval measurement.",
+                "check the canary's armored_mean_episode_length_eval_vs_scripted "
+                "AND its probe length: the eval figure falls back to the probe's, "
+                "so reaching here means BOTH are absent.",
             )
         )
     elif minutes > limits["eval_cycle_hard_max_minutes"]:
@@ -2025,10 +2051,13 @@ def build_launch_argv(
 
     Every value is either measured, derived above, or an operator override that
     the checks have already seen. Flags whose TrainConfig default is the right
-    answer are deliberately OMITTED — ``--snapshot-every-grad-steps``,
+    answer are OMITTED unless overridden — ``--snapshot-every-grad-steps``,
     ``--opponent-epsilon``, ``--reference-promote-grad-steps``, ``--elo-k``,
     ``--elo-initial`` and ``--warm-start-eps-start`` are tuned decisions from
     T11a, and restating them here would create a second place for them to drift.
+    Only the first of the six has an override at all: an explicit
+    ``--snapshot-every-grad-steps`` reaches ``sizing`` and IS emitted below. The
+    other five have no operator path and never appear.
     """
     warm = _section(plan, "warm_start")
     argv: List[str] = [

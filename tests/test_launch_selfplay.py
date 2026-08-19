@@ -62,6 +62,9 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "launch_selfplay.sh")
+#: T17's script, read for ONE thing only: the key list its `build_measurements`
+#: returns, which is the document this gate's whole sizing chain consumes.
+CANARY_SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "canary_selfplay.sh")
 
 
 # ---------------------------------------------------------------------------
@@ -174,22 +177,56 @@ NOW = 1_755_000_000.0
 
 
 def make_canary_measurements(**overrides: Any) -> Dict[str, Any]:
-    """A canary measurement file as T17's `build_measurements` writes it."""
+    """A canary measurement file, key-for-key as T17's `build_measurements` writes it.
+
+    Copied from that function's OWN key list rather than written from memory,
+    and `test_the_canary_fixture_carries_exactly_the_producers_keys` re-derives
+    that list from `scripts/canary_selfplay.sh` on every run so the next rename
+    fails here instead of at 20:00.
+
+    The drift this replaced was load-bearing: the fixture carried
+    `armored_mean_episode_length_eval_greedy`, a key T17 REMOVED (its own
+    `notes` record the rename), so three tests drove an input production can
+    never supply — and one of them was the only coverage of the eval squeeze.
+
+    The numbers are internally consistent: 885 episodes over 1080 s at 25 pads
+    is the 118.0 episodes/arena/hour recorded below, and 118 x 25 is its 25-pad
+    projection. The probe's 132-step fight and the eval's 118-step one are
+    DIFFERENT regimes, which is the whole reason T17 writes both.
+    """
     document: Dict[str, Any] = {
         "measured_at_run": "m4_selfplay_canary",
         "max_episode_steps": 600,
+        # -- the probe: both seats at the run's terminal epsilons -------------
         "armored_mean_episode_length_probe": 132.0,
         "armored_median_episode_length_probe": 128.0,
         "armored_episode_lengths_probe": [140, 128, 128],
         "probe_learner_epsilon": 0.05,
         "probe_opponent_epsilon": 0.02,
-        "armored_mean_episode_length_eval_greedy": 118.0,
-        "eval_episodes": 6,
+        # -- the periodic eval: one seat is the FIXED scripted yardstick ------
+        "armored_mean_episode_length_eval_vs_scripted": 118.0,
+        "eval_opponent": "scripted_mixed",
+        "eval_grad_step": 1000,
+        "eval_episodes_per_cycle": 6,
+        # -- the collection rate a window converts through --------------------
+        "training_episodes": 885,
+        "training_grad_steps": 1200,
+        "training_wall_seconds": 1080.0,
+        "training_arenas": 25,
+        "training_epsilon_schedule_at_end": 0.05,
+        "training_epsilon_mean_at_end": 0.0072,
         "measured_episodes_per_arena_hour": 118.0,
         "projected_episodes_per_hour_at_25_pads": 2950.0,
+        # -- the armored damage regime ----------------------------------------
+        "armored_damage_dealt_per_episode": 9.36,
+        "armored_damage_taken_per_episode": 8.1,
+        "armored_full_charge_hits_dealt": [3.12, 3.12, 3.12],
+        "armored_full_charge_hits_taken": [3.12, 3.12],
         "armored_cap_hit_rate": 0.08,
-        "training_episodes": 900,
-        "training_grad_steps": 1200,
+        # T17 writes four notes here; the gate reads none of them, so the
+        # fixture carries one stand-in rather than a second copy of T17's prose
+        # that could drift into a false claim of its own.
+        "notes": ["the two lengths and the rate are NOT interchangeable"],
     }
     document.update(overrides)
     return document
@@ -316,6 +353,35 @@ def make_smoke_evidence(**overrides: Any) -> Dict[str, Any]:
     return document
 
 
+def canary_measurement_keys() -> List[str]:
+    """The keys T17's `build_measurements` ACTUALLY returns, called for real.
+
+    Extracted and exec'd the same way this file loads the sizing module, then
+    invoked on an empty evidence document: every key is emitted unconditionally,
+    so the returned dict IS the schema. `CANARY_VERDICT_PY` imports only the
+    standard library, so this costs nothing and reaches no server.
+    """
+    with open(CANARY_SCRIPT_PATH, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    opener = "<<'CANARY_VERDICT_PY'"
+    starts = [i for i, line in enumerate(lines) if line.rstrip().endswith(opener)]
+    assert len(starts) == 1, f"expected exactly one {opener}, got {starts}"
+    ends = [
+        i
+        for i in range(starts[0] + 1, len(lines))
+        if lines[i].strip() == "CANARY_VERDICT_PY"
+    ]
+    assert ends, f"no CANARY_VERDICT_PY terminator after line {starts[0] + 1}"
+    source = "\n".join(lines[starts[0] + 1 : ends[0]]) + "\n"
+    module = types.ModuleType("t17_canary_verdict")
+    module.__dict__["__file__"] = CANARY_SCRIPT_PATH
+    exec(  # noqa: S102 - the point is to run T17's own code, not a copy of it
+        compile(source, f"{CANARY_SCRIPT_PATH}:CANARY_VERDICT_PY", "exec"),
+        module.__dict__,
+    )
+    return sorted(module.build_measurements({}))
+
+
 def refusal_codes(verdict: Any) -> List[str]:
     return [check.code for check in verdict.refusals]
 
@@ -327,6 +393,75 @@ def evaluate(plan: Mapping[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 # Extraction and shape.
 # ---------------------------------------------------------------------------
+
+
+def test_the_canary_fixture_carries_exactly_the_producers_keys() -> None:
+    """`make_canary_measurements` must be T17's schema — all of it, nothing else.
+
+    A fixture that invents a key lets a test drive an input production can never
+    supply, and a fixture that omits one hides a field the gate should be
+    reading. Both happened at once: the fixture carried
+    `armored_mean_episode_length_eval_greedy` (removed by T17) while omitting
+    the `armored_mean_episode_length_eval_vs_scripted` / `eval_opponent` pair
+    that replaced it, so the gate read a permanently-absent field and told every
+    operator, truthfully-looking, that a measurement was missing.
+
+    Derived from `build_measurements` itself rather than typed out here, so a
+    rename fails in this file instead of at 20:00 on the launch night.
+    """
+    assert sorted(make_canary_measurements()) == canary_measurement_keys()
+
+
+def test_the_eval_sizing_reads_the_key_t17_writes() -> None:
+    """The eval cost comes from the periodic-eval length, labelled by its opponent.
+
+    The regression this pins: T19 read `..._eval_greedy` after T17 renamed it,
+    so on EVERY healthy run the eval fell back to the probe's length and the
+    report announced a missing measurement. The sizing stayed sane — the
+    fallback is the measured probe, never a constant — which is exactly why the
+    false report could have survived the night.
+    """
+    sizing = sizing_module.derive_sizing(make_canary_measurements(), window_hours=12.0)
+    assert sizing["eval_episode_length_steps"] == 118.0
+    assert sizing["eval_opponent"] == "scripted_mixed"
+    assert "scripted_mixed" in sizing["eval_length_source"]
+    assert "scripted yardstick" in sizing["eval_length_source"]
+    # The label must not resurrect the claim T17 removed.
+    assert "greedy" not in sizing["eval_length_source"]
+    assert "eps=0" not in sizing["eval_length_source"]
+    # ... and it travels into the report the operator reads at 20:00.
+    verdict = evaluate(make_plan())
+    assert "scripted_mixed" in sizing_module.format_launch_report(verdict, make_plan())
+
+
+def test_a_cycle_with_no_eval_length_falls_back_and_says_so_truthfully() -> None:
+    """Absence is reported as THIS CYCLE's, not as a missing field.
+
+    T17 writes the eval length only when the cycle it probed produced one, so
+    its absence is an ordinary outcome. Saying "no greedy-eval length in the
+    canary measurement" instead named a field that no longer exists and sent the
+    operator looking for a bug in the producer.
+    """
+    sizing = sizing_module.derive_sizing(
+        make_canary_measurements(
+            armored_mean_episode_length_eval_vs_scripted=None, eval_opponent=None
+        ),
+        window_hours=12.0,
+    )
+    # The fallback is the SAME measured armored length, never a constant.
+    assert sizing["eval_episode_length_steps"] == sizing["episode_length_steps"]
+    assert sizing["eval_opponent"] is None
+    assert "for this cycle" in sizing["eval_length_source"]
+    assert "probe" in sizing["eval_length_source"]
+    assert "greedy" not in sizing["eval_length_source"]
+
+
+def test_the_named_episode_length_sources_all_exist_in_the_measurement() -> None:
+    """Every source key the sizing offers must be one T17 actually writes."""
+    produced = set(canary_measurement_keys())
+    for source, (key, label) in sizing_module.EPISODE_LENGTH_SOURCES.items():
+        assert key in produced, f"{source} points at {key}, which T17 never writes"
+        assert label.strip()
 
 
 def test_sizing_module_is_stdlib_only() -> None:
@@ -505,7 +640,7 @@ def test_the_eval_cost_model_reproduces_the_measured_97_minutes() -> None:
     """
     sizing = sizing_module.derive_sizing(
         make_canary_measurements(
-            armored_mean_episode_length_eval_greedy=(
+            armored_mean_episode_length_eval_vs_scripted=(
                 sizing_module.STALE_EPISODE_STEPS_SCRIPTED_BARE
             )
         ),
@@ -615,14 +750,21 @@ def test_the_eval_cycle_lands_inside_the_target_band() -> None:
 
 
 def test_expensive_episodes_squeeze_the_scripted_track_not_the_gauntlet() -> None:
-    """With a 550-step armored eval, the yardstick shrinks and the gauntlet holds.
+    """A 550-step eval against the scripted yardstick shrinks the yardstick only.
 
     The gauntlet is the checkpoint-SELECTION input. Losing precision there
     changes which net ships; losing it on the yardstick only makes one logged
     curve noisier.
+
+    The squeeze is driven through `armored_mean_episode_length_eval_vs_scripted`
+    — the key T17 actually writes — so the path exercised here is one a real
+    measurement can reach. A near-cap eval is not in tension with the probe's
+    8% cap-hit rate below it: the probe is both seats at eps=0.05/0.02 and this
+    is one seat against the fixed scripted bot, which is exactly why T17 keeps
+    the two lengths apart.
     """
     sizing = sizing_module.derive_sizing(
-        make_canary_measurements(armored_mean_episode_length_eval_greedy=550.0),
+        make_canary_measurements(armored_mean_episode_length_eval_vs_scripted=550.0),
         window_hours=12.0,
     )
     assert sizing["eval_episodes"] == 10
@@ -715,18 +857,60 @@ def test_missing_canary_measurement_refuses() -> None:
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    "canary_mutation, fleet_mutation, expected_detail",
     [
-        {"mtime": NOW - 13 * 3600.0},  # older than the 12 h allowance
-        {"mtime": NOW + 600.0},  # dated in the future: the clock is unusable
-        {"mtime": None},  # unknowable age
+        pytest.param(
+            {"mtime": NOW - 13 * 3600.0},
+            # The fleet is OLDER than the measurement, so the bridge-restart
+            # clause CANNOT fire and only the age limit can produce this code.
+            # The fixture's 2 h-old bridges trip that clause too, under the SAME
+            # code, so without this the age branch could be deleted outright and
+            # the case would still go green.
+            {
+                "youngest_listener_age_seconds": 20 * 3600.0,
+                "oldest_listener_age_seconds": 21 * 3600.0,
+            },
+            "measurement is 13.0 h old (limit 12 h)",
+            id="older_than_the_12_h_allowance",
+        ),
+        pytest.param(
+            {"mtime": NOW + 600.0},
+            {},
+            "dated 0.17 h in the FUTURE",
+            id="dated_in_the_future",
+        ),
+        pytest.param(
+            {"mtime": None},
+            {},
+            "mtime=None",
+            id="age_unknowable",
+        ),
     ],
 )
-def test_a_stale_canary_measurement_refuses(mutation: Dict[str, Any]) -> None:
+def test_a_stale_canary_measurement_refuses(
+    canary_mutation: Dict[str, Any],
+    fleet_mutation: Dict[str, Any],
+    expected_detail: str,
+) -> None:
+    """Each way freshness can fail must refuse ON ITS OWN CLAUSE.
+
+    All three share one code, so asserting the code alone is not coverage: the
+    age case used to pass because the fixture's 2 h-old bridges tripped the
+    bridge-restart clause underneath it. The detail is asserted for that reason
+    — it is the only thing that distinguishes which clause spoke, and it carries
+    the 12 h threshold itself, so widening the limit fails here too.
+
+    The age clause is the one that catches "canary from Monday, fleet booted
+    Sunday and never restarted since" — precisely the case the bridge-age clause
+    is blind to.
+    """
     plan = make_plan()
-    plan["canary"].update(mutation)
-    codes = refusal_codes(evaluate(plan))
-    assert "CANARY_MEASUREMENTS_STALE" in codes
+    plan["canary"].update(canary_mutation)
+    plan["fleet"].update(fleet_mutation)
+    verdict = evaluate(plan)
+    assert "CANARY_MEASUREMENTS_STALE" in refusal_codes(verdict)
+    stale = next(c for c in verdict.refusals if c.code == "CANARY_MEASUREMENTS_STALE")
+    assert expected_detail in stale.detail
 
 
 def test_a_bridge_restarted_since_the_canary_refuses() -> None:
@@ -921,7 +1105,7 @@ def test_an_uncomputable_eval_cycle_refuses() -> None:
     plan = make_plan()
     measurements = plan["canary"]["measurements"]
     measurements["armored_mean_episode_length_probe"] = None
-    measurements["armored_mean_episode_length_eval_greedy"] = None
+    measurements["armored_mean_episode_length_eval_vs_scripted"] = None
     codes = refusal_codes(evaluate(plan))
     assert "EVAL_CYCLE_TOO_LONG" in codes
 
