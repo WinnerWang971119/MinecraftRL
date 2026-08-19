@@ -1039,10 +1039,11 @@ class SnapshotPool:
         under ``sampling="uniform"`` every member gets ``1 / N``. See
         :meth:`_raw_weights_locked` for why each term is there.
 
-        T17's launch canary is contracted to read this as-is and refuse to
-        launch on invalid or NaN PFSP probabilities. Forward-marked, not a
-        description of today: ``scripts/`` does not exist yet, so nothing
-        currently checks these numbers at launch.
+        T17's launch canary reads this as-is and refuses to launch on invalid or
+        NaN PFSP probabilities: ``scripts/canary_selfplay.sh`` calls it on the
+        run's pool and its ``PFSP_INVALID`` condition blocks the launch on a
+        non-finite, negative, non-normalized or incomplete vector. These numbers
+        are checked at launch today, so a weakening here is caught there.
 
         Returns:
             ``{snapshot_id: probability}`` summing to 1.0, or ``{}`` when the
