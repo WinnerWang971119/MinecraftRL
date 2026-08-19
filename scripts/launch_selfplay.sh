@@ -75,6 +75,7 @@ CANARY_RUN_NAME="m4_selfplay_canary"
 ARENAS=25
 WINDOW_HOURS=12
 WARM_START=""
+EXPECT_SHA256=""
 HOST="127.0.0.1"
 BRIDGE_BASE_PORT=5555
 MC_PORT=25565
@@ -137,7 +138,9 @@ usage: scripts/launch_selfplay.sh <command> [options]
 commands:
   smoke     bounded ${ARENAS}-pad run at production settings; refuses on
             transitions/s, grad steps/hour, queue backlog, RSS or snapshot-load
-            latency. Requires the fleet to be UP and the canary to be GREEN.
+            latency. Requires the fleet to be UP and the canary's measurements
+            file to EXIST (the canary writes it on refused runs too; a GREEN
+            canary is enforced by plan/launch, not here).
   plan      derive the sizing from the canary/smoke measurements and print the
             arithmetic plus the exact launch command. Starts nothing.
   launch    plan, preflight, then start the driver detached (nohup) and print
@@ -148,6 +151,13 @@ common options:
   --warm-start PATH        ABSOLUTE path to the frozen M3 checkpoint. REQUIRED
                            for smoke/plan/launch (TrainConfig refuses
                            --opponent selfplay without one, AC14).
+  --expect-sha256 HEX      the RECORDED sha256 of the warm start (64 lowercase
+                           hex). When given, smoke/plan/launch REFUSE unless
+                           the file's computed digest matches it - the guard
+                           against tab-completing runs/m4.pt (the rejected
+                           30k-step net) instead of runs/m4.best.pt. When
+                           omitted the digest is verified against nothing, and
+                           the preflight says so.
   --run-name NAME          long-run name (default: ${RUN_NAME}). NOT "m4": the
                            completed bare-handed run owns runs/m4.*, which is
                            also this run's warm-start source.
@@ -206,6 +216,7 @@ ANALYZE_ONLY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --warm-start)     need_value "$1" $#; WARM_START="$2"; shift 2 ;;
+        --expect-sha256)  need_value "$1" $#; EXPECT_SHA256="$2"; shift 2 ;;
         --run-name)       need_value "$1" $#; RUN_NAME="$2"; shift 2 ;;
         --smoke-run-name) need_value "$1" $#; SMOKE_RUN_NAME="$2"; shift 2 ;;
         --window-hours)   need_value "$1" $#; WINDOW_HOURS="$2"; shift 2 ;;
@@ -234,6 +245,13 @@ while [[ $# -gt 0 ]]; do
         *) usage >&2; die "unknown argument: $1" ;;
     esac
 done
+
+# A malformed expected digest can never match anything, so it is refused HERE,
+# loudly, rather than surfacing later as a baffling "mismatch" against a value
+# that was never a sha256 in the first place.
+if [[ -n "${EXPECT_SHA256}" ]] && ! [[ "${EXPECT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    die "--expect-sha256 must be 64 lowercase hex characters, got '${EXPECT_SHA256}'."
+fi
 
 # --- Interpreter ------------------------------------------------------------
 if [[ -z "${PYTHON_BIN}" ]]; then
@@ -398,6 +416,11 @@ Sizing (:func:`evaluate_launch`):
   refuses ``--opponent selfplay`` without a warm start (AC14), and the pool's
   snapshot 0 — a PINNED reference, never dropped, never evicted — is seeded
   entirely from this file.
+* ``WARM_START_CANARY_MISMATCH`` — the canary's recorded ``warm_start_sha256``
+  differs from the digest this launch computed, or was never recorded. Every
+  other digest comparison in the chain hashes the file it is checking, so this
+  is the only place two INDEPENDENT namings of the checkpoint meet; a canary
+  GREEN earned on file A clears nothing about a launch pointed at file B.
 * ``RUN_NAME_COLLISION`` — the run would overwrite an existing run's outputs, or
   its own warm start. ``runs/m4.*`` belongs to the completed bare-handed run AND
   is this run's warm-start source: reusing the name overwrites the warm start
@@ -1696,6 +1719,60 @@ def check_warm_start(plan: Mapping[str, Any]) -> CheckResult:
     )
 
 
+def check_warm_start_canary_agreement(plan: Mapping[str, Any]) -> CheckResult:
+    """The canary and this launch must have hashed the SAME checkpoint.
+
+    Every other digest comparison in the chain is self-referential: the shell
+    hashes whatever file ``--warm-start`` names and hands that digest to the
+    driver, whose T11b gate then compares the file against the digest just
+    computed FROM it. The canary's recorded ``warm_start_sha256`` is the one
+    digest produced by a DIFFERENT invocation, so this is the only check that
+    can catch a canary proven on file A gating a launch pointed at file B —
+    ``runs/m4.pt`` sits one tab-completion from ``runs/m4.best.pt``, and the
+    wrong one becomes snapshot 0, a PINNED reference, for the whole night.
+    A canary that recorded no digest refuses too: absent evidence is a refusal
+    here, never a pass.
+    """
+    canary = _section(plan, "canary")
+    measurements = (
+        dict(canary.get("measurements") or {})
+        if isinstance(canary.get("measurements"), Mapping)
+        else {}
+    )
+    recorded = measurements.get("warm_start_sha256")
+    warm = _section(plan, "warm_start")
+    computed = warm.get("sha256")
+    if not isinstance(recorded, str) or not recorded.strip():
+        return _refuse(
+            "WARM_START_CANARY_MISMATCH",
+            f"the canary measurement records warm_start_sha256={recorded!r}",
+            "nothing ties the canary's verdict to the file this launch would "
+            "seed snapshot 0 from. A canary that did not record which "
+            "checkpoint it proved may have proved a different one.",
+            "re-run scripts/canary_selfplay.sh (current revision, which records "
+            "the digest in canary_measurements.json) against the same "
+            "--warm-start.",
+        )
+    if recorded != computed:
+        return _refuse(
+            "WARM_START_CANARY_MISMATCH",
+            f"canary hashed {measurements.get('warm_start')!r} (sha256 "
+            f"{recorded}); this launch hashed {warm.get('path')!r} (sha256 "
+            f"{computed!r})",
+            "the canary's verdict was earned on a DIFFERENT checkpoint than "
+            "the one this launch would pin as snapshot 0 — runs/m4.pt (the "
+            "rejected 30k-step net) sits one tab-completion from "
+            "runs/m4.best.pt, and every downstream digest check hashes the "
+            "file it is checking, so nothing later can catch this.",
+            "pass the SAME --warm-start the canary ran with, or re-run the "
+            "canary against the file you mean to launch from.",
+        )
+    return _ok(
+        "WARM_START_CANARY_MISMATCH",
+        f"canary and launch both hashed sha256 {recorded[:12]}...",
+    )
+
+
 def check_run_name(plan: Mapping[str, Any]) -> CheckResult:
     """The run must not overwrite another run — least of all its own warm start.
 
@@ -2011,6 +2088,7 @@ def evaluate_launch(plan: Mapping[str, Any]) -> Verdict:
     checks.append(check_smoke_cleared(plan))
     checks.append(check_fleet(plan))
     checks.append(check_warm_start(plan))
+    checks.append(check_warm_start_canary_agreement(plan))
     checks.append(check_run_name(plan))
     checks.append(check_checkpoints(plan))
     checks.extend(check_eval_sizing(plan, sizing))
@@ -3122,6 +3200,36 @@ LAUNCH_SHA_PY
     fi
 }
 
+# check_expected_sha256 — the AC14 recorded-digest gate. Every OTHER digest in
+# this chain is computed from whatever file --warm-start names and then
+# compared against that same file (T11b's --warm-start-sha256 gate included),
+# which proves only that the file did not change between hash and load — never
+# that it is the checkpoint the operator MEANT. --expect-sha256 is the one
+# input that comes from the RECORD instead of from the file, so it is the only
+# comparison that can catch a tab-completed runs/m4.pt standing where
+# runs/m4.best.pt was decided.
+check_expected_sha256() {
+    if [[ -z "${EXPECT_SHA256}" ]]; then
+        warn "warm-start sha256 verified against NOTHING (no --expect-sha256 given): the digest above is self-computed and cannot prove this is the RECORDED checkpoint."
+        return 0
+    fi
+    if [[ "${WARM_START_SHA256}" != "${EXPECT_SHA256}" ]]; then
+        local resolved
+        case "${WARM_START}" in
+            /*) resolved="${WARM_START}" ;;
+            *)  resolved="$(cd -- "$(dirname -- "${WARM_START}")" >/dev/null 2>&1 && pwd)/$(basename -- "${WARM_START}")" ;;
+        esac
+        die "warm-start digest mismatch (WARM_START_DIGEST_MISMATCH):
+        hashed    ${resolved}
+        computed  ${WARM_START_SHA256}
+        expected  ${EXPECT_SHA256}  <- --expect-sha256
+      This file is NOT the checkpoint the recorded digest names. runs/m4.pt
+      (the REJECTED 30k-step net) sits one tab-completion from runs/m4.best.pt;
+      check which path you passed before the night is committed to it."
+    fi
+    log "  sha256 matches --expect-sha256 (recorded digest verified)"
+}
+
 require_warm_start() {
     [[ -n "${WARM_START}" ]] || { usage >&2; die "--warm-start is REQUIRED.
       agent/train_config.py refuses --opponent selfplay without one (AC14): the
@@ -3138,6 +3246,7 @@ require_warm_start() {
     WARM_START_SHA256="$(sha256_file "${WARM_START}")"
     log "warm start ${WARM_START}"
     log "  sha256 ${WARM_START_SHA256}"
+    check_expected_sha256
 }
 
 # inspect_fleet — fills FLEET_* with what `lsof` and one Paper connect can see.

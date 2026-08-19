@@ -140,6 +140,7 @@ HOST="127.0.0.1"
 BRIDGE_BASE_PORT=5555
 MC_PORT=25565
 WARM_START=""
+EXPECT_SHA256=""
 OUT_DIR=""
 PYTHON_BIN=""
 ANALYZE_ONLY=""
@@ -161,6 +162,12 @@ REQUIRED
                         run starts from (e.g. .../MinecraftRL/runs/m4.best.pt).
                         Its sha256 is computed and passed to the driver so the
                         AC14 checksum gate actually executes.
+  --expect-sha256 HEX   OPTIONAL: the RECORDED sha256 of that checkpoint (64
+                        lowercase hex). The preflight REFUSES when the file's
+                        computed digest differs - the guard against
+                        tab-completing runs/m4.pt (the rejected 30k-step net)
+                        instead of runs/m4.best.pt. When omitted the digest is
+                        verified against nothing, and the preflight says so.
 
 FLEET (this script starts NOTHING — boot it yourself, Paper -> bridges first)
   --arenas N            Pads to use. Default ${ARENAS}. Ports ${BRIDGE_BASE_PORT}..${BRIDGE_BASE_PORT}+N-1.
@@ -222,6 +229,7 @@ need_value() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --warm-start)         need_value "$1" $#; WARM_START="$2"; shift 2 ;;
+        --expect-sha256)      need_value "$1" $#; EXPECT_SHA256="$2"; shift 2 ;;
         --arenas)             need_value "$1" $#; ARENAS="$2"; shift 2 ;;
         --bridge-base-port)   need_value "$1" $#; BRIDGE_BASE_PORT="$2"; shift 2 ;;
         --mc-port)            need_value "$1" $#; MC_PORT="$2"; shift 2 ;;
@@ -275,6 +283,12 @@ for pair in "ARENAS ${ARENAS}" "MAX_GRAD_STEPS ${MAX_GRAD_STEPS}" \
 done
 if ! [[ "${SEED}" =~ ^[0-9]+$ ]]; then
     die "SEED must be a non-negative integer, got '${SEED}'."
+fi
+# A malformed expected digest can never match anything, so it is refused HERE,
+# loudly, rather than surfacing later as a baffling "mismatch" against a value
+# that was never a sha256 in the first place.
+if [[ -n "${EXPECT_SHA256}" ]] && ! [[ "${EXPECT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    die "--expect-sha256 must be 64 lowercase hex characters, got '${EXPECT_SHA256}'."
 fi
 # The existing `--arenas < 2` refusal in agent/train.py covers `selfplay` (the
 # single-arena loop steps no opponent policy at all), so a 1-pad canary would
@@ -1978,6 +1992,11 @@ def build_measurements(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         observed, which includes reset overhead and the whole epsilon schedule,
         and is what converts a 24-hour budget into an episode count.
 
+    Also PROVENANCE: ``warm_start`` / ``warm_start_sha256`` record which
+    checkpoint this canary's verdict was earned on. T19's launch gate compares
+    its own computed ``--warm-start`` digest against the recorded one, so a
+    canary proven on file A can never clear a launch pointed at file B.
+
     WHERE THE EVAL FIGURE COMES FROM. The driver log, not ``summary.json``. On
     the multi-arena path the only ``logger.summary()`` call in ``agent/train.py``
     is ``logger.summary(selfplay_log_row(snapshot_pool))``, whose keys are
@@ -2011,6 +2030,9 @@ def build_measurements(evidence: Mapping[str, Any]) -> Dict[str, Any]:
 
     return {
         "measured_at_run": evidence.get("run_name"),
+        # -- provenance: the checkpoint this verdict was earned on ------------
+        "warm_start": evidence.get("warm_start"),
+        "warm_start_sha256": evidence.get("warm_start_sha256"),
         "max_episode_steps": probe.get("max_episode_steps", MAX_EPISODE_STEPS),
         # -- armored episode length, three regimes ---------------------------
         "armored_mean_episode_length_probe": probe.get("mean_episode_length"),
@@ -2439,6 +2461,37 @@ if [[ -n "${ANALYZE_ONLY}" ]]; then
 fi
 
 # ===========================================================================
+# The AC14 recorded-digest gate. Every OTHER digest in this chain is computed
+# from whatever file --warm-start names and then compared against that same
+# file, which proves only that the file did not change between hash and load —
+# never that it is the checkpoint the operator MEANT. --expect-sha256 is the
+# one input that comes from the RECORD instead of from the file, so it is the
+# only comparison that can catch a tab-completed runs/m4.pt standing where
+# runs/m4.best.pt was decided.
+# ===========================================================================
+check_expected_sha256() {
+    if [[ -z "${EXPECT_SHA256}" ]]; then
+        warn "warm-start sha256 verified against NOTHING (no --expect-sha256 given): the digest above is self-computed and cannot prove this is the RECORDED checkpoint."
+        return 0
+    fi
+    if [[ "${WARM_START_SHA256}" != "${EXPECT_SHA256}" ]]; then
+        local resolved
+        case "${WARM_START}" in
+            /*) resolved="${WARM_START}" ;;
+            *)  resolved="$(cd -- "$(dirname -- "${WARM_START}")" >/dev/null 2>&1 && pwd)/$(basename -- "${WARM_START}")" ;;
+        esac
+        die "warm-start digest mismatch (WARM_START_DIGEST_MISMATCH):
+        hashed    ${resolved}
+        computed  ${WARM_START_SHA256}
+        expected  ${EXPECT_SHA256}  <- --expect-sha256
+      This file is NOT the checkpoint the recorded digest names. runs/m4.pt
+      (the REJECTED 30k-step net) sits one tab-completion from runs/m4.best.pt;
+      check which path you passed before any budget is spent."
+    fi
+    log "  sha256 matches --expect-sha256 (recorded digest verified)"
+}
+
+# ===========================================================================
 # Phase 0 — preflight. Starts nothing, connects to nothing but Paper.
 # ===========================================================================
 log "phase 0: preflight"
@@ -2506,6 +2559,7 @@ print(h.hexdigest())
 fi
 log "warm start ${WARM_START}"
 log "  sha256 ${WARM_START_SHA256}"
+check_expected_sha256
 
 # Paper is multi-client, so this connect is free. It is also the ONLY connect
 # probe in this file.

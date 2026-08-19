@@ -67,6 +67,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import types
@@ -1448,6 +1449,26 @@ def test_measurements_are_none_rather_than_wrong_when_inputs_are_missing() -> No
     assert measurements["projected_episodes_per_hour_at_25_pads"] is None
 
 
+def test_the_measurements_record_which_warm_start_was_proved() -> None:
+    """T19's cross-check reads the MEASUREMENTS file, so the digest must be in it.
+
+    evidence.json has always recorded `warm_start_sha256`, but the launch gate
+    never opens evidence.json — it reads canary_measurements.json. Without this
+    pass-through, a canary GREEN earned on runs/m4.best.pt says nothing about a
+    launch tab-completed onto runs/m4.pt.
+    """
+    measurements = verdict_module.build_measurements(make_evidence())
+    assert measurements["warm_start"] == "/abs/runs/m4.best.pt"
+    assert measurements["warm_start_sha256"] == "0" * 64
+
+
+def test_an_unrecorded_warm_start_digest_is_none_not_invented() -> None:
+    """Absent provenance stays absent; T19's gate fails closed on the None."""
+    measurements = verdict_module.build_measurements({})
+    assert measurements["warm_start"] is None
+    assert measurements["warm_start_sha256"] is None
+
+
 def test_measurements_are_json_serializable(tmp_path: Any) -> None:
     """The measurement file is T19's input, so it has to survive a round trip."""
     measurements = verdict_module.build_measurements(make_evidence())
@@ -1489,7 +1510,13 @@ def test_the_script_parses() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["CANARY_VERDICT_PY", "CANARY_PROBE_PY", "CANARY_GATE_PY", "CANARY_COLLECT_PY"],
+    [
+        "CANARY_ROOT_PY",
+        "CANARY_VERDICT_PY",
+        "CANARY_PROBE_PY",
+        "CANARY_GATE_PY",
+        "CANARY_COLLECT_PY",
+    ],
 )
 def test_every_embedded_python_block_compiles(name: str) -> None:
     """A syntax error in a heredoc is invisible until the phase that runs it."""
@@ -1826,3 +1853,114 @@ def test_the_probe_never_connects_when_a_client_is_already_attached() -> None:
     # PROBE_FAILED refusal, rather than connecting and evicting the incumbent.
     assert '{"ok": false, "error": "%s"}' in body
     assert "return 0" in body
+
+
+# ===========================================================================
+# The AC14 recorded-digest gate (--expect-sha256). The function under test is
+# extracted VERBATIM from the script — the same no-second-copy rule the heredoc
+# extraction enforces — and run under bash with the script's own log/warn/die,
+# so the exit codes observed here are the exit codes the operator gets.
+# Offline: nothing in this section opens a socket.
+# ===========================================================================
+
+
+def _shell_function(name: str) -> str:
+    """One top-level shell function's text, verbatim, definition to close."""
+    text = "\n".join(_script_lines())
+    marker = f"{name}() {{"
+    assert text.count(marker) == 1, marker
+    start = text.index(marker)
+    return text[start : text.index("\n}", start) + 2]
+
+
+def _shell_logger_defs() -> str:
+    """The script's OWN log/warn/die one-liners, so exit codes cannot drift."""
+    lines = [
+        line for line in _script_lines() if re.match(r"^(log|warn|die)\(\)\s+\{", line)
+    ]
+    assert len(lines) == 3, lines
+    return "\n".join(lines)
+
+
+def run_digest_gate(
+    warm_start: str,
+    computed: str,
+    expect: Optional[str],
+    cwd: Optional[str] = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Drive the real `check_expected_sha256` exactly as the preflight calls it:
+    after WARM_START_SHA256 has been computed from the --warm-start file."""
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f"WARM_START={shlex.quote(warm_start)}",
+            f"WARM_START_SHA256={shlex.quote(computed)}",
+            f"EXPECT_SHA256={shlex.quote(expect or '')}",
+            _shell_logger_defs(),
+            _shell_function("check_expected_sha256"),
+            "check_expected_sha256",
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False, cwd=cwd
+    )
+
+
+def test_a_matching_expected_digest_clears_the_preflight() -> None:
+    result = run_digest_gate("/abs/runs/m4.best.pt", "2" * 64, "2" * 64)
+    assert result.returncode == 0, result.stderr
+    assert "matches --expect-sha256" in result.stdout
+    assert "WARNING" not in result.stderr
+
+
+def test_a_mismatched_expected_digest_refuses_naming_both(tmp_path: Any) -> None:
+    """The refusal carries BOTH digests and the RESOLVED absolute path.
+
+    The warm start is passed RELATIVE here, because that is when the resolved
+    path earns its place: "runs/m4.pt" in the refusal would leave the operator
+    guessing which checkout's runs/ it meant.
+    """
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "m4.pt").write_bytes(b"the rejected 30k-step net")
+    result = run_digest_gate("runs/m4.pt", "2" * 64, "1" * 64, cwd=str(tmp_path))
+    assert result.returncode == 2
+    assert "WARM_START_DIGEST_MISMATCH" in result.stderr
+    assert "2" * 64 in result.stderr
+    assert "1" * 64 in result.stderr
+    assert str(tmp_path / "runs" / "m4.pt") in result.stderr
+
+
+def test_omitting_the_flag_changes_nothing_but_names_the_hole() -> None:
+    """No flag, no new refusal — but the unverified digest is announced."""
+    result = run_digest_gate("/abs/runs/m4.best.pt", "2" * 64, None)
+    assert result.returncode == 0, result.stderr
+    assert "--expect-sha256" in result.stderr
+    assert "NOTHING" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["xyz", "A" * 64, "a" * 63, "a" * 65, "1d3d0c60"],
+    ids=["not_hex", "uppercase", "too_short", "too_long", "truncated"],
+)
+def test_a_malformed_expected_digest_is_refused_up_front(malformed: str) -> None:
+    """A value that can never match must refuse at parse time, not report a
+    baffling "mismatch" after half the preflight has run. This drives the REAL
+    script: the validation sits with the argument checks, before the
+    interpreter probe, so the run dies before it writes or connects to
+    anything."""
+    result = subprocess.run(
+        ["bash", SCRIPT_PATH, "--expect-sha256", malformed],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "64 lowercase hex" in result.stderr
+
+
+def test_the_digest_gate_sits_on_the_preflight_path() -> None:
+    """A function nobody calls gates nothing. The call is pinned directly after
+    the digest is computed and logged, before any budget is spent."""
+    text = "\n".join(_script_lines())
+    assert 'log "  sha256 ${WARM_START_SHA256}"\ncheck_expected_sha256' in text
