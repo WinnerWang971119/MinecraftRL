@@ -20,6 +20,12 @@ covered by `pytest`.
 > and, in full, [`docs/demo-day.md`](docs/demo-day.md). It is one command and it does
 > not need any of the milestones below to have been collected.
 
+> **Running the overnight self-play training?** That is
+> [The self-play night](#the-self-play-night-m4--ac7). Two things there are neither
+> optional nor obvious, and each one alone costs the window: `export PYTHON=...`
+> (this worktree has no venv) and `caffeinate` on the fleet boot (this Mac sleeps
+> after a minute idle).
+
 ---
 
 ## Read this first — what changed on this branch
@@ -535,10 +541,240 @@ against it. Check the date on any other `.pt` before trusting it.
 
 ---
 
-## Training (flags TBD)
+## The self-play night (M4 / AC7)
 
-The retrain flags (warm start, opponent selection, the EASY/HARD curriculum, eval and
-checkpoint cadence) are documented separately and land here shortly.
+The 12-hour unattended run: one 25-pad fleet, `--opponent selfplay`, a frozen M3 net
+as snapshot 0. Why each number is what it is lives in
+[`docs/plans/2026-08-19-m4-selfplay.md`](docs/plans/2026-08-19-m4-selfplay.md); this
+section is the sequence, in order, with nothing left to fill in. Every command below
+was run against its own argument parser.
+
+### Two things that stop the sequence before it starts
+
+**1. There is no `.venv` in this worktree.** The M4 branch is checked out at
+`/Users/diego/Documents/MinecraftRL-m4` and the interpreter lives in the main
+checkout. `canary_selfplay.sh`, `launch_selfplay.sh` and `start-pads.sh` all default
+`PYTHON_BIN` to `${REPO_ROOT}/.venv/bin/python`, so without the export below every
+one of them dies at its interpreter preflight with `python interpreter not found`.
+Export it once, in the shell the whole night runs from:
+
+```bash
+cd /Users/diego/Documents/MinecraftRL-m4
+export PYTHON=/Users/diego/Documents/MinecraftRL/.venv/bin/python
+```
+
+That interpreter, with this worktree as the cwd, imports `agent` and `env` from
+**this** worktree, so the canary's checkout-identity gate still passes: it prints
+`python resolves this project from /Users/diego/Documents/MinecraftRL-m4` before it
+does anything else. Do not build a second venv here.
+
+**2. This Mac sleeps after one idle minute.** `pmset -g custom` reports `sleep 1` and
+`disksleep 10` on AC power, and nothing in this repo holds either off. The fleet
+supervisor is the one process that has to live for the entire window, so that is
+what carries the assertion (step 2 below).
+
+**Do not wrap `launch` in `caffeinate` instead.** `launch_selfplay.sh launch` starts
+the driver detached under `nohup` and returns about 20 seconds later, and
+`caffeinate` releases its assertion the moment the utility it wrapped exits. The
+machine would sleep an hour into the night with the run still going.
+
+**The lid is a separate mechanism.** Closing a MacBook's lid sleeps the machine
+whatever `pmset` says and whatever `caffeinate` is holding, unless it is on AC power
+with an external display attached. Leave it open.
+
+### The sequence
+
+Defaults line up across the three scripts (`m4_selfplay_canary` for the canary,
+`m4_selfplay` for the run), so nothing below needs a flag the sequence does not
+already show. Set the warm start and its digest once, so the three commands that
+take them cannot disagree:
+
+```bash
+warm=/Users/diego/Documents/MinecraftRL/runs/m4.best.pt
+sha=1d3d0c600e2ad76e49f2a6be10859f492ae2877c40f186b14f8924102774d5b2
+```
+
+**1. Size the server for 25 pads.** Idempotent. 25 pads is 50 bots, so `setup.sh`
+sizes `max-players` to 60; `start-pads.sh` verifies that value and refuses to launch
+without it.
+
+```bash
+PADS=25 bash server/setup/setup.sh
+```
+
+**2. Boot the fleet, and put the sleep assertion on it.** This terminal stays open
+all night; Ctrl-C here tears down every bridge and the Paper JVM.
+
+```bash
+DUMMY_KNOCKBACK_IMMUNE=false caffeinate -dimsu \
+  bash server/setup/start-pads.sh --pads 25
+```
+
+Wait for `FLEET READY`. `DUMMY_KNOCKBACK_IMMUNE=false` is what gives the opponent
+knockback; it rides as an environment variable rather than argv, so it cannot be
+read back off a running process and the canary's `OPPONENT_FROZEN` check is the only
+proof it took.
+
+**Boot this fleet once.** The launch gate refuses with `CANARY_MEASUREMENTS_STALE`
+if any bridge listener started after the canary wrote its measurement, because that
+knockback proof covers only the processes the canary probed. If you reach the canary
+and only then notice the fleet is not under `caffeinate`, do not reboot it. Hold the
+assertion on the driver instead, once step 5 has printed a pid:
+
+```bash
+nohup caffeinate -dimsu -w "$(cat runs/m4_selfplay.pid)" >/dev/null 2>&1 &
+```
+
+**3. The learning canary.** Roughly half an hour at 25 pads, under a 90-minute
+wall-clock deadline. It starts no server, no bridge and no JVM.
+
+```bash
+bash scripts/canary_selfplay.sh --warm-start "$warm" --expect-sha256 "$sha" --arenas 25
+```
+
+`--arenas 25`, not 4: the knockback proof covers only the pads the canary actually
+ran on, and more arenas reach the replay floor sooner, which is the whole point of a
+canary that has to learn.
+
+Exit `0` is GREEN and clears the launch. `1` is REFUSED. `2` is a usage or preflight
+error raised before the budget was spent, so nothing ran. `3` means the run happened
+but could not be judged; treat it exactly as a refusal. `--analyze-only <dir>`
+re-runs the verdict over an existing evidence directory and connects to nothing.
+
+**4. The smoke, then the sizing.** The smoke is a 25-pad dress rehearsal at
+production `min_replay` (25,000, against the canary's lowered 2,000), budgeted at
+2,500 gradient steps under a 45-minute deadline. `plan` starts nothing and prints
+the arithmetic plus the exact launch command it would run.
+
+```bash
+bash scripts/launch_selfplay.sh smoke --warm-start "$warm" --expect-sha256 "$sha"
+bash scripts/launch_selfplay.sh plan  --warm-start "$warm" --expect-sha256 "$sha"
+```
+
+**Expect the driver's own startup epsilon line to disagree** with the plan's decay
+fraction. `epsilon_schedule_report` divides by a projection still built from the
+bare-handed 285-step constant, so it reports roughly twice the true fraction. The
+plan report prints what that line will say, and says to ignore it.
+
+**5. Launch.** Re-runs the plan, re-checks the fleet, starts `agent.train` detached
+under `nohup`, waits 20 seconds to catch a config refusal, then prints the pid (also
+written to `runs/m4_selfplay.pid`) and the log path.
+
+```bash
+bash scripts/launch_selfplay.sh launch --warm-start "$warm" --expect-sha256 "$sha" \
+  --window-hours 12
+```
+
+**6. Check it before you sleep, and again whenever you wake up.** See *Checking a
+live run* below.
+
+### The warm start, and the flag that ties the run to it
+
+The decided warm start is `/Users/diego/Documents/MinecraftRL/runs/m4.best.pt`,
+sha256 `1d3d0c600e2ad76e49f2a6be10859f492ae2877c40f186b14f8924102774d5b2`. It becomes
+snapshot 0, permanently pinned, and one of the eval gauntlet's references.
+
+`--expect-sha256` is the only check in the chain that compares that file against the
+**record** instead of against itself. Every other digest is computed from whatever
+`--warm-start` names and then verified against that same file, which proves the file
+did not change between hash and load and proves nothing else. Both scripts take the
+flag, both validate the format at parse time (64 lowercase hex), and both refuse with
+`WARM_START_DIGEST_MISMATCH` and exit `2` before any connection is opened.
+
+**The flag is opt-in, and without it nothing ties the run to the recorded digest.**
+Omit it and both scripts warn that the digest was verified against nothing, then
+carry on. The failure that costs is one keystroke wide: `runs/m4.pt` sits beside
+`runs/m4.best.pt` in the same directory and hashes to
+`c4afabf60ec7b88135c6339817999d449da1725b0c5e195da93eff3c123ac369`. It is the
+rejected 30,000-step net, and with the flag omitted it passes every gate and gets
+pinned as reference 0 for the whole night.
+
+One cross-check needs no operator action: the launch refuses with
+`WARM_START_CANARY_MISMATCH` when the digest the canary recorded differs from the one
+the launch computed, so a canary earned on one file cannot clear a launch pointed at
+another.
+
+### Checking a live run: `scripts/watch_selfplay.sh`
+
+A read-only health check for the run in flight. It writes no file, creates no
+directory, sends no signal, starts nothing, and opens no socket at all: it reads
+files and inspects the process and socket tables with `ps` and `lsof`. It never
+connects to a bridge port, because `BridgeServer` accepts exactly one TCP client and
+resolves a second connection by destroying the incumbent.
+
+```bash
+bash scripts/watch_selfplay.sh --run-name m4_selfplay
+```
+
+Every path defaults from `--run-name`, exactly as `launch_selfplay.sh` names things,
+so on a default night that one flag is the whole invocation. The judgement is
+stdlib-only, so it runs on any `python3` and needs neither the venv nor the `PYTHON`
+export above.
+
+| # | Signal | What it reads |
+|---|--------|---------------|
+| 1 | LIVENESS | the driver process, from the pidfile via `ps`, with a recycled-pid guard and a finished-versus-crashed distinction |
+| 2 | GRAD STEP | the current grad step and how long it has been frozen, from `runs/<run>/metrics.jsonl`, the only source in the run carrying timestamps |
+| 3 | FLEET | bridge listeners on the run's port range against the arena count the launch actually started with |
+| 4 | THROUGHPUT | the grad-step rate per LIVE arena against the canary's own measurement, rendered as implied episodes/hour |
+| 5 | EVAL | grad steps since a cycle last completed, cycles skipped since, and the latest `elo/learner_rated` |
+
+Verdicts are `OK` / `WARN` / `ALARM` / `?????`. Exit `0` is OK or WARN (WARN prints
+loudly but does not page), `1` is at least one ALARM, `2` is a usage error, `3` is
+UNKNOWN.
+
+**Two things to understand, or you will misread the output.**
+
+- **A listening bridge is not proof its collector thread is alive.** A collector that
+  raises anything other than a `BridgeError` dies inside the driver and leaves both
+  the bridge process and its socket standing, and `ActorPool` never notices: its only
+  abort trigger watches the shared Paper port. FLEET cannot see that, and THROUGHPUT
+  is what catches it. The line that names it is the cross-signal note **`FULL FLEET +
+  COLLAPSED RATE`**: every bridge listening with a client attached, and the rate
+  collapsed anyway. That note is what this script exists for.
+- **UNKNOWN is never OK.** `?????` means the signal could not be determined, and it
+  names the file it could not read. A mistyped `--run-name` makes all five UNKNOWN,
+  which is why UNKNOWN carries its own exit code instead of folding into `0`.
+
+`watch(1)` is not installed on this Mac, so the loop the script's own help suggests
+does not run here. Poll with a plain shell loop instead:
+
+```bash
+while true; do bash scripts/watch_selfplay.sh --run-name m4_selfplay; sleep 300; done
+```
+
+### Reading the curves
+
+- **`selfplay/win_rate_vs_ref_<id>` is a lifetime rate, smoothed.** It is
+  `(wins + 1) / (plays + 2)` over every match ever played against that reference, so
+  with `N` plays behind it one more match moves it by about `1/N`, and after
+  thousands of plays a late collapse surfaces slowly. The collapse-sensitive series is
+  **`selfplay/worst_reference_win_rate`**, which is the weakest reference of that
+  eval cycle alone.
+- **Exit code 1 is not failure.** `_main_multi_arena` returns `0 if passed_m2 else 1`,
+  and `passed_m2` is the M2 gate against the stationary dummy: a bar set for a
+  different opponent, which a self-play run does not clear. Judge by the
+  `[multi done]` teardown line and the `best checkpoint:` line.
+- **`MatchResult.learner_epsilon` is the schedule ε, not the ε the collector acted
+  at.** `collect_episode` reports the global schedule value, while the policy acts
+  under the Ape-X per-arena spread (`per_actor_eps` defaults on, α = 7). Do not
+  condition any analysis on that field. Rated-Elo eligibility is unaffected: the
+  rated path pins a literal `0.0`.
+- **`selfplay/rated_matches` at 0 is not a flat Elo.** An empty `elo/learner_rated`
+  and a frozen one draw the same line; only the rated-match count separates "no
+  eval cycle ever scored" from "the learner stopped improving".
+
+### In the morning
+
+```bash
+bash scripts/launch_selfplay.sh compare --run-name m4_selfplay \
+  --extra-runs /Users/diego/Documents/MinecraftRL/runs
+```
+
+`--extra-runs` points at the main checkout's `runs/`, where the bare-handed M3
+checkpoints live; this worktree does not have them. `compare` runs no evaluation, so
+a number nobody measured is printed as absent rather than invented, and rows are
+ordered by grad step rather than by win rate.
 
 ---
 

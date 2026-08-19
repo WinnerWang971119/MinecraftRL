@@ -163,16 +163,17 @@ post-`reset` first observation once the episode is running).
 | `pos`      | `[x,y,z]` floats | World-frame position. Gated upstream.                           |
 | `yaw`      | float       | Yaw in radians, **same protocol convention and range as `self.yaw`**. Gated upstream. See [the angle convention](#the-angle-convention). |
 | `pitch`    | float       | Pitch in radians, **same convention as `self.pitch`**. Gated upstream.  |
-| `velocity` | `[x,y,z]` floats | World-frame velocity. Gated upstream.                          |
+| `velocity` | `[x,y,z]` floats | World-frame velocity, blocks per tick. Gated upstream. Read from the opponent's **own connection**, never from the handle entity; for a human challenger it is finite-differenced from server-sent positions instead. See [opponent provenance](#opponent-provenance). |
 | `on_ground` | bool       | Whether the opponent is on the ground. Not in the learner's observation — consumed by the self-play mirror as the opponent seat's own self state, so no gate applies. Read from the opponent's **own connection** — see [opponent provenance](#opponent-provenance). |
 | `health`   | float       | **RAW true opponent health. PRIVILEGED → reward only, NEVER the observation.** |
 | `held_item` | string     | Opponent held-item identifier, same vocabulary as `self.held_item`. `""` when the hand is empty or there is no connection to read from. Not in the learner's observation — consumed by the self-play mirror as the opponent seat's own self state, so no gate applies. See [opponent provenance](#opponent-provenance). |
 
 <a id="opponent-provenance"></a>
-**Opponent provenance — `on_ground`, `held_item` and `health` come from the
-opponent's OWN connection.** This paragraph is part of the contract, not a note.
+**Opponent provenance — `velocity`, `on_ground`, `held_item` and `health` come
+from the opponent's OWN connection.** This paragraph is part of the contract, not
+a note.
 Mineflayer maintains real state only for the bot whose connection you hold, and
-for two of these three fields a read through another client does not even yield
+for three of these four fields a read through another client does not even yield
 stale data — it yields something that was never a reading at all.
 `entity.health` is never populated for a non-self entity, and reading the
 dummy's health through the learner's client is precisely why `damage_dealt` was
@@ -186,22 +187,51 @@ entity's equipment IS kept current by broadcast `entity_equipment` packets, but
 it follows the same single-source rule rather than being carved out as the one
 exception.)
 
-So `bot.js`'s `_snapshotOpponent` reads these three fields through
+`velocity` is the third field of that kind, and the last one to be found. On the
+pinned `1.21.1` protocol only one of the three handlers that
+write a non-self `entity.velocity` can fire at all: `entity_velocity`, which the
+server sends on abrupt momentum changes such as knockback, never per tick.
+Ordinary walking arrives as `rel_entity_move` and `entity_move_look`, and both
+translate `entity.position` while leaving `entity.velocity` untouched. A
+handle-view read on a walking opponent therefore returns a stale knockback
+impulse that never decays, or a zero, which is why `opp_vel_local` (observation
+indices 16-18) carried no opponent motion for the whole life of the field. The
+opponent's own connection is a real reading: prismarine-physics writes
+`bot.entity.velocity` for the simulated self every tick. **Do not restore a
+handle-view velocity read.** It is the dead channel, not a shortcut to the same
+number.
+
+So `bot.js`'s `_snapshotOpponent` reads these four fields through
 `_opponentBot()` — the opponent's own Mineflayer connection — and never through
 the handle entity that the learner's client resolved. When the opponent has a
 connection but no entity yet, `on_ground` is `false`: that is **"no reading"**,
 not "airborne".
 
-There is no human-challenger exception. A human (`opponentMode: 'human'`) has
-no bot connection, and — per the constructor-constant mechanic above — the
-handle view holds nothing to fall back to: an earlier revision of this contract
-fell back to it for `on_ground`, which would have put a hardcoded `true` on the
-wire for as long as the match lasted, a value that looked like a measurement
-and never was one. That branch was removed. A human opponent carries the same
-no-reading values as a missing entity: `on_ground` `false`, `held_item` `""`,
-`health` `0`. No signal is lost: the only consumer of `on_ground`/`held_item`
-is the self-play mirror, which seats bot opponents only, and a human's death is
-sourced from the `rl_deaths` scoreboard (T2), never from this block.
+No field falls back to the handle view for a human challenger. A human
+(`opponentMode: 'human'`) has no bot connection, and — per the
+constructor-constant mechanic above — the handle view holds nothing to fall back
+to: an earlier revision of this contract fell back to it for `on_ground`, which
+would have put a hardcoded `true` on the wire for as long as the match lasted, a
+value that looked like a measurement and never was one. That branch was removed.
+A human opponent carries the same no-reading values as a missing entity:
+`on_ground` `false`, `held_item` `""`, `health` `0`. No signal is lost: the only
+consumer of `on_ground`/`held_item` is the self-play mirror, which seats bot
+opponents only, and a human's death is sourced from the `rl_deaths` scoreboard
+(T2), never from this block.
+
+**`velocity` is the one field with a human path, and it is a measurement rather
+than a fallback.** Unlike the three above it IS in the learner's 23-dim
+observation, so a fixed zero against a human would be train/serve skew: a net
+trained all night against opponents whose motion it can see would meet a
+constant at the one event the human path exists for. For a human,
+`_challengerVelocity` differences two positions the server sent, over the ticks
+elapsed between them. The same `rel_entity_move` / `entity_move_look` packets
+that leave velocity untouched do translate `entity.position` on every ordinary
+step, so position is the channel that stays current and this is a difference of
+two real observations rather than a constructor constant. The result is already
+in the blocks-per-tick the self-play path emits, so no conversion is applied.
+Until there is a pair of observations to difference, the zero vector goes on the
+wire as "no reading", exactly as the fields above do.
 
 <a id="the-angle-convention"></a>
 **The angle convention — `yaw` and `pitch` are PROTOCOL-convention, not

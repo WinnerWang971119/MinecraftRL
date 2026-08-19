@@ -87,6 +87,27 @@ dependencies, so `requirements.txt` is the only thing that pulls numpy, torch
 and pytest. Running `-e .` afterwards is optional and only puts the packages on
 the path by name.
 
+**Running the demo out of the M4 worktree? There is no `.venv` there.** The
+`feat/m4-selfplay` checkout at `/Users/diego/Documents/MinecraftRL-m4` has none,
+and building a second one the night before a demo is a torch download you do not
+need. Use the main checkout's interpreter with the worktree as the cwd, in place
+of the `.venv/bin/python` every command on this page is written with:
+
+```bash
+/Users/diego/Documents/MinecraftRL/.venv/bin/python
+```
+
+`''` leads `sys.path`, so it imports `deploy`, `agent` and `env` from **this**
+directory rather than from the checkout the venv belongs to. Confirm that before
+you trust it, because a demo running another checkout's code is not something you
+notice from the outside:
+
+```bash
+/Users/diego/Documents/MinecraftRL/.venv/bin/python -c "import deploy.exhibition as m; print(m.__file__)"
+```
+
+The path it prints must be the directory you are standing in.
+
 **3. Install the server and the datapack** (idempotent, safe to re-run):
 
 ```bash

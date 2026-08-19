@@ -264,9 +264,20 @@ scoreboard objectives add hp health
 scoreboard objectives setdisplay list hp
 ```
 
-Now hold Tab and every player's current health shows next to their name, live. The
-arena datapack uses no scoreboard objectives, so this cannot collide with anything.
+Now hold Tab and every player's current health shows next to their name, live.
 Remove it when you are done with `scoreboard objectives remove hp`.
+
+> **Do not do this during a human exhibition.** The arena datapack uses no
+> scoreboard objectives, so while you are watching a training fleet there is
+> nothing to collide with. The exhibition bridge is the exception: in
+> `opponentMode: 'human'` it binds its own `rl_deaths` objective to the **same
+> `list` display slot** (`bridge/bot.js`), and a slot holds one objective.
+> Running `setdisplay list hp` displaces `rl_deaths`, and being display-bound is
+> the only thing that makes the server broadcast score packets at all, so the
+> challenger's deaths stop being reported. Nothing errors and nothing in the log
+> says so; a match the human loses just does not end. Re-bind it with
+> `scoreboard objectives setdisplay list rl_deaths` if you have already run the
+> command.
 
 For a single spot reading instead, from the console:
 
