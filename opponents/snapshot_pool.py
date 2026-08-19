@@ -34,6 +34,10 @@ then ``os.replace``d — the pattern of ``agent.train._atomic_torch_save``, whic
 exists because a kill partway through an in-place write truncates the previous
 good file with nothing to fall back on. Duplicated rather than imported: T10
 makes ``agent.train`` import THIS module, so importing back would be a cycle.
+The index additionally carries a monotone ``index_generation`` stamp and
+:meth:`SnapshotPool.persist` refuses to write a payload older than the one it
+last wrote: atomicity stops a write from being half-applied, but only the stamp
+stops a stale payload from being wholly applied on top of a newer one.
 
 Corruption policy (spec §Error Handling): a missing or unreadable **unpinned**
 snapshot is dropped from the pool and resampled, loudly. A missing or unreadable
@@ -46,13 +50,22 @@ Torch is imported lazily, inside the methods that touch tensors, so the
 dataclasses, the Elo arithmetic and the index round-trip stay importable (and
 testable) in an environment without torch.
 
-Owner: T8 (M4 self-play track). ``pfsp_weights`` is UNIFORM here by design; T9
-replaces the body of :meth:`SnapshotPool._raw_weights_locked` with the real
-PFSP formula and touches no call site.
+Sampling (T9): ``pfsp`` (the default) weights snapshot ``i`` by
+``f(p_i) + 0.05 / N`` with ``f(p) = p(1 - p)``, then normalizes — mass on the
+opponents that are challenging but still winnable, since ``f`` peaks at
+``p = 0.5`` and vanishes at both extremes. ``uniform`` keeps the flat
+distribution so the two are A/B-comparable. The floor is not cosmetic: at
+``p = 0`` or ``p = 1`` the shaping term is exactly zero, and a zero-weight member
+is one the learner never meets again — which is how a self-play run forgets how
+to beat its oldest ancestors.
+
+Owner: T8 (M4 self-play track); PFSP weighting and the ``uniform | pfsp`` switch
+by T9.
 """
 
 from __future__ import annotations
 
+import collections.abc
 import dataclasses
 import json
 import math
@@ -66,13 +79,16 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from agent.contract_config import code_version
 
 __all__ = [
+    "DEFAULT_SAMPLING",
     "ELO_INITIAL",
     "ELO_K",
     "INDEX_FILENAME",
     "INDEX_VERSION",
     "MatchResult",
     "MatchStats",
+    "PFSP_FLOOR_MASS",
     "PinnedSnapshotError",
+    "SAMPLING_MODES",
     "SNAPSHOT_FILENAME",
     "SnapshotPool",
     "SnapshotPoolError",
@@ -104,6 +120,23 @@ SNAPSHOT_FILENAME = "snap_{snapshot_id}.pt"
 #: fails loudly at load instead of half-deserializing into a wrong pool.
 INDEX_VERSION = 1
 
+#: The sampling regimes a pool accepts (the ``uniform | pfsp`` switch, spec #9).
+#: ``uniform`` exists so the PFSP arm has something to be measured against.
+SAMPLING_MODES = frozenset({"uniform", "pfsp"})
+
+#: Default regime. PFSP is the shipped behaviour; ``uniform`` is the fallback in
+#: the plan's feature-cut order.
+DEFAULT_SAMPLING = "pfsp"
+
+#: Total UNNORMALIZED weight reserved for the PFSP floor, spread evenly over the
+#: candidates (``floor = PFSP_FLOOR_MASS / N``, so the N shares sum back to this
+#: constant). Its SHARE of the normalized distribution is therefore
+#: ``PFSP_FLOOR_MASS / (sum(f) + PFSP_FLOOR_MASS)``, not a flat 5% — see
+#: :meth:`SnapshotPool._raw_weights_locked`. It is what keeps a member with
+#: ``f(p) = 0`` — a snapshot the learner always beats, or never beats — reachable
+#: instead of weighted out of the pool forever.
+PFSP_FLOOR_MASS = 0.05
+
 #: Every key the snapshot payload must carry (spec §Data Model). A file missing
 #: any of them is not one of ours and is treated as corrupt.
 _PAYLOAD_KEYS = ("model", "grad_step", "code_version", "snapshot_id", "elo")
@@ -120,6 +153,23 @@ LogFn = Callable[[str], None]
 def _default_log(message: str) -> None:
     """Print to stderr, unbuffered, tagged — the house logging shape."""
     print(f"[snapshot_pool] {message}", file=sys.stderr, flush=True)
+
+
+def _validated_sampling(sampling: str) -> str:
+    """Return ``sampling`` if it names a mode in :data:`SAMPLING_MODES`.
+
+    Loud, because the silent alternative is a run that believes it is the PFSP
+    arm while sampling uniformly (or the reverse), which makes the AC6
+    comparison measure nothing.
+
+    Raises:
+        ValueError: ``sampling`` is not a known mode.
+    """
+    if sampling not in SAMPLING_MODES:
+        raise ValueError(
+            f"sampling must be one of {sorted(SAMPLING_MODES)}, got {sampling!r}"
+        )
+    return str(sampling)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +390,7 @@ class MatchStats:
         ``(wins + 1) / (plays + 2)`` — the posterior mean of a uniform prior,
         i.e. "one imagined win and one imagined loss already on the books". The
         +1/+2 is not cosmetic: it makes the rate defined (0.5) at ZERO plays,
-        which is what keeps T9's PFSP weight ``f(p) = p(1 - p)`` finite and
+        which is what keeps the PFSP weight ``f(p) = p(1 - p)`` finite and
         non-zero for a brand-new snapshot. With the raw ratio, a fresh snapshot
         would be 0/0 (NaN) and, once guarded to 0, would be weighted to zero and
         never sampled — so it could never accumulate the plays that would raise
@@ -450,15 +500,33 @@ class SnapshotPool:
 
     **Locking.** ONE :class:`threading.RLock` guards the registry, the statistics
     and the Elo table — the three pieces that must agree with each other. It is
-    reentrant so a public method may call another without deadlocking (T9 and
-    T12 both add methods to this class). Two rules keep it cheap:
+    reentrant so a public method may call another without deadlocking (T12 and
+    T18 both add methods to this class). Three rules keep it cheap and
+    deadlock-free:
 
       * No disk I/O under the lock. ``torch.load`` of a snapshot happens with the
         lock released; 25 arena threads reloading at episode boundaries must not
-        serialize behind one another.
-      * A separate ``_io_lock`` serializes index writes so a stale ``pool.json``
-        cannot land after a newer one. Lock order is always ``_io_lock`` then
-        ``_lock``, never the reverse.
+        serialize behind one another. Pinned by
+        ``test_disk_io_never_runs_under_the_state_lock``, which fails if a future
+        edit moves a read or a write inside ``with self._lock:``.
+      * No caller-supplied callback under the lock either. The ``log`` sink is
+        the caller's code and may take a lock of its own; invoking it while
+        holding ``_lock`` turns "another thread waits for the pool" into a
+        deadlock. :meth:`_retire` and :meth:`_normalized_weights_locked`
+        therefore both hand their message OUT and log after the release.
+      * ``_io_lock`` serializes index writes so two persists cannot interleave
+        into one file. It is never taken while holding ``_lock``, and
+        :meth:`persist` never acquires ``_lock`` at all — it is handed the
+        payload — so the two locks are ORDER-INDEPENDENT and an ABBA cycle
+        between them cannot be written, not merely avoided. Handing the payload
+        in gives up the freshness that building it under the write lock used to
+        guarantee, so every payload carries the monotone ``index_generation``
+        stamp instead and :meth:`persist` drops a write older than its last one.
+        Both properties, one lock each, and neither thread ever holds two.
+
+    **Sampling.** ``sampling="pfsp"`` (default) weights each candidate by
+    ``p(1 - p) + PFSP_FLOOR_MASS / N``; ``sampling="uniform"`` gives every
+    candidate the same weight. See :meth:`_raw_weights_locked`.
 
     **Eviction.** None in this run. The only way a member leaves the pool is the
     corruption drop, and only if it is unpinned.
@@ -474,6 +542,7 @@ class SnapshotPool:
         *,
         elo_k: float = ELO_K,
         elo_initial: float = ELO_INITIAL,
+        sampling: str = DEFAULT_SAMPLING,
         log: Optional[LogFn] = None,
     ) -> None:
         """Create an empty pool rooted at ``directory``.
@@ -483,11 +552,14 @@ class SnapshotPool:
                 (with parents) if missing — the pool owns this directory.
             elo_k: Elo K-factor (default :data:`ELO_K` = 24).
             elo_initial: The learner's starting rating (default 1000).
+            sampling: ``"pfsp"`` (default) or ``"uniform"`` — the opponent
+                weighting regime, fixed for the life of the pool so a run cannot
+                change arm halfway through its own A/B.
             log: Sink for the loud corruption/drop messages; defaults to stderr.
 
         Raises:
-            ValueError: ``elo_k`` is negative or non-finite, or ``elo_initial``
-                is non-finite.
+            ValueError: ``elo_k`` is negative or non-finite, ``elo_initial`` is
+                non-finite, or ``sampling`` is not a known mode.
             OSError: The directory could not be created.
         """
         if not math.isfinite(elo_k) or elo_k < 0.0:
@@ -498,6 +570,7 @@ class SnapshotPool:
         self.directory = directory
         self._elo_k = float(elo_k)
         self._elo_initial = float(elo_initial)
+        self._sampling = _validated_sampling(sampling)
         self._log: LogFn = log if log is not None else _default_log
 
         # One lock over registry + stats + Elo (see the class docstring).
@@ -513,6 +586,16 @@ class SnapshotPool:
         # instead of being discarded or rated against a guessed number.
         self._retired_elo: Dict[int, float] = {}
         self._next_id = 0
+        # Monotone version stamp over everything `index_payload` serializes —
+        # the registry, the id counter, the statistics and both Elo series.
+        # Bumped under `_lock` by every mutation that touches any of them, so
+        # equal generations mean identical payloads and a smaller generation
+        # means a strictly older payload. Guarded by `_lock`.
+        self._generation = 0
+        # Generation of the last payload `persist` actually wrote. Guarded by
+        # `_io_lock`, alongside the write it describes. -1 means this pool has
+        # written nothing yet, so its first persist always lands.
+        self._persisted_generation = -1
         self._learner_elo_online = self._elo_initial
         self._learner_elo_rated = self._elo_initial
 
@@ -534,6 +617,14 @@ class SnapshotPool:
     def elo_initial(self) -> float:
         """The learner's starting rating."""
         return self._elo_initial
+
+    @property
+    def sampling(self) -> str:
+        """The weighting regime in force: ``"pfsp"`` or ``"uniform"``.
+
+        Set at construction and never mutated, so it needs no lock.
+        """
+        return self._sampling
 
     @property
     def learner_elo_online(self) -> float:
@@ -659,6 +750,9 @@ class SnapshotPool:
         with self._lock:
             snapshot_id = self._next_id
             self._next_id += 1
+            # `next_snapshot_id` is index state, so allocating an id ages the
+            # payload just as registering the record does.
+            self._generation += 1
 
         path = os.path.join(
             self.directory, SNAPSHOT_FILENAME.format(snapshot_id=snapshot_id)
@@ -684,8 +778,14 @@ class SnapshotPool:
         with self._lock:
             self._records[snapshot_id] = record
             self._stats.setdefault(snapshot_id, MatchStats())
+            self._generation += 1
 
-        self.persist()
+        # Read the state under `_lock` (inside index_payload), then write it
+        # under `_io_lock` only — `persist` never touches `_lock`, so the order
+        # in which a caller happens to hold the two can never matter. Built
+        # immediately before the write, and stamped, so neither this payload nor
+        # a concurrent one can land on top of a newer index.
+        self.persist(self.index_payload())
         return record
 
     def record_result(self, result: MatchResult) -> None:
@@ -694,7 +794,7 @@ class SnapshotPool:
         Updates, all under the one lock:
 
           * the head-to-head :class:`MatchStats` (``plays += 1``,
-            ``learner_wins += score``) — the input to T9's PFSP weighting;
+            ``learner_wins += score``) — the input to the PFSP weighting;
           * ``elo/learner_online``, from EVERY result;
           * ``elo/learner_rated``, only when ``result.rated_eligible``.
 
@@ -742,6 +842,10 @@ class SnapshotPool:
                 self._learner_elo_rated = updated_elo(
                     self._learner_elo_rated, opponent_elo, score, self._elo_k
                 )
+            # The statistics and both Elo series are in the index too, so a
+            # result ages the payload: one built before this line must never be
+            # written on top of one built after it.
+            self._generation += 1
 
     # -- sampling ---------------------------------------------------------
 
@@ -791,7 +895,12 @@ class SnapshotPool:
                         "opponent. Seed snapshot 0 from the warm start before "
                         "collecting."
                     )
-                weights = self._normalized_weights_locked(candidates)
+                weights, warning = self._normalized_weights_locked(candidates)
+            # OUTSIDE the lock: `_log` is caller-supplied and may take a lock of
+            # its own, and a callback that blocks while we hold `_lock` wedges
+            # every other arena thread.
+            if warning is not None:
+                self._log(warning)
 
             record = _weighted_choice(rng, candidates, weights)
 
@@ -847,17 +956,29 @@ class SnapshotPool:
     def pfsp_weights(self) -> Dict[int, float]:
         """Return normalized sampling probabilities over every live snapshot.
 
-        **UNIFORM in T8** — a correct, finite, normalized placeholder. T9
-        replaces the body of :meth:`_raw_weights_locked` with the real PFSP
-        weighting (``f(p) + floor``, ``f(p) = p(1 - p)``, ``floor = 0.05 / N``)
-        and no call site — here or in any consumer — changes.
+        Under ``sampling="pfsp"`` the weight of snapshot ``i`` is
+        ``f(p_i) + PFSP_FLOOR_MASS / N`` with ``f(p) = p(1 - p)`` and ``p_i`` the
+        Beta(1, 1)-smoothed head-to-head win rate, normalized over the pool;
+        under ``sampling="uniform"`` every member gets ``1 / N``. See
+        :meth:`_raw_weights_locked` for why each term is there.
+
+        T17's launch canary is contracted to read this as-is and refuse to
+        launch on invalid or NaN PFSP probabilities. Forward-marked, not a
+        description of today: ``scripts/`` does not exist yet, so nothing
+        currently checks these numbers at launch.
 
         Returns:
             ``{snapshot_id: probability}`` summing to 1.0, or ``{}`` when the
             pool is empty. Never contains a NaN.
         """
         with self._lock:
-            return self._normalized_weights_locked(self._sorted_records_locked())
+            weights, warning = self._normalized_weights_locked(
+                self._sorted_records_locked()
+            )
+        # Logged after the release, for the reason given in :meth:`sample`.
+        if warning is not None:
+            self._log(warning)
+        return weights
 
     # -- loading (all disk I/O happens OUTSIDE the lock) -------------------
 
@@ -931,6 +1052,13 @@ class SnapshotPool:
         Also the round-trip witness — two pools with equal index payloads hold
         the same snapshots, the same statistics and the same Elo.
 
+        Every payload is stamped with ``index_generation``: the pool's monotone
+        version counter as of the moment it was built. That stamp is what lets
+        :meth:`persist` order two payloads and refuse the older one, so a
+        payload built long ago cannot land on top of a newer index.
+        :meth:`load` restores it, so the counter continues across a restart
+        instead of starting again at zero underneath a much later ``pool.json``.
+
         Snapshot paths are stored as bare FILENAMES, not full paths, so a run
         directory stays relocatable (copy ``runs/<run>/`` to another box and the
         pool still loads). :meth:`load` rejoins them onto its own directory.
@@ -938,6 +1066,7 @@ class SnapshotPool:
         with self._lock:
             return {
                 "index_version": INDEX_VERSION,
+                "index_generation": self._generation,
                 "elo_k": self._elo_k,
                 "elo_initial": self._elo_initial,
                 "learner_elo_online": self._learner_elo_online,
@@ -968,24 +1097,111 @@ class SnapshotPool:
                 ],
             }
 
-    def persist(self) -> None:
-        """Rewrite ``pool.json`` atomically.
+    def persist(self, payload: Mapping[str, Any]) -> None:
+        """Write ``payload`` (an :meth:`index_payload` result) onto ``pool.json``.
 
-        ``_io_lock`` serializes concurrent persists so an older state snapshot
-        can never land on disk after a newer one; the state itself is read under
-        ``_lock`` and the file is written with ``_lock`` released. Lock order is
-        always ``_io_lock`` → ``_lock``.
+        The payload is an ARGUMENT rather than something this method builds, and
+        that is the whole point: ``persist`` never acquires ``_lock``. A thread
+        inside ``persist`` holds only ``_io_lock`` and waits for nothing, so the
+        two locks are order-independent and no ABBA cycle between them can be
+        written — whatever a future caller happens to hold. The alternative
+        (``persist`` taking ``_io_lock`` and then ``_lock`` internally) is
+        correct only for as long as every caller remembers the rule, and that is
+        a docstring, not an invariant.
+
+        ``_io_lock`` still serializes the writes themselves, so two persists can
+        never interleave into one file. What handing the payload in DID cost is
+        freshness: building the index inside the write lock used to guarantee
+        that the last writer held the newest state. The ``index_generation``
+        stamp buys that back without reintroducing a lock order — every payload
+        carries the pool's monotone version counter, ``persist`` remembers the
+        generation it last wrote (under ``_io_lock``, with the write), and a
+        payload older than that is DROPPED and logged instead of written.
+
+        The stamp, not :meth:`load`'s floor, is what protects the id counter.
+        That floor is computed from the ids in whatever index is on disk, so
+        against a stale index it reports the stale ``next_snapshot_id`` back and
+        protects nothing: a fresh index at ``next_snapshot_id: 2`` overwritten by
+        a stale one at ``1`` hands id 1 out a second time after a restart, and
+        the second policy version silently ``os.replace``s the first's
+        ``snap_1.pt``, so two policy versions answer to one id.
+
+        MEASURED, not assumed: the re-issued id does NOT inherit the first's
+        statistics. ``load`` only re-issues an id the index does not contain,
+        and an index missing the id is missing its stats and Elo too — the
+        record comes back with zeroed ``MatchStats``, the new Elo, and
+        ``pinned=False``. That is worse, not better: nothing INSIDE the pool
+        looks anomalous, while everything outside it that was already keyed on
+        that id (a previously logged ``selfplay/win_rate_vs_ref_<id>``, T12's
+        rating history) now silently describes a different policy, and a pinned
+        reference quietly stops being one. Refusing the backwards write is what
+        makes all of that unreachable.
+
+        A skipped write is NOT an error and callers need not handle it: the
+        pool's state is already on disk in a newer form, which is what the caller
+        wanted. Callers that follow the convention
+        (``pool.persist(pool.index_payload())``) will normally never cause one.
+
+        Args:
+            payload: The index dict from :meth:`index_payload`.
 
         Raises:
+            TypeError: ``payload`` is not a mapping — usually
+                ``persist(self.index_payload)`` with the call parentheses lost —
+                or it carries no usable ``index_generation``, which means it did
+                not come from :meth:`index_payload` and cannot be ordered.
             OSError: The index could not be written — the previous index then
-                survives intact, because the write is atomic.
+                survives intact, because the write is atomic, and so does the
+                watermark, because it only advances after the write lands.
         """
+        if not isinstance(payload, collections.abc.Mapping):
+            raise TypeError(
+                "persist(payload) takes the index dict from index_payload(); "
+                f"got {type(payload).__name__}"
+            )
+        try:
+            generation = int(payload["index_generation"])
+        except (KeyError, TypeError, ValueError) as exc:
+            # An unorderable payload is precisely the hole this guard closes:
+            # writing one would put an index of unknown age onto pool.json.
+            raise TypeError(
+                "persist(payload) takes the index dict from index_payload(), "
+                "which stamps 'index_generation'; got a mapping without a "
+                f"usable one ({exc!r})"
+            ) from exc
+
+        stale: Optional[str] = None
         with self._io_lock:
-            payload = self.index_payload()
-            _atomic_write_json(payload, self.index_path)
+            if generation < self._persisted_generation:
+                stale = (
+                    f"SKIPPED a stale index write: payload generation "
+                    f"{generation} is older than generation "
+                    f"{self._persisted_generation}, already on "
+                    f"{self.index_path!r}. Nothing was written and the newer "
+                    "index stands — writing backwards here would let a later "
+                    "snapshot reuse a live id. Build the payload immediately "
+                    "before persisting: pool.persist(pool.index_payload())."
+                )
+            else:
+                _atomic_write_json(payload, self.index_path)
+                # Advanced only once the replace has landed: a failed write
+                # leaves the previous index in force, so the watermark that
+                # describes it must stay in force too.
+                self._persisted_generation = generation
+
+        # OUTSIDE `_io_lock`: `_log` is caller-supplied code, and the rule that
+        # keeps it off `_lock` (see :meth:`sample`) applies to `_io_lock` too.
+        if stale is not None:
+            self._log(stale)
 
     @classmethod
-    def load(cls, directory: str, *, log: Optional[LogFn] = None) -> "SnapshotPool":
+    def load(
+        cls,
+        directory: str,
+        *,
+        sampling: str,
+        log: Optional[LogFn] = None,
+    ) -> "SnapshotPool":
         """Rebuild a pool from ``directory``/``pool.json``.
 
         Restores the registry, the per-snapshot statistics, both Elo series and
@@ -999,6 +1215,16 @@ class SnapshotPool:
 
         Args:
             directory: The pool directory written by :meth:`persist`.
+            sampling: Weighting regime for the restored pool. REQUIRED, and
+                deliberately without a default: the regime is a run-config
+                choice (it mirrors T11a's ``snapshot_sampling`` field), so a
+                resumed run passes the value its own config carries, and a
+                resume that omitted it would restart the ``uniform`` arm of the
+                AC6 comparison as the ``pfsp`` arm, invisibly. A default would
+                leave that exact failure expressible by omission — the one thing
+                this parameter exists to prevent — so there is none. Not stored
+                in the index for the same reason: ``pool.json`` describes the
+                pool, not the run that resumes it.
             log: Sink for the loud corruption/drop messages.
 
         Returns:
@@ -1010,6 +1236,7 @@ class SnapshotPool:
                 or structurally malformed.
             PinnedSnapshotError: A pinned snapshot's file is missing.
         """
+        sampling = _validated_sampling(sampling)
         index_path = os.path.join(directory, INDEX_FILENAME)
         with open(index_path, "r", encoding="utf-8") as handle:
             try:
@@ -1036,6 +1263,7 @@ class SnapshotPool:
                 directory,
                 elo_k=float(raw.get("elo_k", ELO_K)),
                 elo_initial=float(raw.get("elo_initial", ELO_INITIAL)),
+                sampling=sampling,
                 log=log,
             )
             entries = raw["snapshots"]
@@ -1082,6 +1310,16 @@ class SnapshotPool:
                 int(raw.get("next_snapshot_id", 0)),
                 max(known_ids) + 1 if known_ids else 0,
             )
+            # Continue the stamp where the index left off rather than restarting
+            # at 0 underneath a much later pool.json. max(0, ...) because a
+            # hand-edited negative would invert the ordering the stamp exists to
+            # provide; an index written before the stamp existed simply has
+            # none, and starts at 0. `_persisted_generation` deliberately stays
+            # at -1: the restored pool was BUILT from this index, so its first
+            # write is at least as fresh, and taking a write watermark from disk
+            # would let one bad edit silence every persist for the rest of the
+            # run.
+            pool._generation = max(0, int(raw.get("index_generation", 0)))
         except (KeyError, TypeError, ValueError) as exc:
             raise SnapshotPoolError(
                 f"pool index {index_path!r} is malformed: {exc!r}"
@@ -1133,45 +1371,113 @@ class SnapshotPool:
     ) -> Dict[int, float]:
         """Unnormalized sampling weights. Caller holds ``_lock``.
 
-        **This body is the T9 seam.** T8 ships UNIFORM weights — correct,
-        finite, and non-zero for every member, including a snapshot with zero
-        plays. T9 replaces exactly this method with ``f(p) + 0.05 / N``,
-        ``f(p) = p(1 - p)``, ``p`` from :meth:`MatchStats.win_rate` (which is why
-        the Beta(1, 1) prior lives on ``MatchStats`` and not in the weighting).
-        Nothing else has to change: every caller goes through
-        :meth:`_normalized_weights_locked`.
+        ``uniform``: every candidate gets 1.0 — the flat baseline the PFSP arm is
+        measured against, and the fallback in the plan's feature-cut order.
+
+        ``pfsp``: ``w_i = f(p_i) + PFSP_FLOOR_MASS / N``, with
+        ``f(p) = p(1 - p)`` and ``p_i`` straight from :meth:`MatchStats.win_rate`.
+        Two terms, two jobs:
+
+          * ``f`` peaks at ``p = 0.5`` and falls to zero at both ends, so mass
+            lands on the opponents that are challenging but still winnable — the
+            ones the learner can actually learn from. Because ``win_rate``
+            carries the Beta(1, 1) prior, a snapshot with ZERO plays reports
+            ``p = 0.5`` and therefore the MAXIMUM ``f``: a brand-new past self is
+            treated as maximally informative until its record says otherwise.
+            The prior is not reimplemented here; that is deliberate, so there is
+            exactly one place where the smoothing can be wrong.
+          * The floor keeps every member reachable. ``f`` is exactly 0 at
+            ``p = 0`` and ``p = 1``, and a zero-weight snapshot is one the
+            learner never plays again — so it never accumulates the results that
+            would move ``p`` back off the extreme. That is the mechanism by which
+            a self-play run forgets how to beat its oldest ancestors, and the
+            pinned references (the fixed measuring sticks behind
+            ``selfplay/win_rate_vs_ref_<id>``) are exactly the members that sit
+            at the extremes once the learner has outgrown them.
+
+        Weights are unnormalized here; :meth:`_normalized_weights_locked`
+        divides by the sum. In absolute terms the floor contributes
+        ``PFSP_FLOOR_MASS`` of unnormalized weight in TOTAL — one N-th of it to
+        each of the N candidates — so its share of the normalized distribution
+        is ``PFSP_FLOOR_MASS / (sum(f) + PFSP_FLOOR_MASS)``: the WHOLE
+        distribution when every ``f`` is zero, and a diminishing fraction as the
+        shaping mass grows. That share is not pinned at 5%, and EXCEEDS it
+        whenever ``sum(f) < 0.95`` — common, since ``f`` maxes out at 0.25. On
+        TC14's table (``sum(f) = 0.66``) the floor holds 0.05 / 0.71 = 7.04%.
+
+        Raises:
+            SnapshotPoolError: A mode was added to :data:`SAMPLING_MODES` without
+                a branch here — loud rather than silently uniform.
         """
-        return {rec.snapshot_id: 1.0 for rec in candidates}
+        if not candidates:
+            # Never reached through _normalized_weights_locked (which short-
+            # circuits on empty), but a direct caller must not divide by zero.
+            return {}
+
+        if self._sampling == "uniform":
+            return {rec.snapshot_id: 1.0 for rec in candidates}
+
+        if self._sampling == "pfsp":
+            floor = PFSP_FLOOR_MASS / float(len(candidates))
+            weights: Dict[int, float] = {}
+            for record in candidates:
+                probability = self._stats_locked(record.snapshot_id).win_rate()
+                weights[record.snapshot_id] = (
+                    probability * (1.0 - probability) + floor
+                )
+            return weights
+
+        raise SnapshotPoolError(
+            f"unknown sampling mode {self._sampling!r}; __init__ validates "
+            f"against {sorted(SAMPLING_MODES)}, so a mode was added there "
+            "without a branch in _raw_weights_locked"
+        )
 
     def _normalized_weights_locked(
         self, candidates: Sequence[SnapshotRecord]
-    ) -> Dict[int, float]:
+    ) -> Tuple[Dict[int, float], Optional[str]]:
         """Normalize :meth:`_raw_weights_locked` into a probability distribution.
 
         Caller holds ``_lock``. Falls back to uniform — loudly — if the raw
-        weights are non-finite or sum to zero. That cannot happen with T8's
-        uniform weights; the guard is here for T9's formula, because a NaN or an
+        weights are non-finite or sum to zero. Neither can happen with the
+        shipped formulas (``p(1 - p) + floor`` is finite and strictly positive
+        for every ``p`` in ``[0, 1]``), so this is defence in depth: a NaN or an
         all-zero distribution reaching the sampler would either wedge an arena or
         silently pin it to one opponent, and both present as a training problem
         rather than as a weighting bug.
+
+        Returns ``(weights, warning)`` rather than logging the warning itself:
+        ``_log`` is a caller-supplied callback and this method runs under
+        ``_lock``. A callback that waits on a lock held by a thread that is
+        waiting on ``_lock`` would deadlock the pool — ``_lock`` being reentrant
+        saves only the same-thread case. The CALLER logs ``warning`` (when it is
+        not ``None``) after releasing, exactly as :meth:`_retire` does.
+
+        Returns:
+            ``(weights, warning)``: the normalized distribution, and either
+            ``None`` or the message the caller must log once the lock is out of
+            its hands.
         """
         if not candidates:
-            return {}
+            return {}, None
         raw = self._raw_weights_locked(candidates)
         values = [raw.get(rec.snapshot_id, float("nan")) for rec in candidates]
         total = math.fsum(value for value in values if math.isfinite(value))
         if any(not math.isfinite(value) for value in values) or total <= 0.0:
-            self._log(
+            uniform = 1.0 / len(candidates)
+            return (
+                {rec.snapshot_id: uniform for rec in candidates},
                 f"WARNING: sampling weights are unusable ({values!r}); falling "
                 "back to uniform over "
-                f"{[rec.snapshot_id for rec in candidates]}"
+                f"{[rec.snapshot_id for rec in candidates]}",
             )
-            uniform = 1.0 / len(candidates)
-            return {rec.snapshot_id: uniform for rec in candidates}
-        return {
-            rec.snapshot_id: value / total
-            for rec, value in zip(candidates, values)
-        }
+        return (
+            {
+                rec.snapshot_id: value / total
+                for rec, value in zip(candidates, values)
+            },
+            None,
+        )
 
     def _retire(self, record: SnapshotRecord, reason: str) -> None:
         """Apply the corruption policy to ``record``: fatal if pinned, else drop.
@@ -1196,6 +1502,10 @@ class SnapshotPool:
                 removed = self._records.pop(record.snapshot_id, None)
                 if removed is not None:
                     self._retired_elo[record.snapshot_id] = removed.elo
+                    # Only on a real drop: re-retiring an already-dropped member
+                    # changes nothing, and a bump there would break the
+                    # "equal generation, equal payload" reading of the stamp.
+                    self._generation += 1
                 remaining = sorted(self._records)
 
         if pinned:
