@@ -691,7 +691,8 @@ test('handleReset issues ONE reset command, acks ok:true, then sends the initial
   // command latency). The dummy gate is as load-bearing as the learner's:
   // acking while the dummy is still hurt would measure the first real hit
   // against a phantom baseline, so its mock must sit at the +3 x spawn, healed
-  // and empty-handed.
+  // and carrying the loadout its template expects — which is what mockDummy()
+  // below builds, an iron sword and full iron since #33, NOT a bare fixture.
   bots.learner = mockBot('learner_bot', { inventory: ['iron_sword'] });
   bots.dummy = mockDummy();
 
@@ -1157,12 +1158,15 @@ test('the read-back rides the beacon channel WITHOUT disturbing it', async () =>
 // RESET CAUSALITY (the gate verifies template MATCH, not that the reset ran).
 //
 // After a kill cycle the natural post-respawn state IS the template state: the
-// dummy respawns at its pinned spawnpoint at full health, empty-handed, with
-// effects cleared by death, and a learner that killed from its spawn without
-// moving still reads back 20 / anchor+0.5 / ['iron_sword'] / no effects. So a
-// reset_pad that ABORTS AT INSTANTIATION would pass both gates and ack a reset
-// that never happened — no saturation restore, no knockback re-pin, silently,
-// and precisely under the combat probe's stationary kill cycles.
+// dummy respawns at its pinned spawnpoint at full health, with effects cleared
+// by death and — `gamerule keepInventory true` being on (arena:setup) — still
+// holding the sword and wearing the armor its template has expected since #33,
+// so arming it did not close this hole. A learner that killed from its spawn
+// without moving still reads back 20 / anchor+0.5 / ['iron_sword'] / no
+// effects. So a reset_pad that ABORTS AT INSTANTIATION would pass both gates
+// and ack a reset that never happened — no saturation restore, no knockback
+// re-pin, silently, and precisely under the combat probe's stationary kill
+// cycles.
 //
 // The datapack ends each spawn function with a beacon a bare respawn cannot
 // produce. These tests pin both directions.
@@ -4577,11 +4581,18 @@ test('PROVENANCE: a HUMAN challenger emits no-reading defaults — a non-self on
   assert.equal(bots._opponentBot(), null, 'a human challenger has no bot connection');
   assert.equal(snapshot.on_ground, false, 'no connection means no reading, never the constructor constant');
   assert.equal(snapshot.held_item, '', 'no connection to read a held item from');
-  assert.equal(snapshot.velocity, null, 'nor a velocity — same own-connection rule (T20)');
+  assert.equal(
+    snapshot.velocity,
+    null,
+    'nor a velocity: no connection to read one from, and (T21) no earlier position to difference',
+  );
   // POSITION and facing DO still come from the handle: rel_entity_move and
   // entity_move_look really do keep another player's `entity.position` current.
   // Velocity is the field those same packets never write, which is why it moved
-  // to the own-connection side and a human now has no reading for it at all.
+  // to the own-connection side — and, since T21, why a human's velocity is
+  // recovered by DIFFERENCING those positions instead. This snapshot is the
+  // FIRST one, so there is no pair yet; the block below pins what the second
+  // one reports. The handle's 4/-4/4 is never the answer either way.
   assert.deepEqual(snapshot.pos, { x: 0, y: 64, z: 5 });
   assert.deepEqual(
     zeroedWire(snapshot).opponent.velocity,
@@ -4691,6 +4702,241 @@ test('PROVENANCE: an opponent bot with no entity yet reports NO velocity, not th
 
   assert.equal(bots._snapshotOpponent(handle).velocity, null);
   assert.deepEqual(zeroedWire(bots._snapshotOpponent(handle)).opponent.velocity, [0, 0, 0]);
+});
+
+// ===========================================================================
+// A HUMAN CHALLENGER'S VELOCITY (T21) — the finite difference.
+//
+// T20 put velocity on the opponent's OWN connection, which is right for
+// self-play and left a human — who has none — reading the zero vector for the
+// whole match. That is a TRAIN/SERVE SKEW rather than a cosmetic gap: unlike
+// on_ground and held_item, which feed only the self-play mirror,
+// FIELD_SLICES['opp_vel_local'] is slice(16, 19) of the learner's own 23-dim
+// observation (env/observation_spec.py). A net that spent a night of self-play
+// learning to lead a moving target would meet three constant zeros on demo day.
+//
+// The repair is a MEASUREMENT and not a fabrication — two positions the server
+// really sent, over the ticks between them — which is the whole reason it is
+// allowed where reading the handle's own `velocity` is not. These pin the
+// units, the direction, the no-reading cases, the reset discontinuity, and the
+// one that guards the training path: a bot opponent never takes this branch.
+// ===========================================================================
+
+/** A hand-built human handle over a position the test can walk. */
+function challengerHandle(x, z, username = 'Steve') {
+  return {
+    entity: {
+      position: { x, y: 64, z },
+      yaw: 0,
+      pitch: 0,
+      // The loud stale impulse a cross-client read really carries. It must
+      // never reach the wire, before or after T21.
+      velocity: { x: -0.9, y: 0.42, z: 0.9 },
+      onGround: true,
+    },
+    isBot: false,
+    username,
+  };
+}
+
+/** An arena in exhibition mode with no bots wired — for direct snapshot calls. */
+function humanSnapshotArena() {
+  return new ArenaBots(
+    { opponentMode: OPPONENT_MODE_HUMAN, challengerUsername: 'Steve' },
+    { transport: { send: () => {} } },
+  );
+}
+
+/** The opponent velocity on the LAST message sent, checked schema-valid. */
+function lastOpponentVelocity(sent) {
+  const state = sent[sent.length - 1];
+  assert.equal(state.type, 'state');
+  assert.doesNotThrow(() => validateOutbound(state));
+  return state.opponent.velocity;
+}
+
+test('T21: a STATIONARY human reads a MEASURED zero, distinct from "no reading"', () => {
+  // `_currentTick` is stepped by ACTION_REPEAT because that is the boundary
+  // handleStep advances it to; the reader divides by the measured difference,
+  // never by that constant.
+  const arena = humanSnapshotArena();
+  const handle = challengerHandle(0.5, 0.5);
+
+  arena._currentTick = 0;
+  assert.equal(
+    arena._snapshotOpponent(handle).velocity,
+    null,
+    'the first observation has nothing to difference against — null, not a guess',
+  );
+
+  arena._currentTick = ACTION_REPEAT;
+  assert.deepEqual(
+    arena._snapshotOpponent(handle).velocity,
+    { x: 0, y: 0, z: 0 },
+    'standing still is a real reading of zero, not the absent one',
+  );
+});
+
+test('T21: a human walking a known distance reads that rate, in the right direction', () => {
+  // 0.84 blocks of +x and 0.4 blocks of -z per ACTION_REPEAT window is
+  // 0.21 / -0.1 blocks per tick — mineflayer's own unit for velocity, and
+  // about the speed of a sprint.
+  const arena = humanSnapshotArena();
+  const handle = challengerHandle(0.5, 0.5);
+
+  arena._currentTick = 0;
+  arena._snapshotOpponent(handle);
+
+  // Translated IN PLACE, exactly as rel_entity_move mutates a real player's
+  // position vector — which is also why the sample must copy the scalars out.
+  handle.entity.position.x += 0.84;
+  handle.entity.position.z -= 0.4;
+  arena._currentTick = ACTION_REPEAT;
+  const first = arena._snapshotOpponent(handle).velocity;
+
+  // A second window of the same walk must report the same rate, not twice it:
+  // the difference is per-window, never cumulative.
+  handle.entity.position.x += 0.84;
+  handle.entity.position.z -= 0.4;
+  arena._currentTick = 2 * ACTION_REPEAT;
+  const second = arena._snapshotOpponent(handle).velocity;
+
+  for (const [label, velocity] of [['window 1', first], ['window 2', second]]) {
+    assert.ok(velocity.x > 0, `${label}: walking +x must report +x, not a mirrored sign`);
+    assert.ok(velocity.z < 0, `${label}: walking -z must report -z`);
+    assertVecClose(
+      [velocity.x, velocity.y, velocity.z],
+      [0.21, 0, -0.1],
+      `${label}: blocks moved divided by ticks elapsed`,
+    );
+  }
+});
+
+test('T21: the chain BREAKS rather than bridging a gap, a swap or a stalled clock', () => {
+  const arena = humanSnapshotArena();
+  const handle = challengerHandle(0.5, 0.5);
+
+  arena._currentTick = 0;
+  arena._snapshotOpponent(handle);
+  handle.entity.position.x += 0.84;
+  arena._currentTick = ACTION_REPEAT;
+  assert.ok(arena._snapshotOpponent(handle).velocity.x > 0, 'the chain is live to begin with');
+
+  // 1. THEY LEAVE THE ENTITY VIEW. Keeping the sample would difference their
+  //    return against wherever they vanished, however long ago that was.
+  arena._currentTick = 2 * ACTION_REPEAT;
+  assert.equal(arena._snapshotOpponent(null).velocity, null, 'nobody observed: no reading');
+  assert.equal(arena._challengerPosSample, null, 'and the stale sample is dropped, not kept');
+
+  handle.entity.position.x += 30;
+  arena._currentTick = 3 * ACTION_REPEAT;
+  assert.equal(
+    arena._snapshotOpponent(handle).velocity,
+    null,
+    'so the window they reappear in re-seeds instead of reporting a 7.5 blocks/tick charge',
+  );
+
+  // 2. A DIFFERENT PERSON. The difference between two people's positions
+  //    describes neither of them.
+  const other = challengerHandle(handle.entity.position.x + 6, 0.5, 'Alex');
+  arena._currentTick = 4 * ACTION_REPEAT;
+  assert.equal(arena._snapshotOpponent(other).velocity, null, 'a swap is not a movement');
+
+  // 3. A CLOCK THAT DID NOT ADVANCE — two reads inside one window. Dividing by
+  //    zero elapsed ticks is the one arithmetic this must never perform.
+  other.entity.position.x += 0.84;
+  const sameTick = arena._snapshotOpponent(other).velocity;
+  assert.equal(sameTick, null, 'no elapsed time, no rate');
+});
+
+test('T21: a reset does not let the next window difference across the discontinuity', async () => {
+  const sent = [];
+  const challenger = playerEntity('Steve', 0.5, 0.5);
+  const arena = exhibitionArena(sent, { 11: challenger }, { challengerUsername: 'Steve' });
+  // The clear under test runs BEFORE the read-back gates, so an instantly
+  // failing gate exercises it without burning the real 3 s timeout. ok:false
+  // sends no state, which is why every wire read below follows a step.
+  arena._readbackOptions = instantTimeoutGate();
+
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  challenger.position.x += 0.8;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assertVecClose(lastOpponentVelocity(sent), [0.2, 0, 0], 'the tracker is live before the reset');
+
+  await withCapturedErrors(() => arena.handleReset({ type: 'reset', episode: 1, seed: 0 }));
+
+  assert.equal(
+    arena._challengerPosSample,
+    null,
+    'the reset drops the sample outright, alongside the last-seen memory',
+  );
+
+  // Between episodes the challenger ends up somewhere else — they walked back
+  // to the pad, the operator moved them, they died and respawned. The bridge
+  // never learns which, and it does not need to: the reset dropped the sample,
+  // and the tick clock it was stamped on restarted at 0.
+  challenger.position.x = -5.5;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+
+  assert.deepEqual(
+    lastOpponentVelocity(sent),
+    [0, 0, 0],
+    'differencing across the reset would report ~1.7 blocks/tick, eight times a sprint',
+  );
+
+  // And it recovers on the very next window rather than staying dead for the
+  // episode — a guard that never re-arms is the same outage in slower motion.
+  challenger.position.x += 0.8;
+  await arena.handleStep({ type: 'step', action: Macro.IDLE });
+  assertVecClose(lastOpponentVelocity(sent), [0.2, 0, 0], 'the next window measures normally again');
+});
+
+test('T21: the SELF-PLAY path is untouched — own connection, never a difference', () => {
+  // The training path must not be able to notice T21 at all. The dummy's own
+  // connection reports a constant while its handle view is walked across the
+  // pad: a difference would answer 3 blocks/tick, the own-connection read
+  // answers what the connection says, and no sample is ever taken.
+  const bots = new ArenaBots({}, { transport: { send: () => {} } });
+  const ownReading = { x: 0.21, y: -0.0784, z: -0.34 };
+  bots.dummy = {
+    health: MAX_HEALTH,
+    heldItem: { name: 'iron_sword' },
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: ownReading,
+      onGround: true,
+    },
+  };
+  const handle = {
+    entity: {
+      position: { x: 0.5, y: 64, z: 10.5 },
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 0, y: 0, z: 0 },
+      onGround: true,
+    },
+    isBot: true,
+    username: 'dummy_bot',
+  };
+
+  bots._currentTick = 0;
+  assert.deepEqual(bots._snapshotOpponent(handle).velocity, ownReading, 'window 1');
+
+  handle.entity.position.x += 12;
+  bots._currentTick = ACTION_REPEAT;
+
+  assert.deepEqual(
+    bots._snapshotOpponent(handle).velocity,
+    ownReading,
+    'window 2: a moved handle view cannot change what the own connection reports',
+  );
+  assert.equal(
+    bots._challengerPosSample,
+    null,
+    'and the bot path never records a position sample at all',
+  );
 });
 
 test('the zeroed opponent block (no opponent at all) carries both fields', () => {

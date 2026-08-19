@@ -1316,7 +1316,9 @@ def test_a_payload_built_mid_add_cannot_orphan_the_snapshot_it_missed(
     )
 
 
-def test_the_generation_advances_on_every_change_the_index_carries(tmp_path):
+def test_the_generation_advances_on_every_change_the_index_carries(
+    tmp_path, monkeypatch
+):
     """Everything the payload serializes must age it, or the stamp is a half-order.
 
     The stamp means "equal generation, equal payload". A mutation the counter
@@ -1342,3 +1344,36 @@ def test_the_generation_advances_on_every_change_the_index_carries(tmp_path):
     assert start < after_adds, "a new snapshot must age the index"
     assert after_adds < after_result, "a scored match must age the index"
     assert after_result < after_drop, "a retired snapshot must age the index"
+
+    # AN ``add`` THAT NEVER REACHED THE DISK, which is the only case that pins
+    # the bump under the ID ALLOCATION rather than the one after the save.
+    # ``add`` documents this path — "the destination file and the index are then
+    # left untouched and the id is simply skipped" — and it is exactly where the
+    # id and the record part company: ``_next_id`` has advanced, no record
+    # registers, and the post-save bump never runs. Without the allocation bump
+    # this payload and the one before it would carry DIFFERENT
+    # ``next_snapshot_id`` values under the SAME generation, and ``persist``
+    # drops only what is STRICTLY older — so the earlier payload is free to land
+    # on top, re-issuing a live id after a restart. This is the ID-COUNTER half
+    # of the hole this test's docstring states for every other field.
+    def refuse_to_save(payload, path):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(snapshot_pool, "_atomic_torch_save", refuse_to_save)
+    before_failed_add = pool.index_payload()
+    with pytest.raises(OSError):
+        pool.add(_fake_state_dict(3.0), grad_step=2000, elo=1000.0)
+    after_failed_add = pool.index_payload()
+
+    assert after_drop < int(after_failed_add["index_generation"]), (
+        "an add that raised still consumed an id, so it still changed the index"
+    )
+    # ...and the two assertions below are what stop that one from being vacuous:
+    # the id really moved, and nothing else did, so the pair of payloads differs
+    # in `next_snapshot_id` ALONE.
+    assert (
+        after_failed_add["next_snapshot_id"] > before_failed_add["next_snapshot_id"]
+    ), "the id was consumed even though the save raised"
+    assert after_failed_add["snapshots"] == before_failed_add["snapshots"], (
+        "a failed add registers no snapshot — the file never landed"
+    )

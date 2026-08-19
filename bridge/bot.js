@@ -713,15 +713,19 @@ function assertMacroUsername(value, label) {
  *
  * WHY THIS EXISTS. The read-back gate verifies TEMPLATE MATCH, not causality,
  * and after a kill cycle the natural post-respawn state IS the template state:
- * the dummy respawns at its previously-pinned spawnpoint at full health with an
- * empty inventory and no effects (death clears them), and a learner that killed
- * from its spawn without moving still reads back health 20 / anchor+0.5 /
- * ['iron_sword'] / no effects. So a `reset_pad` that ABORTS AT INSTANTIATION —
- * silent at boot, total at runtime, likeliest triggered by a Paper 1.21.2 bump
- * or a "fix" to the `generic.` attribute prefix — would let BOTH gates pass and
- * the bridge ack a reset that never happened: no saturation restore (AC18
- * drifts), no knockback re-pin (the dummy stops being stationary). Invisibly,
- * and precisely under the combat probe's stationary-learner kill cycles.
+ * the dummy respawns at its previously-pinned spawnpoint at full health and
+ * with no effects (death clears them) — and, because `gamerule keepInventory
+ * true` (arena:setup) is on, still holding the iron sword and wearing the iron
+ * set its template expects since the M4 loadout (#33). Arming the dummy
+ * therefore did NOT close this hole: a geared dummy respawns still matching its
+ * new template. A learner that killed from its spawn without moving likewise
+ * still reads back health 20 / anchor+0.5 / ['iron_sword'] / no effects. So a
+ * `reset_pad` that ABORTS AT INSTANTIATION — silent at boot, total at runtime,
+ * likeliest triggered by a Paper 1.21.2 bump or a "fix" to the `generic.`
+ * attribute prefix — would let BOTH gates pass and the bridge ack a reset that
+ * never happened: no saturation restore (AC18 drifts), no knockback re-pin
+ * (the dummy stops being stationary). Invisibly, and precisely under the combat
+ * probe's stationary-learner kill cycles.
  *
  * A bare respawn cannot produce this line. The datapack addresses it to the bot
  * BY NAME and stamps it with the anchor and username, so one pad's beacon can
@@ -2048,6 +2052,17 @@ class ArenaBots {
     /** End-of-window server tick (advances by ACTION_REPEAT each step). */
     this._currentTick = 0;
 
+    // THE HUMAN CHALLENGER'S PREVIOUS OBSERVED POSITION (T21):
+    // {x, y, z, tick, username}, or null when there is no pair to difference.
+    // Written ONLY on the no-connection path — _challengerVelocity owns it, and
+    // owns every discontinuity guard. The coordinates are COPIED out of the
+    // entity's Vec3 rather than aliased: mineflayer translates that same vector
+    // in place on every movement packet (entities.js:301, :320), so a stored
+    // reference would silently BE the current position and every difference
+    // would read exactly zero. This is the aliasing hazard _updateLastSeen
+    // clone()s around, one field over.
+    this._challengerPosSample = null;
+
     // Tick (on the same post-reset clock as _currentTick) at which the RESET's
     // regear re-zeroed the server-side attack-strength meter, or null if no
     // reset has been confirmed on this instance yet. Set to 0 by handleReset's
@@ -2992,6 +3007,17 @@ class ArenaBots {
     }
     this._currentTick = 0;
     this._lastSeenOpponentPos = null;
+    // The challenger velocity sample is dropped with them (T21). A sample from
+    // the previous episode describes a different match on a different clock:
+    // the `_currentTick = 0` two lines up restarts the very counter it is
+    // stamped on, and a reset is also the operator's between-challengers
+    // command (T6), so the next person to occupy the slot may not be the person
+    // who just left it. _challengerVelocity's own guards would refuse most of
+    // what a surviving sample could produce — a non-positive elapsed count, a
+    // changed username — but those are the backstop; this line is the intent,
+    // and it is what keeps the first observation of a new episode an honest
+    // "no reading yet" rather than a difference across the gap.
+    this._challengerPosSample = null;
     // A new match may be a new challenger, so the death-ATTRIBUTION memory is
     // dropped alongside the last-seen memory; the episode's first step rewrites
     // it (handleStep takes the claim and notes the identity in one synchronous
@@ -3020,10 +3046,10 @@ class ArenaBots {
     // READ-BACK GATES: poll BOTH bots until each matches its template or times
     // out. The dummy gate (health + position) exists because the reset heals
     // the dummy asynchronously — acking while it is still hurt would let the
-    // first real hit be measured against a phantom baseline. The dummy template
-    // (this.dummyResetTemplate) mirrors what spawn_dummy_pad actually applies:
-    // the learner spawn offset +3 on x, healed, effects cleared, and an EMPTY
-    // inventory — the datapack gives the dummy no weapon.
+    // first real hit be measured against a phantom baseline. For WHAT the dummy
+    // template (this.dummyResetTemplate) mirrors, and for the retracted premise
+    // that used to be described here, see the RETRACTED block on that field's
+    // declaration in the constructor.
     let result;
     let dummyResult;
     let confirmed = false;
@@ -3649,9 +3675,18 @@ class ArenaBots {
     // OPPONENT_ATTACK_SPEED_TICKS = SERVER_TPS / 1.6 (env/mc_pvp_env.py) to
     // mirror MacroExecutor's own IRON_SWORD_ATTACK_SPEED_TICKS default, and
     // nothing on either side would catch the two drifting apart — the opponent
-    // would simply stop attacking, or flail. Note the dummy is BARE-HANDED
-    // (spawn_dummy_pad.mcfunction runs $clear with no $give): do NOT "correct"
-    // this to a bare-hand speed. The two sides must agree, and the agreed value
+    // would simply stop attacking, or flail.
+    //
+    // RETRACTED (T2/T21). This block used to read "Note the dummy is
+    // BARE-HANDED (spawn_dummy_pad.mcfunction runs $clear with no $give)".
+    // That was true when it was written and is false now:
+    // spawn_dummy_pad.mcfunction issues `$give $(dummy) minecraft:iron_sword 1`,
+    // so the dummy holds the same iron sword the learner does. The warning it
+    // guarded gets STRONGER, not weaker — the default is no longer merely the
+    // agreed value, it is the physically correct one for the weapon actually in
+    // the opponent's hand. Do NOT "correct" this to a bare-hand speed. (The
+    // phrase survived T21's retraction sweep because that grepped "no weapon";
+    // this one said "BARE-HANDED".) The two sides must agree, and the agreed value
     // is the default. The learner's this._weaponAttackSpeedTicks is
     // deliberately NOT reused here — that is the LEARNER's weapon, and passing
     // it would silently re-point this at whatever a future task sets it to.
@@ -4423,6 +4458,14 @@ class ArenaBots {
    * `finiteOr`. Both sides must be converted or not at all: the filter derives
    * the opponent's agent-relative facing as `opp.yaw - self.yaw`, and
    * converting one term alone would leave that difference in neither frame.
+   *
+   * NOT PURE ON THE HUMAN PATH — call it at most ONCE per tick boundary. With
+   * no opponent connection this advances `_challengerPosSample` (see
+   * `_challengerVelocity`), so a second call inside one window re-stamps the
+   * sample at the same tick and that window's velocity silently reads zero.
+   * Today the only call sites are handleReset and handleStep, once each; adding
+   * a third observation (a get_state request, a re-send, a debug dump) would
+   * cost the wire a reading with nothing reporting it.
    */
   _snapshotOpponent(handle = this._opponentHandle()) {
     const entity = handle !== null && handle.entity ? handle.entity : null;
@@ -4503,24 +4546,154 @@ class ArenaBots {
     // writes `bot.entity.velocity` for the SELF entity every simulated tick
     // (node_modules/prismarine-physics/index.js:856, PlayerState.apply).
     //
-    // A HUMAN challenger has no connection, so there is no reading and this
-    // emits the zero vector — assembleStateMsg's toVec3(null) — alongside the
-    // no-reading `health` 0, `on_ground` false and `held_item` "" this block
-    // already carries in that state. Deliberately NOT the handle view: a
-    // fabricated value is worse than an absent one, which is the lesson the
-    // rest of this block is written from.
+    // A HUMAN CHALLENGER HAS NO CONNECTION — SO THEIR VELOCITY IS MEASURED
+    // RATHER THAN READ (T21). T20 correctly stopped reading the handle, but it
+    // left the human path emitting the zero vector forever, and that is a
+    // TRAIN/SERVE SKEW rather than a harmless gap. Unlike `on_ground` and
+    // `held_item` — which have no slot in the observation and feed only the
+    // self-play mirror — `opp_vel_local` IS in the learner's own 23-dim
+    // observation: FIELD_SLICES['opp_vel_local'] is slice(16, 19) in
+    // env/observation_spec.py. Self-play trains against an opponent whose own
+    // connection carries REAL motion, so a night of it teaches the net to use
+    // those three features to lead a moving target and to react to a charge —
+    // and against a human they would be a fixed constant, at the one event this
+    // branch exists for.
+    //
+    // WHY THIS IS NOT THE FABRICATED VALUE THE REST OF THIS BLOCK REFUSES. The
+    // handle's `on_ground` and the handle's `velocity` are refused because the
+    // number sitting in them never came from an observation of this opponent at
+    // all: a prismarine-entity constructor constant, and a knockback impulse
+    // that never decays. A DIFFERENCE OF TWO POSITIONS THE SERVER SENT US IS A
+    // MEASUREMENT. `rel_entity_move` (entities.js:301) and `entity_move_look`
+    // (:320) translate `entity.position` on every ordinary step — which is
+    // precisely why position is the channel that stays current while velocity
+    // does not — so what is derived below comes from the same packets, one
+    // differentiation away. Nothing is invented: where there is no pair of
+    // observations yet, the zero vector is emitted as "no reading", exactly as
+    // this block's other human-path fields do.
+    //
+    // UNITS, READ OUT OF THE VENDORED SOURCE RATHER THAN ASSUMED. Mineflayer's
+    // `bot.entity.velocity` is BLOCKS PER TICK — prismarine-physics spends it
+    // as one tick's DISPLACEMENT. Each simulated tick it calls
+    // `moveEntity(entity, world, vel.x, vel.y, vel.z)` (index.js:493, :536,
+    // :590), whose dx/dy/dz are how far the entity moves that tick (collisions
+    // permitting, :157), and PlayerState.apply then writes the vector back onto
+    // the bot (`bot.entity.velocity = this.vel`, :856). Blocks divided by an
+    // ELAPSED TICK COUNT is therefore already in the units the self-play path
+    // emits, and no conversion is applied. See _challengerVelocity for which
+    // tick clock supplies that divisor.
     const ownEntity = bot !== null && bot.entity ? bot.entity : null;
+    let velocity;
+    if (bot === null) {
+      velocity = this._challengerVelocity(handle);
+    } else {
+      // THE SELF-PLAY PATH IS UNTOUCHED: an opponent that has a connection is
+      // still read from it, and never reaches the difference below.
+      velocity = ownEntity ? ownEntity.velocity : null;
+    }
     return {
       pos: entity ? entity.position : null,
       yaw: entity ? toProtocolYaw(entity.yaw) : 0,
       pitch: entity ? toProtocolPitch(entity.pitch) : 0,
-      velocity: ownEntity ? ownEntity.velocity : null,
+      velocity,
       on_ground: ownEntity ? Boolean(ownEntity.onGround) : false,
       // PRIVILEGED raw true health — reward-only downstream, never the obs.
       health: bot && typeof bot.health === 'number' ? bot.health : 0,
       // Same own-connection rule; "" when there is no bot to ask (human
       // challenger) or its hand is empty, matching the zeroed-opponent block.
       held_item: this._heldItemName(bot),
+    };
+  }
+
+  /**
+   * A HUMAN challenger's velocity in BLOCKS PER TICK, finite-differenced from
+   * two consecutively observed positions — or null for "no reading", which
+   * assembleStateMsg's toVec3(null) puts on the wire as the zero vector.
+   *
+   * Called ONLY from the no-connection branch of _snapshotOpponent. An opponent
+   * that has its own connection is read from it and never reaches here, so
+   * nothing below can perturb the self-play path. This method also OWNS
+   * `_challengerPosSample`: it is the only writer outside handleReset's clear.
+   *
+   * THE CLOCK IS `this._currentTick`, whose unit is one client physics tick —
+   * the same tick `bot.entity.velocity` is denominated in, since _waitTicks
+   * advances the counter by awaiting that many `physicsTick` events. The
+   * elapsed count is MEASURED, not assumed to be ACTION_REPEAT: this runs for
+   * handleReset's post-reset first observation too, which is outside any
+   * decision window, so two consecutive samples are not always one window
+   * apart. `_serverTick()` is deliberately NOT the clock — the server sends
+   * `update_time` only about once a second (see _serverTick), so consecutive
+   * windows would usually report a delta of 0 and every difference would be a
+   * division by zero.
+   *
+   * FOUR THINGS BREAK THE CHAIN, and each answers "no reading" rather than a
+   * number:
+   *   1. no previous sample — the first observation of this person, where a
+   *      guess would be indistinguishable from a measurement;
+   *   2. nothing observed now (no slot claimed, or the claimant is out of the
+   *      learner's entity view): the chain is BROKEN, not paused, so the stored
+   *      sample is dropped rather than kept to be differenced against whenever
+   *      they reappear;
+   *   3. a different username than the stored sample — the difference between
+   *      two people's positions describes neither of them;
+   *   4. a non-positive elapsed tick count. This is what an un-cleared sample
+   *      from before a reset would produce (handleReset restarts _currentTick
+   *      at 0 AND clears the sample); the guard is what makes forgetting that
+   *      clear fail closed instead of reporting a huge negative velocity.
+   *
+   * WHAT IT DOES NOT COVER: a teleport WITHIN one episode — a challenger who
+   * dies and respawns while still in view. `entity_teleport` (entities.js:333)
+   * sets the position absolutely and writes no velocity, so that one window
+   * would report the jump divided by the window length. It is one frame, and
+   * the last of its episode (env/mc_pvp_env.py: `events.opponent_died` is a
+   * terminal win, and the reset that follows clears the sample), which is worth
+   * less than either way of closing it — a max-speed clamp needs a threshold
+   * nothing in this repo pins, and a packet listener needs wiring on a path
+   * shared with training.
+   *
+   * @param {object|null} handle The opponent handle resolved for THIS
+   *   observation — never re-resolved here, so the velocity describes the same
+   *   person as the rest of the block.
+   * @returns {{x:number, y:number, z:number}|null} Blocks per tick, or null.
+   */
+  _challengerVelocity(handle) {
+    const entity = handle !== null && handle.entity ? handle.entity : null;
+    const position = entity && entity.position ? entity.position : null;
+    // Resolved BEFORE the guard rather than inside it: a nameless observation
+    // cannot be attributed, and a guard that reached through `handle` would
+    // depend on an earlier clause having already proved it non-null.
+    const username = handle !== null && typeof handle.username === 'string' ? handle.username : null;
+    const previous = this._challengerPosSample;
+    if (
+      position === null ||
+      username === null ||
+      !Number.isFinite(position.x) ||
+      !Number.isFinite(position.y) ||
+      !Number.isFinite(position.z)
+    ) {
+      this._challengerPosSample = null;
+      return null;
+    }
+    // Scalars, never the live Vec3 (see the field's declaration).
+    const sample = {
+      x: position.x,
+      y: position.y,
+      z: position.z,
+      tick: this._currentTick,
+      username,
+    };
+    this._challengerPosSample = sample;
+    if (previous === null || previous.username !== sample.username) {
+      return null;
+    }
+    const elapsedTicks = sample.tick - previous.tick;
+    if (!(elapsedTicks > 0)) {
+      return null;
+    }
+    return {
+      x: (sample.x - previous.x) / elapsedTicks,
+      y: (sample.y - previous.y) / elapsedTicks,
+      z: (sample.z - previous.z) / elapsedTicks,
     };
   }
 
