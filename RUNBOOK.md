@@ -707,7 +707,9 @@ bash scripts/watch_selfplay.sh --run-name m4_selfplay
 ```
 
 Every path defaults from `--run-name`, exactly as `launch_selfplay.sh` names things,
-so on a default night that one flag is the whole invocation. The judgement is
+and the arena count and the bridge **base port** are both read out of the launch
+gate's own `launch_argv.txt`, so a run on a non-default base port needs no flag
+either. On a default night `--run-name` is the whole invocation. The judgement is
 stdlib-only, so it runs on any `python3` and needs neither the venv nor the `PYTHON`
 export above.
 
@@ -715,13 +717,29 @@ export above.
 |---|--------|---------------|
 | 1 | LIVENESS | the driver process, from the pidfile via `ps`, with a recycled-pid guard and a finished-versus-crashed distinction |
 | 2 | GRAD STEP | the current grad step and how long it has been frozen, from `runs/<run>/metrics.jsonl`, the only source in the run carrying timestamps |
-| 3 | FLEET | bridge listeners on the run's port range against the arena count the launch actually started with |
+| 3 | FLEET | bridge listeners against the arena count **and** the base port the launch actually started with, both from `launch_argv.txt`; the detail line names where each came from (`base port from: launch-argv`) |
 | 4 | THROUGHPUT | the grad-step rate per LIVE arena against the canary's own measurement, rendered as implied episodes/hour |
 | 5 | EVAL | grad steps since a cycle last completed, cycles skipped since, and the latest `elo/learner_rated` |
 
 Verdicts are `OK` / `WARN` / `ALARM` / `?????`. Exit `0` is OK or WARN (WARN prints
 loudly but does not page), `1` is at least one ALARM, `2` is a usage error, `3` is
 UNKNOWN.
+
+**The two time windows are properties of your run, not constants, and the report
+shows its working.** How long the grad step may sit frozen before it is an ALARM, and
+how long the rate is measured over, are both derived from the interval this run
+should go between metrics rows: the tighter of
+`--checkpoint-every-grad-steps` / `--eval-every-grad-steps` out of `launch_argv.txt`,
+over the rate the canary measured for the number of arenas actually launched. GRAD
+STEP prints a `stall window …` line carrying every input to it, so read that line
+instead of assuming a number; when the argv or the baseline cannot be read it falls
+back to a wider constant and the same line says so.
+
+**Do not override it with `--stall-minutes`.** A fixed threshold was tried and
+rejected: the launch gate pins 20 periodic checkpoints across the window, which puts
+healthy boundaries roughly 39 minutes apart, so a constant made a perfectly healthy
+run read as a hard ALARM on the operator's first check after launch. The derivation
+is the fix.
 
 **Two things to understand, or you will misread the output.**
 
@@ -733,8 +751,17 @@ UNKNOWN.
   COLLAPSED RATE`**: every bridge listening with a client attached, and the rate
   collapsed anyway. That note is what this script exists for.
 - **UNKNOWN is never OK.** `?????` means the signal could not be determined, and it
-  names the file it could not read. A mistyped `--run-name` makes all five UNKNOWN,
-  which is why UNKNOWN carries its own exit code instead of folding into `0`.
+  names the files involved. A mistyped `--run-name` makes all five UNKNOWN, which is
+  why UNKNOWN carries its own exit code instead of folding into `0`.
+
+Three UNKNOWN readings are worth recognizing on sight. Each one is a question the
+script refuses to answer rather than a fault in the run, and each exits `3`:
+
+| Reading | What it means |
+|---------|---------------|
+| THROUGHPUT: *the grad step goes BACKWARDS inside the rate window* | `metrics.jsonl` is opened in append mode, so a run restarted into the same `--run-name` leaves two series interleaved in one file, and a rate across that seam is arithmetic on two runs. Point `--metrics` at a clean file, or watch a fresh `--run-name` |
+| EVAL: *no completed eval in the part of the log that was read, and the log was TRUNCATED* | Only the last 8 MiB of the driver log is read. This says the read cannot see a cycle, not that none has completed |
+| EVAL: *the log reports an eval at a grad step ahead of the metrics' current one* | The two files do not describe the same run. Check `--run-name`, `--log` and `--metrics` before reading anything else on the screen |
 
 `watch(1)` is not installed on this Mac, so the loop the script's own help suggests
 does not run here. Poll with a plain shell loop instead:
