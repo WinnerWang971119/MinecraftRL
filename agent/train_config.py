@@ -52,6 +52,7 @@ Owner: T16 (DQN core track)
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from agent.replay import DEFAULT_ALPHA, DEFAULT_BETA0, DEFAULT_PRIORITY_EPS
@@ -278,10 +279,13 @@ def eps_decay_episodes_for(
 
 #: The opponent sources ``TrainConfig.opponent`` accepts. ``"dummy"`` is the
 #: bridge-served stationary dummy (no ``opp_action`` on the wire at all);
-#: ``"scripted"`` is the Python-stepped ``ScriptedBot`` curriculum (T12). A typo
+#: ``"scripted"`` is the Python-stepped ``ScriptedBot`` curriculum (T12);
+#: ``"selfplay"`` fights a frozen policy snapshot drawn from the
+#: ``opponents.snapshot_pool.SnapshotPool`` (T8/T10, issue #10) — it REQUIRES
+#: ``warm_start`` to seed the pool's snapshot 0, enforced below. A typo
 #: here would otherwise select the dummy silently and quietly invalidate a whole
 #: overnight retrain, so the set is validated in ``__post_init__``.
-_OPPONENT_CHOICES = frozenset({"dummy", "scripted"})
+_OPPONENT_CHOICES = frozenset({"dummy", "scripted", "selfplay"})
 
 #: The tiers ``TrainConfig.eval_opponent_preset`` accepts — which scripted
 #: opponent the PERIODIC EVAL fights (never the training mixture, which drifts
@@ -289,6 +293,12 @@ _OPPONENT_CHOICES = frozenset({"dummy", "scripted"})
 #: ``"mixed"`` alternates EASY/HARD by episode index, ``"easy"`` / ``"hard"``
 #: pin one tier. Read only when ``opponent == "scripted"``.
 _EVAL_OPPONENT_PRESET_CHOICES = frozenset({"mixed", "easy", "hard"})
+
+#: The modes ``TrainConfig.snapshot_sampling`` accepts. ``"pfsp"`` is
+#: Prioritized Fictitious Self-Play (weight snapshots toward those the
+#: learner is roughly even with); ``"uniform"`` samples the pool with equal
+#: probability. Read only when ``opponent == "selfplay"``.
+_SNAPSHOT_SAMPLING_CHOICES = frozenset({"uniform", "pfsp"})
 
 
 @dataclass(frozen=True)
@@ -602,6 +612,90 @@ class TrainConfig:
     #: single-tier eval stops discriminating between checkpoints.
     eval_opponent_preset: str = "mixed"
 
+    # -- self-play snapshot pool + Elo (T8/T9/T10/T12/T18; issue #10) --------
+    #: Learner gradient steps between snapshot-pool archive events (T18): the
+    #: PUBLISHED weights (never ``trainer.online`` mid-step) are cloned,
+    #: frozen, and added to the pool as a new opponent version. 1000 is
+    #: one-fifth of ``checkpoint_interval`` (also gradient steps) — frequent
+    #: enough that the pool tracks the learner's progress, not so frequent
+    #: that most of the pool is a near-duplicate policy. Only read when
+    #: ``opponent == "selfplay"``.
+    snapshot_every_grad_steps: int = 1000
+
+    #: Which policy chooses the opponent snapshot for each self-play episode,
+    #: one of :data:`_SNAPSHOT_SAMPLING_CHOICES`. ``"pfsp"`` (the default) is
+    #: Prioritized Fictitious Self-Play: it weights snapshots toward those the
+    #: learner is roughly EVEN with (the PFSP weight ``p(1-p)`` peaks at a 50%
+    #: win rate), so training time is not spent replaying opponents already
+    #: solved or hopelessly out of reach. ``"uniform"`` samples the live pool
+    #: with equal probability — a simpler baseline, mainly useful for
+    #: isolating a PFSP-specific bug. Only read when ``opponent == "selfplay"``.
+    snapshot_sampling: str = "pfsp"
+
+    #: Exploration ε applied to the FROZEN snapshot opponent (never the
+    #: learner's own ε schedule). Without some opponent-side randomness, a
+    #: greedy learner facing a greedy frozen snapshot can lock the pair into a
+    #: deterministic, uninformative loop — both sides repeat the same move
+    #: sequence every episode, and neither side's data teaches the learner
+    #: anything new. 0.02 is a light nudge, not a real exploration schedule:
+    #: the snapshot opponent never trains and this value never decays.
+    #:
+    #: THE EXACT-ZERO CONTRACT (flagged in T8 review — do not "fix" this by
+    #: rounding): a match counts toward the RATED Elo series
+    #: (``elo/learner_rated``, the AC7 series and the checkpoint-selection
+    #: input) only when the learner's ε and this ε are BOTH `== 0.0` by exact
+    #: float equality (``MatchResult.rated_eligible``,
+    #: ``opponents.snapshot_pool.MatchResult.__post_init__``). If this were
+    #: ever set to a tiny-but-nonzero value (e.g. ``1e-18``) instead of a
+    #: literal ``0.0`` for eval cycles, every eval match would silently read
+    #: as unrated and the entire Elo curve — the headline deliverable of issue
+    #: #10 — would come out empty with no error anywhere. This field governs
+    #: TRAINING-time matches only; eval cycles must pass exactly ``0.0`` for
+    #: both epsilons, never an epsilon-adjacent constant.
+    opponent_epsilon: float = 0.02
+
+    #: Learner gradient steps at which pinned reference snapshots 2 and 3 are
+    #: promoted (T18) — permanent, never-evicted pool members that give PFSP a
+    #: floor opponent and give Elo a fixed yardstick across the whole run.
+    #: Reference 1 is pinned at creation (snapshot 0, grad step 0, from the
+    #: warm start) and is not listed here. Must be a 2-tuple of positive
+    #: ``int`` grad steps in STRICTLY INCREASING order — an out-of-order or
+    #: repeated value would promote the same (or an earlier) snapshot twice
+    #: and silently shrink the reference set to fewer than 3 members. Only
+    #: read when ``opponent == "selfplay"``.
+    reference_promote_grad_steps: tuple[int, int] = (5000, 15000)
+
+    #: Elo K-factor: the maximum rating swing per RATED match,
+    #: ``R_a += K * (S_a - E_a)``. 24 mirrors
+    #: ``opponents.snapshot_pool.ELO_K`` — the standard mid-range value, large
+    #: enough that Elo tracks a genuinely improving learner within one
+    #: training run, small enough that a single lucky win does not swing the
+    #: rating wildly. Only read when ``opponent == "selfplay"``.
+    elo_k: float = 24.0
+
+    #: The learner's Elo rating at the start of the run, before any rated
+    #: match. Mirrors ``opponents.snapshot_pool.ELO_INITIAL``. Snapshot
+    #: ratings are frozen at creation from whatever the learner's rating was
+    #: at that moment; only the learner's own rating moves thereafter. 1000
+    #: is the conventional Elo baseline. Only read when
+    #: ``opponent == "selfplay"``.
+    elo_initial: float = 1000.0
+
+    #: Optional SHA-256 hex digest the warm-start checkpoint at ``warm_start``
+    #: must match, checked by T11b before the run is allowed to start.
+    #: ``None`` skips the check (the default — plain ``warm_start`` runs are
+    #: unaffected). This exists because a self-play run's snapshot 0 is
+    #: seeded ENTIRELY from the warm-start weights (AC14): a checkpoint
+    #: silently swapped for the wrong file (stale path, wrong run, a partial
+    #: download) would still load cleanly and would only be caught, if at
+    #: all, by the Elo curve looking wrong hours later. When set, must be a
+    #: 64-character lowercase hex string — the exact shape
+    #: ``hashlib.sha256(...).hexdigest()`` produces — so a mistyped or
+    #: wrongly-cased checksum fails at config time instead of silently never
+    #: matching. T11b owns the actual byte comparison against the checkpoint
+    #: file; this field only owns its shape.
+    warm_start_sha256: str | None = None
+
     def __post_init__(self) -> None:
         """Validate the hyperparameters so a misconfigured run fails loudly.
 
@@ -747,4 +841,106 @@ class TrainConfig:
                 "eval_opponent_preset must be one of "
                 f"{sorted(_EVAL_OPPONENT_PRESET_CHOICES)}, got "
                 f"{self.eval_opponent_preset!r}"
+            )
+        if self.snapshot_every_grad_steps < 1:
+            raise ValueError(
+                "snapshot_every_grad_steps must be >= 1, got "
+                f"{self.snapshot_every_grad_steps}"
+            )
+        if self.snapshot_sampling not in _SNAPSHOT_SAMPLING_CHOICES:
+            raise ValueError(
+                "snapshot_sampling must be one of "
+                f"{sorted(_SNAPSHOT_SAMPLING_CHOICES)}, got "
+                f"{self.snapshot_sampling!r}"
+            )
+        # `not 0 <= x <= 1` (not two or-ed comparisons) so NaN is rejected rather
+        # than slipping through as an always-false predicate.
+        if not 0.0 <= self.opponent_epsilon <= 1.0:
+            raise ValueError(
+                f"opponent_epsilon must be in [0, 1], got {self.opponent_epsilon!r}"
+            )
+        # The container type is checked BEFORE the length, because a list
+        # passes every value check below and then breaks something far away:
+        # this dataclass is frozen (so hashable by field values), and a list
+        # field makes `hash(cfg)` raise `TypeError: unhashable type: 'list'`
+        # at whatever unrelated call site first hashes the config. An
+        # `argparse` flag with `nargs=2` yields a list, so this is the shape
+        # the CLI hands over unless it casts.
+        if not isinstance(self.reference_promote_grad_steps, tuple):
+            raise ValueError(
+                "reference_promote_grad_steps must be a tuple, got "
+                f"{self.reference_promote_grad_steps!r}"
+            )
+        if len(self.reference_promote_grad_steps) != 2:
+            raise ValueError(
+                "reference_promote_grad_steps must have exactly 2 entries "
+                f"(references 2 and 3), got {self.reference_promote_grad_steps!r}"
+            )
+        for step in self.reference_promote_grad_steps:
+            # Entries must be `int`, not merely int-VALUED: T18 promotes on
+            # `grad_step == promote_first`, an equality against an integer
+            # counter, so a float like 5000.5 never matches and pinned
+            # references 2 and 3 would simply never be created — no error
+            # anywhere, just a reference set silently short of 3 members.
+            if not isinstance(step, int):
+                raise ValueError(
+                    "reference_promote_grad_steps entries must all be int, got "
+                    f"{step!r} in {self.reference_promote_grad_steps!r}"
+                )
+            if step <= 0:
+                raise ValueError(
+                    "reference_promote_grad_steps must all be positive, got "
+                    f"{self.reference_promote_grad_steps!r}"
+                )
+        promote_first, promote_second = self.reference_promote_grad_steps
+        if not promote_first < promote_second:
+            raise ValueError(
+                "reference_promote_grad_steps must be strictly increasing, got "
+                f"{self.reference_promote_grad_steps!r}"
+            )
+        # Two guards per field, because the two bad values fail differently.
+        # `not x > 0` (not `x <= 0`) so NaN is rejected: NaN fails every ordered
+        # comparison, so `<= 0` would be False and let it through. `isfinite`
+        # then catches `+inf`, which PASSES the ordered comparison — and an
+        # infinite K-factor turns the first rated match's rating into inf/nan,
+        # emptying the `elo/learner_rated` series (issue #10's headline
+        # deliverable) with no error anywhere. Deliberately STRICTER than
+        # ``opponents.snapshot_pool``'s own Elo argument checks, which require
+        # only finite-and-``>= 0`` for ``elo_k`` and merely finite for
+        # ``elo_initial``. Tightening here is free; the pool is the shared
+        # library and keeps the looser contract.
+        if not math.isfinite(self.elo_k) or not self.elo_k > 0.0:
+            raise ValueError(f"elo_k must be finite and > 0, got {self.elo_k!r}")
+        if not math.isfinite(self.elo_initial) or not self.elo_initial >= 0.0:
+            raise ValueError(
+                f"elo_initial must be finite and >= 0, got {self.elo_initial!r}"
+            )
+        if self.warm_start_sha256 is not None:
+            digest = self.warm_start_sha256
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(
+                    "warm_start_sha256 must be a 64-character lowercase hex "
+                    f"SHA-256 digest or None, got {self.warm_start_sha256!r}"
+                )
+            if self.warm_start is None:
+                # The converse of the shape check: with no warm start there is
+                # no checkpoint to hash, so T11b's comparison has nothing to
+                # run against and would silently skip. An operator who pastes
+                # a checksum but forgets `--warm-start` would get exactly zero
+                # verification and zero warning — the same silent-skip failure
+                # AC14 (below) exists to kill.
+                raise ValueError(
+                    "warm_start_sha256 requires warm_start to be set — there "
+                    "is no checkpoint to verify the digest against, got "
+                    f"warm_start=None with "
+                    f"warm_start_sha256={self.warm_start_sha256!r}"
+                )
+        if self.opponent == "selfplay" and self.warm_start is None:
+            # Without a warm start the snapshot pool has nothing to seed
+            # snapshot 0 from; failing here beats reaching "pool empty: refuse
+            # to start" at runtime, hours into a launched run (AC14).
+            raise ValueError(
+                "opponent='selfplay' requires warm_start to be set — the "
+                "snapshot pool has no policy to seed snapshot 0 from without "
+                "a warm-start checkpoint, got warm_start=None"
             )
