@@ -66,6 +66,17 @@ reach the obs ONLY through the gating filter; opponent ``health`` never reaches
 the obs at all (the obs has no slot for it). The reward consumes the privileged
 ``events`` block, never raw opponent health here.
 
+Self-play seam (M4): built with ``mirror_opponent=True`` the env ALSO builds the
+OPPONENT seat's observation — the same frozen 23-number contract with the two
+wire blocks exchanged — and serves it from
+:meth:`MCPvPEnv.opponent_observation`. It is computed EAGERLY, exactly once per
+ingested ``state``, because the mirror's memory ages per ``filter()`` call and a
+lazy accessor would age it once per caller instead of once per window. The
+mirror owns a SECOND :class:`~env.perception_filter.PerceptionFilter`, never the
+learner's: the two fighters last saw each other at different times, and those
+are different facts. The flag defaults to False, which leaves the M1/M2/M3
+paths exactly as they were.
+
 Owner: T9 (Environment/bridge track)
 """
 
@@ -97,6 +108,7 @@ from bridge.messages import (
     StepMsg,
     parse_line,
 )
+from env.mirror_perception import OpponentMirror
 from env.observation_spec import (
     OBS_DIM,
     OBS_DTYPE,
@@ -388,6 +400,13 @@ class TcpBridgeClient:
 # PerceptionFilter uses for the opponent). The yaw rotation convention is the
 # single one documented in env/perception_filter (yaw 0 looks toward +z;
 # +Z_local forward, +X_local right, +Y_local world-up).
+#
+# That convention is now GUARANTEED at the wire, not merely assumed here: the
+# bridge converts mineflayer's mirrored frame (its yaw 0 looks toward -z) into
+# the protocol one inside `_snapshotSelf` / `_snapshotOpponent`, and
+# bridge/schema.md states it as part of the contract. Feeding a raw mineflayer
+# yaw into this rotation mirrors the agent's forward axis front-to-back — which
+# is precisely the perception bug this convention note exists to prevent.
 # ---------------------------------------------------------------------------
 
 
@@ -561,6 +580,14 @@ class MCPvPEnv:
         auto_connect: Connect the transport during construction. Defaults to True;
             tests with a fake that needs no connect can leave it True (a fake
             ``connect`` is a harmless no-op).
+        mirror_opponent: Also build the OPPONENT seat's observation on every
+            ingested state and serve it from :meth:`opponent_observation`.
+            Defaults to False, which builds no mirror at all — no second
+            filter, no second vector, and :meth:`opponent_observation` raises;
+            the M1/M2/M3 paths are untouched. Set it True only for M4
+            self-play, where the second fighter is a frozen snapshot of this
+            agent's own policy and therefore needs the same 23 numbers computed
+            from the seat it is playing.
 
     Action space:
         Discrete ``N_ACTIONS`` (== 8), the frozen :class:`~agent.actions.Macro`
@@ -592,6 +619,7 @@ class MCPvPEnv:
         max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
         dt: float = DECISION_DT_SECONDS,
         auto_connect: bool = True,
+        mirror_opponent: bool = False,
     ) -> None:
         # ``None`` is "no truncation" and is handled BEFORE the range check —
         # the check reads ``<= 0``, and ``None <= 0`` is a TypeError on Python 3.
@@ -612,6 +640,28 @@ class MCPvPEnv:
             None if max_episode_steps is None else int(max_episode_steps)
         )
         self._dt = float(dt)
+
+        # The OPPONENT seat's observation builder, or None when the mirror is
+        # off (the default, and the whole of the M1/M2/M3 behavior here).
+        #
+        # DO NOT hand it ``self._filter``. OpponentMirror takes an optional
+        # filter and deliberately builds its OWN: each fighter remembers when
+        # IT last saw the other, so one shared instance would let every
+        # learner-seat filter() call zero the opponent seat's time_since_seen
+        # and vice versa — both memories destroyed, both vectors still
+        # well-formed and validate()-passing.
+        self._mirror: Optional[OpponentMirror] = (
+            OpponentMirror() if mirror_opponent else None
+        )
+        # Tripwire, not a runtime condition: it cannot fire as written above,
+        # and it fires the moment somebody "optimizes" that line into passing
+        # ``self._filter`` — at construction, instead of silently mid-run.
+        if self._mirror is not None and self._mirror.perception_filter is self._filter:
+            raise RuntimeError(
+                "the opponent mirror must not share the env's PerceptionFilter: "
+                "the two seats hold different last-seen memories, and one shared "
+                "instance makes each seat refresh the other's time_since_seen"
+            )
 
         # Per-episode mutable state (initialized by reset()).
         self._episode: int = -1
@@ -670,7 +720,8 @@ class MCPvPEnv:
         reports ``ok == False`` the world is unverified, so the reset is RETRIED
         ONCE; a second ``ok == False`` RAISES :class:`BridgeError` rather than
         starting an episode from a corrupt state (protects the MDP / AC7). On
-        success the PerceptionFilter memory and step counter are reset and the
+        success the PerceptionFilter memory (and the opponent mirror's separate
+        memory, when the mirror is on) and the step counter are reset, and the
         post-reset ``state`` message is gated/packed into the initial observation.
 
         Transport resilience: unlike :meth:`step`, ``reset`` is idempotent and has
@@ -759,6 +810,15 @@ class MCPvPEnv:
         # Gate confirmed: clear per-episode memory BEFORE consuming the first
         # state so the opponent starts ABSENT (no stale memory across episodes).
         self._filter.reset()
+        # The opponent seat's perception memory is per-episode state too, and it
+        # is a SEPARATE memory from self._filter's — clearing one does not clear
+        # the other. Without this the frozen snapshot starts a fresh episode
+        # already "remembering" the previous episode's geometry. It also drops
+        # the cached mirrored vector, so if the post-reset state read below never
+        # lands, opponent_observation() raises "before any state" rather than
+        # serving the previous episode's last window as if it were current.
+        if self._mirror is not None:
+            self._mirror.reset()
         self._step_count = 0
         self._done = False
         # Re-arm the opponent's shadow swing meter alongside the filter memory:
@@ -775,6 +835,12 @@ class MCPvPEnv:
         # The post-reset first observation is the next inbound `state` message.
         state = self._recv_state()
         obs = self._state_to_obs(state)
+        # EAGER, in lockstep with _state_to_obs: one mirrored observation per
+        # ingested state. _step_count is 0 and the shadow swing meter was just
+        # re-armed above, so the cooldown handed to the mirror is 1.0 — exactly
+        # what raw_opponent_view() reports to a scripted opponent picking its
+        # first action of this episode.
+        self._observe_opponent_seat(state)
         self._prev_obs = obs
         return obs
 
@@ -870,6 +936,19 @@ class MCPvPEnv:
         events = state.events
         self._step_count += 1
 
+        # --- the mirrored opponent seat (M4 self-play) ----------------------
+        # EAGER, once per ingested state — and deliberately BELOW the increment
+        # above, so both seats read the shadow swing meter at the same point in
+        # the window. A scripted opponent calls raw_opponent_view() AFTER
+        # step() returns, to choose the next window's action, and therefore
+        # sees the POST-increment meter; the self-play driver calls
+        # opponent_observation() at that same point. Computing the mirror up
+        # beside _state_to_obs instead would report 0.0 for a swing that
+        # raw_opponent_view() already scores as one window charged, and the two
+        # seats would disagree about the same swing.
+        self._observe_opponent_seat(state)
+
+        # --- terminal flags -------------------------------------------------
         died = bool(events.i_died)
         opp_died = bool(events.opponent_died)
         # A None horizon NEVER truncates (T3/AC4): against a human the only
@@ -971,7 +1050,14 @@ class MCPvPEnv:
 
         Yaw is converted to **degrees**: the wire carries radians, and
         ``OpponentView`` documents its ``self_yaw`` / ``target_yaw`` as degrees.
-        This method is the only place that conversion happens.
+        This method is the only place that conversion happens. Only the UNIT
+        changes here — the *frame* is passed through untouched, so both yaws
+        stay in the wire's protocol convention (``0`` faces ``+z``, increasing
+        clockwise toward ``-x``; see ``bridge/schema.md``) and land in
+        ``(-180, 180]``. ``ScriptedBot`` reads neither field — they are carried
+        on ``OpponentView`` for a future policy that steers by facing — so this
+        is the frame that policy inherits, and it must not be re-mirrored here
+        to match some other module's idea of yaw.
 
         ``attack_cooldown`` is clamped to **exactly** ``1.0`` (never ``1.0``
         minus a float hair) because ``ScriptedBot`` tests readiness with a
@@ -1037,6 +1123,54 @@ class MCPvPEnv:
             can_see_target=True,
             last_known_target_pos=view_target_pos,
         )
+
+    # -- the mirrored opponent-seat observation (self-play seam) -----------
+
+    def opponent_observation(self) -> np.ndarray:
+        """The OPPONENT seat's observation for the current window — the CACHE.
+
+        The same frozen ``OBS_DIM`` contract :meth:`step` returns, computed from
+        the other fighter's seat: ``state.opponent`` is its SELF block and the
+        LEARNER is its perception-gated target, through a filter of the mirror's
+        own. It exists for one consumer — the M4 self-play driver, which runs a
+        frozen snapshot of this agent's past policy and so needs the exact
+        inputs that policy was trained on, from the seat it is playing.
+
+        **This method computes nothing.** The vector is built eagerly, exactly
+        once per ingested ``state``, inside :meth:`reset` and :meth:`step`.
+        Building it here instead would age the mirror's perception memory once
+        per CALL: two reads in one window would age it twice, and a window
+        nobody read would not age it at all, so the opponent's "how long since I
+        saw you" would track how many times Python happened to ask rather than
+        elapsed time. Repeat calls within one window are therefore
+        byte-identical (AC2) and allocate nothing.
+
+        Returned BY REFERENCE — the same array the mirror holds, exactly as
+        :meth:`step` returns the array ``_prev_obs`` retains. Treat it as
+        read-only; mutating it corrupts the cache for the rest of the window.
+
+        Returns:
+            The mirrored ``np.ndarray`` of shape ``(OBS_DIM,)``, dtype float32,
+            already through :func:`env.observation_spec.validate`.
+
+        Raises:
+            ValueError: if this env was built with ``mirror_opponent=False``
+                (there is no opponent seat to serve), or if no ``state`` has
+                been received yet — matching :meth:`raw_opponent_view`'s refusal
+                rather than inventing a zeroed world for the frozen net.
+        """
+        if self._mirror is None:
+            raise ValueError(
+                "opponent_observation() requires an env built with "
+                "mirror_opponent=True; this env has no opponent mirror"
+            )
+        obs = self._mirror.latest
+        if obs is None:
+            raise ValueError(
+                "opponent_observation() called before any state was received; "
+                "call reset() first"
+            )
+        return obs
 
     def close(self) -> None:
         """Send ``close`` (best-effort) and tear down the transport.
@@ -1306,6 +1440,42 @@ class MCPvPEnv:
         # Fail loudly on a malformed vector rather than feeding the agent garbage.
         validate(obs)
         return obs.astype(OBS_DTYPE, copy=False)
+
+    def _observe_opponent_seat(self, state: StateMsg) -> None:
+        """Build + cache the OPPONENT seat's observation for this window.
+
+        A no-op when the mirror is off — that no-op is what keeps the M1/M2/M3
+        paths unchanged under a flag they never set.
+
+        Called EXACTLY ONCE per ingested ``state``, from :meth:`_reset_protocol`
+        and :meth:`step`, and never from :meth:`opponent_observation`. The
+        mirror owns a :class:`~env.perception_filter.PerceptionFilter` whose
+        memory ages by ``dt`` on every ``filter()`` call, so "once per state" is
+        the invariant that makes the opponent's ``time_since_seen`` mean seconds
+        rather than call count.
+
+        The cooldown comes from the env's EXISTING shadow meter
+        (:meth:`_opponent_attack_cooldown`), never a second estimate: the wire
+        carries no opponent cooldown at all, and two independent reconstructions
+        would drift until the seats disagreed about the same swing. That meter
+        reads ``_step_count``, so WHERE :meth:`step` calls this is load-bearing
+        — see the comment at that call site.
+
+        Raises:
+            env.mirror_perception.MirrorWireError: if ``state.opponent`` lacks
+                ``on_ground`` or ``held_item``. This is the earliest point the
+                refusal can happen — at construction there is no wire block to
+                inspect yet — and in practice it is the first :meth:`reset`.
+                It catches an ``OpponentState`` built without the fields (or a
+                hand-rolled/replay state object); it does NOT catch a bridge
+                that stopped emitting them, because ``assembleStateMsg``
+                rebuilds the block and coerces an absent value to ``False`` /
+                ``""``, which arrives here looking like a real reading.
+                ``env/mirror_perception.py`` records the full surface list.
+        """
+        if self._mirror is None:
+            return
+        self._mirror.observe(state, self._dt, self._opponent_attack_cooldown())
 
 
 # ===========================================================================

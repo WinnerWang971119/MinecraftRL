@@ -91,12 +91,24 @@ that need a sustained live run are still open.
 > that mattered — see
 > [`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md).
 
+> **The loadout changed, and no armored match has been played yet.** Both fighters —
+> learner, opponent bot, and the human challenger at the exhibition — now get an iron
+> sword **and a full iron set** (`spawn_learner_pad.mcfunction`,
+> `spawn_dummy_pad.mcfunction`, and `human_gear_commands()` in
+> [`deploy/exhibition.py`](deploy/exhibition.py)). Armor is applied with
+> `item replace entity … armor.<slot>`, never `give`: **`give` does not equip**, it
+> drops the piece in the inventory at zero armor points, which looks identical in a
+> chat log. A full iron set takes ~48% off an incoming iron-sword hit (6 → ~3.12), so
+> fights run ~1.75× longer and `MAX_EPISODE_STEPS` moved 400 → **600** (120 s). Every
+> checkpoint in `runs/` predates the change and was trained bare-handed.
+
 | Milestone | Question | Bar | Status |
 |-----------|----------|-----|:------:|
 | **M1 plumbing** (AC3) | does the loop survive the real bridge? | ≥100 episodes, 0 crashes, RSS growth < ~200 MB | ⬜ live run pending |
 | **M1 the number** (AC4) | how fast / how many pads? | transitions/s, p99 round-trip, damage-exact, max pads @≥19 TPS | ⬜ live run pending — the scale ladder in [`RUNBOOK.md`](RUNBOOK.md) is an empty table on purpose |
 | **Recurrence gate** (TC8b) | does the LSTM actually work? | memory fixture green, ablation fails | ✅ offline, re-confirm before trusting M2 |
 | **M2 learning** (AC6) | does the RL stack learn? | greedy win ≥95% / 100 eps, no spin-farming | ⬜ live training pending |
+| **M4 self-play** (AC7) | does it improve against itself? | `elo/learner_rated` rising, win rate vs pinned references not collapsing | ⬜ live run pending — `--opponent selfplay` exists; no self-play run has been done |
 
 Taking the stack live and collecting these acceptances is exactly what
 [`RUNBOOK.md`](RUNBOOK.md) walks through, in dependency order. **Done = the
@@ -219,14 +231,16 @@ Commands assume the venv (`.venv/bin/python`); plain `python` works if you activ
 | Offline tests | `.venv/bin/python -m pytest` · `cd bridge && npm test` | Fakes + fixtures; no game needed |
 | Boot Paper | `bash server/setup/setup.sh` then `bash server/setup/start.sh` | `setup` is idempotent and re-copies the datapack into the world; `start.sh` resolves and pins Java 21. The `.ps1` files in [`server/setup/`](server/setup/) are Windows leftovers, unmaintained since the move to macOS and **not** kept in step with the shell scripts (their Java advice is wrong). macOS is the supported path |
 | Start the bridge | `cd bridge && npm start` | Start Paper **first** — bots connect before the port opens |
-| Damage-channel gate | `.venv/bin/python -m eval.combat_probe --cycles 10` | AC8, the go/no-go: per-hit `6,6,6,2`, cumulative 20, reconciled against the wire's opponent health |
+| Damage-channel gate | `.venv/bin/python -m eval.combat_probe --cycles 10` | AC8, the go/no-go. Per-hit expectation is DERIVED from the target's loadout, not hardcoded: against the iron set both fighters now wear it is `3.12` x6 then `1.28`, cumulative 20. `--target-armor none` reproduces the historical `6,6,6,2` |
 | M1 slice | `.venv/bin/python -m eval.run_random --episodes 100 --host 127.0.0.1 --port 5555` | ≥100 eps, zero crashes |
 | M1 benchmark | `.venv/bin/python -m eval.benchmark --duration 600 --arenas 1` | Climb the rungs for the max; this is the AC4 **measurement** flag on `eval.benchmark` |
 | M2 training (single pad) | `.venv/bin/python -m agent.train --max-episodes 10000 --eval-every-episodes 50 --eval-episodes 100 --checkpoint runs/m2.pt --run-name m2_train` | Live status bar + ETA; stops early when the gate passes |
 | Multi-pad training | `PADS=N bash server/setup/setup.sh`, `bash server/setup/start-pads.sh --pads N` (wait for `FLEET READY`), then `.venv/bin/python -m agent.train --arenas N --port 5555 --max-episodes 10000 --checkpoint runs/m2_multi.pt --run-name m2_multi` | **One** Paper JVM, N enclosed pads 512 blocks apart, bridge port `5555+i`. `--arenas N` on `agent.train` is the **training** flag; distinct from `eval.benchmark --arenas` above |
+| M4 self-play night | The ordered sequence in [`RUNBOOK.md`](RUNBOOK.md) (*The self-play night*): fleet, `scripts/canary_selfplay.sh`, `scripts/launch_selfplay.sh smoke`/`plan`/`launch` | A 12-hour unattended run. Two prerequisites are load-bearing and neither is a flag on the scripts: `export PYTHON=/Users/diego/Documents/MinecraftRL/.venv/bin/python` (the M4 worktree has no `.venv`, and `canary_selfplay.sh`, `launch_selfplay.sh` and `start-pads.sh` all default to one), and `caffeinate -dimsu` on the **fleet boot**, not the launch, because this Mac sleeps after a minute idle and `launch` detaches and returns in ~20 s |
+| Check a live run | `bash scripts/watch_selfplay.sh --run-name m4_selfplay` | Read-only: writes nothing, signals nothing, opens no socket. Five badged signals; exit `0` OK/WARN, `1` ALARM, `2` usage, `3` UNKNOWN. Needs only a stdlib `python3` |
 | Watch it live | [`docs/spectate.md`](docs/spectate.md) | Join with your own client. Read its "Before you join" first — you spawn in **survival**, inside pad 0 |
 | Human exhibition | `.venv/bin/python -m deploy.exhibition --challenger-username <name>` | One command: Paper + bridge + the agent playing greedily from a checkpoint. Plays **one** match, then waits. Full procedure, the one-challenger protocol and the failure lookup table are in [`docs/demo-day.md`](docs/demo-day.md) |
-| Arm the next challenger | `.venv/bin/python -m deploy.exhibition --reset` | Separate command, second terminal. Heals and repositions both sides and plays exactly one more match. Never automatic |
+| Arm the next challenger | type `reset` in Minecraft chat, or `.venv/bin/python -m deploy.exhibition --reset` | One mechanism, two triggers; chat is the demo-day path. Heals, repositions and re-gears both sides (sword + full iron set), reads the human's gear back off the server, and plays exactly one more match. Never automatic |
 
 **Run order for anything live: Paper → bridge → Python driver.** Full ordered
 procedure, pass conditions, and what to watch (reward components, Q divergence) are
@@ -242,6 +256,7 @@ in [`RUNBOOK.md`](RUNBOOK.md).
 | [`RUNBOOK.md`](RUNBOOK.md) | Taking the stack live and collecting M1 + M2, plus the scale-ladder table. |
 | [`docs/demo-day.md`](docs/demo-day.md) | Running the classroom exhibition: the one command, the one-challenger protocol, the reset, and what to do when something looks wrong mid-demo. |
 | [`docs/spectate.md`](docs/spectate.md) | Joining the world with your own Minecraft client to check the bots by eye. |
+| [`docs/plans/2026-08-19-m4-selfplay.md`](docs/plans/2026-08-19-m4-selfplay.md) | The M4 self-play design: the snapshot pool, PFSP, the two Elo series, the T17 canary and the T19 launch gate, and the decided warm start with its digest. |
 | [`docs/plans/2026-08-08-damage-channel-fix-and-pad-topology.md`](docs/plans/2026-08-08-damage-channel-fix-and-pad-topology.md) | Why the damage channel was dead, the enclosed-pad topology, and the reward re-ordering. Current branch. |
 | [`docs/analysis/2026-08-10-windows-archive.md`](docs/analysis/2026-08-10-windows-archive.md) | What the pre-repair training archive actually contains, and why no checkpoint in `runs/` is usable. |
 | [`docs/plans/2026-06-09-minecraft-pvp-kickoff.md`](docs/plans/2026-06-09-minecraft-pvp-kickoff.md) | The full picture: scope, decisions, data model, task table (T0–T20), acceptance criteria, risks. |

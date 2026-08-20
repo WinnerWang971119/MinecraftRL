@@ -142,7 +142,7 @@ Discrete set (DQN-native); each maps to Mineflayer plugin calls:
 
 Dense, damage-anchored, minimal (to avoid hacking):
 `r = c_dmg_out·damage_dealt − c_dmg_in·damage_taken − c_step + c_aim·1[visible & in_crosshair] + R_terminal`.
-Starts: `c_dmg_out=1, c_dmg_in≈1, c_step≈0.005, c_aim≈0.01, R_terminal=±(5–10)`, timeout = draw (0). Prefer **potential-based shaping** for positional terms. Watch: `c_step` too big → suicide-rush, too small → runs away; always-on aim reward → spin-to-farm (hence visibility-gated, tiny). (Full detail: training spec §3.)
+Starts: `c_dmg_out=1, c_dmg_in≈1, c_step≈0.005, c_aim=0.002, R_terminal=±(5–10)`, timeout = draw (0). **`c_aim` must be strictly below `c_step`** — `RewardConfig` raises otherwise (issue #25): visibility-gating alone still lets a stationary agent stare at a visible opponent for `c_aim − c_step` a step forever, which at `c_aim ≥ c_step` is a flat non-negative optimum. The earlier `≈0.01` here was that inversion. Prefer **potential-based shaping** for positional terms. Watch: `c_step` too big → suicide-rush, too small → runs away; always-on aim reward → spin-to-farm (hence visibility-gated, tiny). (Full detail: training spec §3.)
 
 ---
 

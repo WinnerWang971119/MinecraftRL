@@ -72,7 +72,9 @@ def _state(*, damage_dealt=0.0, damage_taken=0.0, tick=1):
                 "yaw": 0.0,
                 "pitch": 0.0,
                 "velocity": [0.0, 0.0, 0.0],
+                "on_ground": True,
                 "health": 20.0,
+                "held_item": "iron_sword",
             },
             "events": {
                 "damage_dealt": damage_dealt,

@@ -66,8 +66,8 @@
           "description": "Learner-bot raw state (FULL; always real, never gated).",
           "properties": {
             "pos": { "$ref": "#/definitions/vec3" },
-            "yaw": { "type": "number", "description": "Yaw in radians." },
-            "pitch": { "type": "number", "description": "Pitch in radians." },
+            "yaw": { "type": "number", "description": "Yaw in radians, PROTOCOL convention: 0 looks toward +z (south) and yaw increases turning clockwise seen from above (toward -x, west); folded into (-pi, pi]. NOT mineflayer's frame (its yaw 0 looks toward -z); bot.js converts at the snapshot boundary via protocol_yaw = normalizeYaw(pi - mineflayer_yaw). See bridge/schema.md \"the angle convention\"." },
+            "pitch": { "type": "number", "description": "Pitch in radians, POSITIVE looking DOWN, range [-pi/2, pi/2]. NOT mineflayer's frame (its pitch is positive looking up); bot.js converts via protocol_pitch = -mineflayer_pitch. See bridge/schema.md \"the angle convention\"." },
             "velocity": { "$ref": "#/definitions/vec3" },
             "on_ground": { "type": "boolean" },
             "health": { "type": "number", "description": "Self current health (0..MAX_HEALTH). Self health is allowed in the observation." },
@@ -82,12 +82,14 @@
           "description": "Opponent RAW true state. PRIVILEGED: opponent.health is true health carried for FUTURE stages; the reward may read it but it MUST NEVER reach the observation (gated out by the PerceptionFilter). Position/facing/velocity are also gated upstream before they reach the obs.",
           "properties": {
             "pos": { "$ref": "#/definitions/vec3" },
-            "yaw": { "type": "number", "description": "Opponent yaw in radians." },
-            "pitch": { "type": "number", "description": "Opponent pitch in radians." },
+            "yaw": { "type": "number", "description": "Opponent yaw in radians, SAME protocol convention and (-pi, pi] range as state.self.yaw (both fighters are converted at the same boundary, because the filter derives facing as opponent.yaw - self.yaw). See bridge/schema.md \"the angle convention\"." },
+            "pitch": { "type": "number", "description": "Opponent pitch in radians, SAME convention as state.self.pitch (positive looking DOWN). See bridge/schema.md \"the angle convention\"." },
             "velocity": { "$ref": "#/definitions/vec3" },
-            "health": { "type": "number", "description": "RAW true opponent health. PRIVILEGED -> reward only, NEVER the observation." }
+            "on_ground": { "type": "boolean", "description": "Whether the opponent is on the ground. PROVENANCE: read from the OPPONENT'S OWN mineflayer connection (bot.js _opponentBot().entity.onGround), never from the handle entity resolved through the learner's client. Reading it cross-client would not give stale data, it would give a fabricated constant: prismarine-entity sets onGround = true in its constructor and nothing ever writes a non-self entity's value again. That is the same defect class as damage_dealt reading 0 for the life of the project. A human challenger has no connection to read from, so the wire carries the no-reading false - matching held_item's empty string and health's 0. There is no handle-view fallback." },
+            "health": { "type": "number", "description": "RAW true opponent health. PRIVILEGED -> reward only, NEVER the observation." },
+            "held_item": { "type": "string", "description": "Opponent held-item identifier (e.g. \"iron_sword\"); same vocabulary as state.self.held_item, resolved to a vocab id by observation_spec. Read from the OPPONENT'S OWN connection for the same provenance reason as on_ground; \"\" when the opponent has no connection (human challenger) or an empty hand, matching the zeroed-opponent block." }
           },
-          "required": ["pos", "yaw", "pitch", "velocity", "health"],
+          "required": ["pos", "yaw", "pitch", "velocity", "on_ground", "health", "held_item"],
           "additionalProperties": false
         },
         "events": {

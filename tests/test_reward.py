@@ -96,7 +96,8 @@ def test_default_config_reproduces_combat_reward_shape():
     assert cfg.c_dmg_in == 0.5
     assert cfg.c_dmg_out == 2.0 * cfg.c_dmg_in  # dealt weighted 2x taken
     assert cfg.c_step == 0.005  # finalized step penalty (T17)
-    assert cfg.c_aim == 0.01
+    assert cfg.c_aim == 0.002  # issue #25: must stay strictly below c_step
+    assert cfg.c_aim < cfg.c_step  # staring at a visible opponent is net-negative
     assert cfg.R_terminal_win == 50.0
     assert cfg.R_terminal_loss == 30.0
     assert cfg.R_terminal_timeout == -15.0
@@ -424,12 +425,19 @@ def test_compute_reward_equals_sum_of_components_random():
     rng = np.random.default_rng(2025)
 
     for _ in range(500):
+        # c_step is drawn first and c_aim as a strict fraction of it (0.999x at
+        # most) so every draw satisfies the RewardConfig invariant c_aim <
+        # c_step (issue #25) — sampling the two independently from overlapping
+        # ranges would frequently draw c_aim >= c_step and make this
+        # construction raise.
+        c_step_draw = float(rng.uniform(1e-4, 0.02))
+        c_aim_draw = float(rng.uniform(0.0, 0.999)) * c_step_draw
         cfg = dataclasses.replace(
             RewardConfig(),
             c_dmg_out=float(rng.uniform(0.5, 2.0)),
             c_dmg_in=float(rng.uniform(0.5, 2.0)),
-            c_step=float(rng.uniform(0.0, 0.02)),
-            c_aim=float(rng.uniform(0.0, 0.05)),
+            c_step=c_step_draw,
+            c_aim=c_aim_draw,
             R_terminal_win=float(rng.uniform(5.0, 10.0)),
             R_terminal_loss=float(rng.uniform(5.0, 10.0)),
             # Must stay strictly between -R_terminal_loss and 0. The binding
@@ -599,3 +607,88 @@ def test_terminal_invariant_rejects_non_finite_values(field, bad):
     directions and could otherwise coincidentally satisfy a sign check."""
     with pytest.raises(ValueError, match=rf"RewardConfig\.{field} must be finite"):
         dataclasses.replace(RewardConfig(), **{field: bad})
+
+
+# ---------------------------------------------------------------------------
+# TC36 — c_aim < c_step strictly (issue #25): a stationary, staring agent must
+# never be able to farm net-positive reward by doing nothing but aiming.
+# ---------------------------------------------------------------------------
+
+
+def test_aim_step_invariant_accepts_the_default_config():
+    """The frozen defaults satisfy c_aim < c_step without raising."""
+    cfg = RewardConfig()
+    assert cfg.c_aim == 0.002
+    assert cfg.c_step == 0.005
+    assert cfg.c_aim < cfg.c_step
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (
+            {"c_aim": 0.005, "c_step": 0.005},
+            r"c_aim < c_step \(strictly\), got c_aim=0\.005, c_step=0\.005",
+        ),
+        (
+            {"c_aim": 0.01, "c_step": 0.005},
+            r"c_aim < c_step \(strictly\), got c_aim=0\.01, c_step=0\.005",
+        ),
+    ],
+    ids=["equal_is_rejected", "greater_is_rejected"],
+)
+def test_aim_step_invariant_rejects_equality_and_inversion(kwargs, match):
+    """TC36: equality is REJECTED, not just inversion. At ``c_aim == c_step``
+    staring nets exactly 0/step — still a flat local optimum with no gradient
+    pushing the agent back toward engaging, so it is rejected exactly like
+    ``c_aim > c_step``. ``equal_is_rejected`` pins that flat-optimum boundary
+    (0.005, 0.005), which was never a shipped config; ``greater_is_rejected``
+    pins the actual (0.01, 0.005) values that produced issue #25, so a revert
+    of the default cannot pass silently."""
+    with pytest.raises(ValueError, match=match):
+        dataclasses.replace(RewardConfig(), **kwargs)
+
+
+def test_aim_step_invariant_rejects_negative_c_aim():
+    """A negative aim coefficient would flip the sign of the shaping incentive
+    (penalizing the agent for looking at its opponent), so it is rejected
+    independently of the ordering check."""
+    with pytest.raises(ValueError, match=r"RewardConfig\.c_aim must be non-negative"):
+        dataclasses.replace(RewardConfig(), c_aim=-0.001)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("field", ["c_aim", "c_step"])
+def test_aim_step_invariant_rejects_non_finite_values(field, bad):
+    """inf, -inf, and nan are all rejected for both c_aim and c_step — a
+    non-finite coefficient would poison every downstream reward sum."""
+    with pytest.raises(ValueError, match=rf"RewardConfig\.{field} must be finite"):
+        dataclasses.replace(RewardConfig(), **{field: bad})
+
+
+def test_stationary_staring_agent_accrues_negative_reward_every_step():
+    """The actual property TC36 protects (issue #25), not just the numbers.
+
+    A stationary agent that stares at a visible, in-crosshair opponent deals
+    no damage, takes no damage, and never moves (so the positional shaping
+    term, already 0 at the default ``c_approach``, has no delta to contribute
+    either way). Under the OLD coefficients (``c_aim=0.01 > c_step=0.005``)
+    this exact scenario was net POSITIVE (``+0.005``/step) forever — a stable
+    degenerate equilibrium where two mutually-staring self-play agents never
+    engage. Under the fixed coefficients it must be net NEGATIVE every single
+    step, not merely on average, so standing still and aiming is never a rest
+    state the agent can settle into.
+    """
+    cfg = RewardConfig()
+    events = _events()  # no damage dealt, none taken
+    obs = _obs(visible=True, in_crosshair=True, opp_pos=(1.0, 0.0, 2.0))
+
+    total = 0.0
+    for _ in range(50):  # a long stare, not just a single lucky step
+        r = compute_reward(events, obs, obs, _nonterminal(), cfg)
+        assert r < 0.0, "staring must be net-negative every step, not on average"
+        assert r == pytest.approx(cfg.c_aim - cfg.c_step)
+        total += r
+
+    assert total == pytest.approx(50 * (cfg.c_aim - cfg.c_step))
+    assert total < 0.0

@@ -187,6 +187,21 @@ OutboundMessage = "ResetMsg | StepMsg | CloseMsg"  # typing alias (string form)
 # Nested raw-state blocks are typed dataclasses so callers read fields by name.
 # Vector fields (``pos``/``velocity``) are kept as plain length-3 lists of
 # floats — the same world-frame triples that are on the wire.
+#
+# ANGLE CONVENTION (contract; see bridge/schema.md "the angle convention").
+# Every ``yaw`` / ``pitch`` parsed here is PROTOCOL-convention, because the
+# bridge converts out of mineflayer's frame at the snapshot boundary
+# (``bot.js::_snapshotSelf`` / ``_snapshotOpponent``):
+#
+#   * ``yaw`` — radians, ``0`` looks toward ``+z`` (south), increasing clockwise
+#     seen from above (toward ``-x``, west); folded into ``(-pi, pi]``.
+#   * ``pitch`` — radians, POSITIVE looking DOWN, range ``[-pi/2, pi/2]``.
+#
+# This is exactly the convention ``env/perception_filter.py`` documents and its
+# ``_look_vector`` assumes. Mineflayer's own ``entity.yaw`` is
+# ``atan2(-dx, -dz)`` — mirrored along ``z``, with pitch positive looking UP —
+# and must never reach these dataclasses unconverted: it silently mirrors the
+# FOV cone front-to-back.
 # ---------------------------------------------------------------------------
 
 
@@ -196,8 +211,10 @@ class SelfState:
 
     Attributes:
         pos: ``[x, y, z]`` world-frame position.
-        yaw: Yaw in radians.
-        pitch: Pitch in radians.
+        yaw: Yaw in radians, protocol convention (``0`` looks toward ``+z``,
+            increasing clockwise toward ``-x``), folded into ``(-pi, pi]``.
+            See the ANGLE CONVENTION note above.
+        pitch: Pitch in radians, POSITIVE looking DOWN, in ``[-pi/2, pi/2]``.
         velocity: ``[x, y, z]`` world-frame velocity.
         on_ground: Whether the bot is on the ground.
         health: Self current health (``0..MAX_HEALTH``); allowed in the obs.
@@ -250,19 +267,44 @@ class OpponentState:
     reward only. Position/facing/velocity are also raw here and are gated
     upstream by the PerceptionFilter before any of them reach the obs.
 
+    ``on_ground`` and ``held_item`` are neither privileged nor gated, because
+    the learner's observation never carries them at all — the observation
+    contract (``env/observation_spec.py``) has no opponent slot for either.
+    They are on the wire for the M4 self-play mirror, which consumes them as
+    the opponent seat's OWN self block, and self state is by definition
+    ungated. Distinct from ``health``, which IS privileged: reward-only, never
+    any observation.
+
     Attributes:
         pos: ``[x, y, z]`` world-frame position.
-        yaw: Yaw in radians.
-        pitch: Pitch in radians.
+        yaw: Yaw in radians, the SAME protocol convention and ``(-pi, pi]``
+            range as :attr:`SelfState.yaw` — both fighters are converted at the
+            same boundary, because the filter derives the agent-relative facing
+            as ``opponent.yaw - self.yaw``. See the ANGLE CONVENTION note above.
+        pitch: Pitch in radians, POSITIVE looking DOWN, in ``[-pi/2, pi/2]``.
         velocity: ``[x, y, z]`` world-frame velocity.
+        on_ground: Whether the opponent is on the ground. Mirrors
+            :attr:`SelfState.on_ground`, and carries the same meaning — but NOT
+            the same provenance. The bridge reads it from the opponent's OWN
+            mineflayer connection, never from the opponent entity as seen
+            through the learner's client: a non-self ``onGround`` is a
+            prismarine-entity constructor constant that nothing updates, the
+            same class of non-reading that left ``damage_dealt`` at zero for
+            the life of the project. A human challenger has no connection to
+            read from, so the wire carries the no-reading ``False``.
         health: RAW true opponent health. PRIVILEGED -> reward only, NEVER obs.
+        held_item: Opponent held-item identifier string, same vocabulary as
+            :attr:`SelfState.held_item`. ``""`` when the opponent's hand is
+            empty or it has no connection to read from (a human challenger).
     """
 
     pos: List[float]
     yaw: float
     pitch: float
     velocity: List[float]
+    on_ground: bool
     health: float
+    held_item: str
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "OpponentState":
@@ -271,9 +313,11 @@ class OpponentState:
             yaw=float(d["yaw"]),
             pitch=float(d["pitch"]),
             velocity=[float(v) for v in d["velocity"]],
+            on_ground=bool(d["on_ground"]),
             # PRIVILEGED: parsed because it is on the wire; downstream must route
             # this ONLY to the reward, never to the observation builder.
             health=float(d["health"]),
+            held_item=str(d["held_item"]),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -282,7 +326,9 @@ class OpponentState:
             "yaw": self.yaw,
             "pitch": self.pitch,
             "velocity": list(self.velocity),
+            "on_ground": self.on_ground,
             "health": self.health,
+            "held_item": self.held_item,
         }
 
 
@@ -363,7 +409,8 @@ class StateMsg:
     -------------------------------------------------------------
     The opponent has **no** ``attack_cooldown`` channel on the wire:
     ``state.self.attack_cooldown`` is the *learner's*, and ``state.opponent``
-    carries only pos/yaw/pitch/velocity/health. ``MCPvPEnv.raw_opponent_view()``
+    carries pos/yaw/pitch/velocity/on_ground/health/held_item — every field the
+    self block has EXCEPT the cooldown. ``MCPvPEnv.raw_opponent_view()``
     therefore SHADOW-TRACKS the opponent's swing meter in Python, from the ticks
     elapsed since the last ``opp_action == ATTACK`` that actually fired. This
     field is how the bridge says whether it fired:
@@ -587,13 +634,19 @@ def _validate_self(d: Any) -> None:
 
 
 def _validate_opponent(d: Any) -> None:
-    _check_keys(d, ("pos", "yaw", "pitch", "velocity", "health"), "state.opponent")
+    _check_keys(
+        d,
+        ("pos", "yaw", "pitch", "velocity", "on_ground", "health", "held_item"),
+        "state.opponent",
+    )
     _check_vec3(d["pos"], "state.opponent.pos")
     _require(_is_number(d["yaw"]), "state.opponent.yaw must be a number")
     _require(_is_number(d["pitch"]), "state.opponent.pitch must be a number")
     _check_vec3(d["velocity"], "state.opponent.velocity")
+    _require(isinstance(d["on_ground"], bool), "state.opponent.on_ground must be a boolean")
     # PRIVILEGED: validated as present/number, but it is reward-only downstream.
     _require(_is_number(d["health"]), "state.opponent.health must be a number")
+    _require(isinstance(d["held_item"], str), "state.opponent.held_item must be a string")
 
 
 def _validate_events(d: Any) -> None:

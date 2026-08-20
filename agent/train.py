@@ -51,6 +51,8 @@ Owner: T16 (DQN core track)
 
 from __future__ import annotations
 
+import hashlib
+import os
 import random
 import threading
 from collections import deque
@@ -58,6 +60,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Deque,
     Dict,
     List,
@@ -65,7 +68,9 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
+    Union,
 )
 
 import numpy as np
@@ -88,6 +93,13 @@ from agent.train_config import (
 )
 from distributed.serialization import Episode
 from opponents.scripted_bot import OpponentView, ScriptedBot, ScriptedPreset
+from opponents.snapshot_pool import (
+    DRAW_SCORE,
+    INDEX_FILENAME,
+    MatchResult,
+    SnapshotPool,
+    SnapshotRecord,
+)
 
 __all__ = [
     "EnvProtocol",
@@ -109,11 +121,22 @@ __all__ = [
     "arena_episode_seed",
     "opponent_seed",
     "EpisodeOpponent",
+    "ObservationOpponent",
+    "OpponentDriver",
     "OpponentCurriculum",
     "ScriptedOpponentDriver",
     "build_scripted_opponents",
+    "SnapshotOpponentDriver",
+    "build_snapshot_opponents",
+    "build_rated_eval_opponent",
+    "build_reference_tracks",
+    "selfplay_eval_cycle_row",
+    "selfplay_log_row",
+    "snapshot_pool_directory",
+    "SnapshotArchivist",
     "EvalOpponentDriver",
     "build_eval_opponent",
+    "build_live_env_factory_for",
     "collect_episode",
     "hidden_snapshot",
     "LearnStats",
@@ -781,10 +804,23 @@ def arena_episode_seed(cfg: TrainConfig, arena_id: int, local_ep: int) -> int:
 
 
 #: Seed roles inside one arena's opponent band, in index order. Each per-arena
-#: driver owns three independent RNG streams — the EASY/HARD mixture draw, and
-#: one per ``ScriptedBot`` — and they must not collide with each other or with
-#: another arena's.
-_OPPONENT_SEED_ROLES: Tuple[str, ...] = ("mixture", "easy", "hard", "eval")
+#: driver owns independent RNG streams — for the scripted driver the EASY/HARD
+#: mixture draw plus one per ``ScriptedBot``; for the self-play driver the
+#: snapshot draw plus its ε-greedy generator — and they must not collide with
+#: each other or with another arena's.
+#:
+#: APPEND ONLY. The seed for a role is its INDEX in this tuple, so inserting or
+#: reordering an entry silently re-seeds every role after it and changes what a
+#: previously reproducible run replays. The self-play roles are therefore at the
+#: end, behind the four this project already shipped.
+_OPPONENT_SEED_ROLES: Tuple[str, ...] = (
+    "mixture",
+    "easy",
+    "hard",
+    "eval",
+    "snapshot_sample",
+    "snapshot_epsilon",
+)
 
 
 def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
@@ -810,8 +846,10 @@ def opponent_seed(cfg: TrainConfig, arena_id: int, role: str) -> int:
         cfg: The training config (supplies ``seed`` and ``seed_stride``).
         arena_id: 0-based arena index.
         role: One of :data:`_OPPONENT_SEED_ROLES` — ``"mixture"``, ``"easy"``,
-            ``"hard"``, or ``"eval"`` (the periodic eval's own opponent, which
-            :func:`build_eval_opponent` seeds from a band no collector owns).
+            ``"hard"``, ``"eval"`` (the periodic eval's own opponent, which
+            :func:`build_eval_opponent` seeds from a band no collector owns),
+            ``"snapshot_sample"`` (the self-play driver's pool draw) or
+            ``"snapshot_epsilon"`` (its ε-greedy ``torch.Generator``).
 
     Returns:
         The integer seed for that arena's stream.
@@ -1137,6 +1175,1348 @@ def build_scripted_opponents(
     return curriculum, opponent_for
 
 
+# ---------------------------------------------------------------------------
+# Self-play: the frozen past-self opponent (T10, M4 / issues #8-#10).
+#
+# WHAT CHANGES. The scripted curriculum drives the second fighter from an
+# omniscient hand-written bot that reads an :class:`OpponentView`. Self-play
+# drives it from a FROZEN SNAPSHOT of this agent's own past policy, which is a
+# ``DuelingDRQN`` and therefore needs the one thing a view is not: the 23-dim
+# observation vector, computed from the OPPONENT'S seat. ``MCPvPEnv`` serves
+# that from ``opponent_observation()`` when it was built with
+# ``mirror_opponent=True``.
+#
+# TWO PROTOCOLS, ONE DISCRIMINATOR. The two opponent kinds cannot share one
+# ``act`` signature without one of them silently receiving the wrong argument
+# type, so :class:`ObservationOpponent` is a SEPARATE protocol and
+# :func:`collect_episode` picks the branch off the ``needs_observation`` class
+# attribute. :class:`EpisodeOpponent` is untouched; the scripted path keeps
+# every byte of its behavior.
+#
+# THE MIRROR IS NOT OPTIONAL. ``opponent_observation()`` RAISES on an env built
+# without ``mirror_opponent=True`` rather than returning a zeroed world, so a
+# missed construction site is a loud failure on the first episode instead of a
+# night spent training a frozen net on garbage. Both sites — the training env
+# factory and the eval env — are wired below.
+# ---------------------------------------------------------------------------
+
+
+class ObservationOpponent(Protocol):
+    """An opponent that decides from the OPPONENT-seat OBSERVATION, not a view.
+
+    Deliberately a SEPARATE protocol from :class:`EpisodeOpponent` rather than a
+    widening of it: the two differ in what ``act`` takes (a 23-dim
+    ``np.ndarray`` here, an :class:`~opponents.scripted_bot.OpponentView` there)
+    and Python would happily pass either object to either implementation.
+    Splitting them makes the mismatch a routing decision
+    :func:`collect_episode` takes ONCE per episode, off :attr:`needs_observation`,
+    instead of a duck-typing accident discovered at the first ``act`` call.
+
+    :class:`SnapshotOpponentDriver` is the only production implementation; a
+    test may substitute a recorder.
+
+    Attributes:
+        needs_observation: Always ``True``. The discriminator
+            :func:`collect_episode` reads to decide between
+            ``env.opponent_observation()`` and ``env.raw_opponent_view()``. A
+            ``ClassVar`` rather than an instance field so it describes the KIND
+            of opponent: one driver cannot route one way this episode and the
+            other way the next.
+    """
+
+    needs_observation: ClassVar[bool]
+
+    def begin_episode(self) -> None:
+        """Called once before an episode's first decision (sample + reset)."""
+        ...
+
+    def act(self, obs: np.ndarray) -> int:
+        """Return the opponent's macro (``0..N_ACTIONS-1``) for this window.
+
+        Args:
+            obs: The OPPONENT seat's ``(OBS_DIM,)`` float32 observation, from
+                ``env.opponent_observation()``.
+        """
+        ...
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Called once with the FINAL step's ``info`` so the episode can be scored."""
+        ...
+
+
+#: Either opponent kind, as :func:`collect_episode` sees it.
+#: :class:`~distributed.actor.ActorPool` builds one per arena and only stores it
+#: (it never calls into a driver itself); :func:`collect_episode` is the single
+#: place either protocol is actually exercised.
+OpponentDriver = Union[EpisodeOpponent, ObservationOpponent]
+
+
+def _needs_observation(opponent: Optional[Any]) -> bool:
+    """True iff ``opponent`` wants the mirrored observation rather than a view.
+
+    Read via ``getattr`` with a ``False`` default so an
+    :class:`EpisodeOpponent` — which has no such attribute, and must not grow
+    one — routes to the historical view path untouched. ``None`` (the
+    stationary-dummy path) reads as ``False`` for the same reason. The ``bool``
+    coercion makes the return a real boolean rather than whatever the attribute
+    happened to hold, so a caller may compare it with ``is``.
+    """
+    return bool(getattr(opponent, "needs_observation", False))
+
+
+def snapshot_pool_directory(run_name: str) -> str:
+    """Return the snapshot-pool directory for ``run_name`` (``runs/<run>/snapshots``).
+
+    The one place that layout is spelled out, so the pool the training loop
+    writes and the pool a restart reloads cannot drift apart by a path typo.
+
+    Args:
+        run_name: The run's logger name (``--run-name``), e.g. ``"m4_selfplay"``.
+
+    Returns:
+        The relative directory path. :class:`~opponents.snapshot_pool.SnapshotPool`
+        creates it if it does not exist.
+
+    Raises:
+        ValueError: ``run_name`` is empty or whitespace — that would silently
+            collapse the path to ``runs/snapshots`` and merge two runs' pools.
+    """
+    name = str(run_name).strip()
+    if not name:
+        raise ValueError(f"run_name must be a non-empty string, got {run_name!r}")
+    return os.path.join("runs", name, "snapshots")
+
+
+class SnapshotOpponentDriver:
+    """One arena's self-play opponent: a frozen past-self policy, resampled per episode.
+
+    Implements :class:`ObservationOpponent`. Per episode it draws a snapshot
+    from the shared :class:`~opponents.snapshot_pool.SnapshotPool`, loads those
+    frozen weights into its OWN net, and plays them; at the end it scores the
+    match back into the pool, which is what feeds PFSP and both Elo series.
+
+    Four properties are load-bearing, and each one is a specific failure this
+    class exists to prevent:
+
+      * **The net is a PRIVATE CPU clone in ``eval()`` mode.** One per arena —
+        ``cfg.arenas`` of them, all live while the learner steps the optimizer;
+        putting them on the learner's device would make every arena's episode
+        boundary contend with it for the same compute. It is a SECOND frozen
+        clone per collector, beside the
+        :class:`~distributed.weights.SnapshotPolicy` that already acts for the
+        learner, and that one is CPU-pinned too. ``DuelingDRQN.act`` is itself
+        ``@torch.no_grad()``, so no autograd graph is ever built here.
+      * **The LSTM hidden state is reset in :meth:`begin_episode`.** A DRQN's
+        action depends on its whole carried history; a hidden state left over
+        from the PREVIOUS episode (a different snapshot, a different fight) is
+        not an error anywhere — the net still returns a legal macro — it just
+        makes the opponent's behavior a function of the last episode's ending.
+        Silent corruption, so it is reset explicitly and asserted by a test.
+      * **Two private RNG streams, never the global ones.** ``self._rng`` draws
+        the snapshot, ``self._generator`` drives ε-greedy; both are seeded from
+        this arena's own band via :func:`opponent_seed`. A stream shared with
+        another arena — or with the process-wide RNG — makes each arena's draws
+        depend on how the collector threads happened to interleave, so the run
+        stops being reproducible from its seed and the arenas stop being
+        independent samples.
+      * **It acts at ``cfg.opponent_epsilon`` (0.02 by default), not greedily.**
+        Two greedy deterministic policies facing each other can lock into the
+        same move sequence every episode, producing thousands of near-identical
+        trajectories that teach the learner nothing. ``rated=True`` is the one
+        thing IN THIS CLASS that overrides that ε, pinning both sides to a
+        literal ``0.0`` — see the argument below and
+        :func:`build_rated_eval_opponent`. It is for an eval cycle of a bounded
+        number of episodes, where the lock-in this ε exists to prevent has
+        nothing to corrupt (``eval.evaluate.evaluate`` writes nothing into the
+        replay buffer) and where greedy-vs-greedy is the POINT: it is the only
+        pairing ``elo/learner_rated`` accepts. A run can of course also reach
+        ε=0 by configuring ``opponent_epsilon`` to 0 — which is why that field
+        carries its own warning, and why it is not the fix for the eval.
+
+    Args:
+        cfg: The training config (``opponent_epsilon``, seeds).
+        pool: The SHARED snapshot pool (one per run). Thread-safe; every arena's
+            driver samples from and records into the same instance.
+        arena_id: 0-based arena index; selects this driver's seed band.
+        net_factory: Zero-arg builder for this driver's own net. MUST produce
+            the same architecture the learner publishes, or
+            ``load_state_dict(strict=True)`` refuses the snapshot loudly.
+            Defaults to a stock :class:`~agent.dqn.DuelingDRQN`.
+        learner_epsilon: The learner's ε for the FIRST match, before
+            :meth:`note_learner_epsilon` reports the real per-episode value.
+            Defaults to ``cfg.eps_end`` — the learner's ε FLOOR, deliberately
+            not ``0.0``: a match whose ε was never reported must not read as a
+            greedy one and slip into the rated Elo series.
+        rated: Build the RATED-EVAL driver instead of a training one. Both
+            epsilons become a literal ``0.0``, so every match this driver scores
+            is ``rated_eligible`` and moves ``elo/learner_rated`` — the AC7
+            series and the checkpoint-selection input. Without it that series is
+            empty BY CONSTRUCTION: a training driver stamps
+            ``cfg.opponent_epsilon`` (0.02) on every record and the learner
+            anneals only to ``cfg.eps_end`` (0.05), so no training match can
+            ever qualify. Setting ``--opponent-epsilon 0`` is NOT the same fix —
+            that makes the frozen opponent greedy in TRAINING too, which is the
+            deterministic lock-in the nonzero default prevents. Defaults to
+            ``False``, so every existing construction site is unchanged.
+        reference: PIN this driver to ONE snapshot for every episode instead of
+            drawing a fresh one from the pool. ``None`` (the default) keeps the
+            sampling behavior every training driver has. The reference eval
+            needs the pin because ``selfplay/win_rate_vs_ref_<id>`` names a
+            SPECIFIC snapshot: a driver that resampled would spread one track's
+            ten episodes across whatever PFSP happened to draw, and the series
+            would be labelled with a snapshot the agent mostly did not fight.
+            Passed a PINNED record (which is all
+            :meth:`~opponents.snapshot_pool.SnapshotPool.pinned_references`
+            returns), so the pool's corruption policy for it is fatal-not-drop —
+            which is the correct reading here too: a reference gauntlet that
+            silently lost a reference would report a rising curve over a
+            shrinking set of opponents.
+
+    Raises:
+        ValueError: ``rated=True`` together with a nonzero ``learner_epsilon`` —
+            a contradiction, and the direction that fails SILENTLY (the driver
+            would look rated and score nothing into the rated series).
+    """
+
+    #: The :func:`collect_episode` discriminator: this driver is fed
+    #: ``env.opponent_observation()``, never ``env.raw_opponent_view()``.
+    needs_observation: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        pool: SnapshotPool,
+        arena_id: int,
+        *,
+        net_factory: Optional[Callable[[], Any]] = None,
+        learner_epsilon: Optional[float] = None,
+        rated: bool = False,
+        reference: Optional[SnapshotRecord] = None,
+    ) -> None:
+        self.arena_id = int(arena_id)
+        self._pool = pool
+        self._rated = bool(rated)
+        self._reference = reference
+        if self._rated:
+            if learner_epsilon is not None and float(learner_epsilon) != 0.0:
+                raise ValueError(
+                    "a rated driver plays at epsilon 0.0 on BOTH sides, so "
+                    f"learner_epsilon={learner_epsilon!r} contradicts rated=True. "
+                    "Pass 0.0 or omit it."
+                )
+            # LITERAL zeros, not `cfg`-derived ones. `MatchResult.rated_eligible`
+            # is exact float equality, so a value that arrived here as 1e-18
+            # would leave every eval match unrated and `elo/learner_rated` empty
+            # with no error anywhere.
+            self._epsilon = 0.0
+            self._learner_epsilon = 0.0
+        else:
+            self._epsilon = float(cfg.opponent_epsilon)
+            self._learner_epsilon = float(
+                cfg.eps_end if learner_epsilon is None else learner_epsilon
+            )
+
+        # CPU only, deliberately and unconditionally — see the class docstring.
+        # Not derived from the learner's device: a run that ever gets a GPU
+        # learner must NOT quietly move a frozen clone per arena onto it.
+        self._device = torch.device("cpu")
+        build = net_factory if net_factory is not None else DuelingDRQN
+        self._net = build().to(self._device)
+        self._net.eval()
+
+        # Private streams, seeded from this arena's own band. `random.Random`
+        # for the pool draw (SnapshotPool.sample only needs `.random()`) and a
+        # torch.Generator for ε-greedy (what DuelingDRQN.act consumes).
+        self._rng = random.Random(
+            opponent_seed(cfg, self.arena_id, "snapshot_sample")
+        )
+        self._generator = torch.Generator(device=self._device)
+        self._generator.manual_seed(
+            opponent_seed(cfg, self.arena_id, "snapshot_epsilon")
+        )
+
+        # Per-episode state. `None` hidden is the LSTM zero-init contract
+        # DuelingDRQN.act applies, and `None` record means "no snapshot loaded
+        # yet", which observe_outcome treats as nothing to score.
+        self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._record: Optional[SnapshotRecord] = None
+        self._last_match: Optional[MatchResult] = None
+
+    # -- read side ---------------------------------------------------------
+
+    @property
+    def net(self) -> Any:
+        """This driver's own frozen net (exposed for tests / introspection)."""
+        return self._net
+
+    @property
+    def hidden(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The carried LSTM state; ``None`` at every episode's first decision."""
+        return self._hidden
+
+    @property
+    def snapshot_id(self) -> Optional[int]:
+        """Id of the snapshot loaded for the CURRENT episode, or ``None``."""
+        return None if self._record is None else int(self._record.snapshot_id)
+
+    @property
+    def record(self) -> Optional[SnapshotRecord]:
+        """The :class:`~opponents.snapshot_pool.SnapshotRecord` being played."""
+        return self._record
+
+    @property
+    def reference(self) -> Optional[SnapshotRecord]:
+        """The snapshot this driver is PINNED to, or ``None`` if it samples.
+
+        Set once at construction and never mutated, so a reference track cannot
+        drift onto another opponent halfway through its episodes.
+        """
+        return self._reference
+
+    @property
+    def epsilon(self) -> float:
+        """This driver's own ε — the ``opponent_epsilon`` side of a match record."""
+        return self._epsilon
+
+    @property
+    def learner_epsilon(self) -> float:
+        """The learner's ε for the current episode, as last reported."""
+        return self._learner_epsilon
+
+    @property
+    def rated(self) -> bool:
+        """True iff this driver was built for a RATED eval (both ε exactly 0.0).
+
+        Every match a rated driver scores is ``rated_eligible``. A training
+        driver's matches are not, unless the RUN itself was configured greedy on
+        both sides — which the nonzero ``opponent_epsilon`` default exists to
+        prevent. The flag is fixed at construction and cannot be set later:
+        :meth:`note_learner_epsilon` refuses to move a rated driver off ``0.0``
+        rather than silently downgrading it back to an unrated one.
+        """
+        return self._rated
+
+    @property
+    def name(self) -> str:
+        """Stable name for logs (``"snapshot_<id>"``, or ``"snapshot"`` before one)."""
+        return "snapshot" if self._record is None else f"snapshot_{self.snapshot_id}"
+
+    @property
+    def current_match(self) -> Optional[MatchResult]:
+        """The most recently SCORED match, or ``None`` before the first outcome.
+
+        Deliberately the scored result and not the in-flight one: a
+        :class:`~opponents.snapshot_pool.MatchResult` carries a ``score``, and a
+        match still being played has none. Fabricating a placeholder score here
+        would put a value into a record whose whole purpose is to be rated. The
+        in-flight match's identity is available meanwhile from
+        :attr:`snapshot_id`, :attr:`learner_epsilon` and :attr:`epsilon`.
+        """
+        return self._last_match
+
+    # -- write side --------------------------------------------------------
+
+    def note_learner_epsilon(self, epsilon: float) -> None:
+        """Report the LEARNER's ε for the episode about to start.
+
+        The driver cannot derive this: ε comes from the global per-episode
+        schedule (plus the Ape-X per-actor spread), which lives on the collector
+        side. :func:`collect_episode` calls this immediately before
+        :meth:`begin_episode` on every self-play episode; an eval that wants its
+        matches to count toward ``elo/learner_rated`` must call it with EXACTLY
+        ``0.0`` (see ``TrainConfig.opponent_epsilon`` — eligibility is exact
+        float equality, so an ε-adjacent constant empties the rated series
+        silently).
+
+        Args:
+            epsilon: The learner's exploration rate for this episode, in
+                ``[0, 1]``.
+
+        Raises:
+            ValueError: ``epsilon`` is outside ``[0, 1]`` or not finite —
+                :class:`~opponents.snapshot_pool.MatchResult` would reject it
+                later, at scoring time, far from the caller that supplied it.
+                Also when a nonzero ε is reported to a :attr:`rated` driver: that
+                would silently un-rate an eval cycle, and an empty
+                ``elo/learner_rated`` looks exactly like a flat one.
+        """
+        value = float(epsilon)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"learner epsilon must be in [0, 1], got {epsilon!r}")
+        if self._rated and value != 0.0:
+            raise ValueError(
+                f"a rated driver plays at learner epsilon 0.0; got {epsilon!r}. "
+                "Reporting a nonzero epsilon here would make every match of this "
+                "eval cycle unrated, and elo/learner_rated would stay flat at "
+                "its initial value with nothing reporting why."
+            )
+        self._learner_epsilon = value
+
+    def begin_episode(self) -> None:
+        """Sample this episode's snapshot, load it, and clear the LSTM memory.
+
+        Three steps, all of them before the first :meth:`act`:
+
+          1. ``pool.sample_state_dict`` draws a snapshot AND reads its weights,
+             internally dropping-and-resampling past an unpinned member that
+             turns out to be missing or corrupt. That retry loop is the pool's,
+             not this class's — reimplementing it here would give the fleet two
+             disagreeing corruption policies.
+          2. ``load_state_dict(strict=True)`` (torch's default) copies the frozen
+             weights in; a snapshot from a different architecture fails loudly
+             rather than loading a partial net.
+          3. The hidden state is cleared, so the first ``act`` of the episode
+             starts from a zero LSTM state instead of the last episode's memory.
+
+        ``exclude_id`` is passed as ``None``. It names the learner's own current
+        policy version, and this driver has no way to know it: the collector
+        carries a :class:`~distributed.weights.WeightStore` version, which is a
+        publish counter, not a snapshot id. So the newest snapshot stays
+        sampleable — a near-copy of the learner as of the last archive cadence.
+        Wiring a real exclusion belongs with whatever owns that cadence, which
+        is also the only thing that knows which snapshot id it just wrote.
+        Either way the pool's bootstrap rule (snapshot 0 stays sampleable until
+        a second distinct version exists) guarantees the very first episode has
+        a legal opponent.
+
+        A driver built with a ``reference`` skips step 1 entirely and reloads
+        THAT snapshot every episode. Reloading is strictly redundant — the
+        record never changes and :meth:`act` cannot write weights — and it is
+        done anyway so a pinned driver and a sampling one keep ONE shape: the
+        weights an episode plays always came from a pool read at the start of
+        that episode, with no second lifecycle to reason about. It costs one
+        snapshot read (~2.4 MB) per episode, against an eval cycle measured in
+        tens of minutes. ``pool.load_state_dict`` applies the same corruption
+        policy the sampling path uses, and for a PINNED record that policy is
+        fatal rather than drop-and-resample — the correct reading here too: a
+        gauntlet that silently lost a reference would report a rising curve
+        over a shrinking set of opponents.
+
+        Raises:
+            opponents.snapshot_pool.PinnedSnapshotError: A pinned reference
+                snapshot is missing or unreadable — fatal by contract.
+            opponents.snapshot_pool.SnapshotPoolError: No sampleable member
+                remains. Never silently falls back to an untrained net.
+        """
+        if self._reference is not None:
+            record = self._reference
+            state_dict = self._pool.load_state_dict(record)
+        else:
+            record, state_dict = self._pool.sample_state_dict(
+                self._rng, exclude_id=None
+            )
+        self._net.load_state_dict(state_dict)
+        self._record = record
+        # AFTER the load, and unconditionally: a hidden state carried across the
+        # episode boundary makes this episode's behavior depend on the last
+        # one's ending, with nothing anywhere reporting it.
+        self._hidden = None
+
+    def act(self, obs: np.ndarray) -> int:
+        """Return the frozen snapshot's macro for this decision window.
+
+        Advances the driver's own LSTM by exactly one step and acts ε-greedily
+        at :attr:`epsilon` off the driver's private generator.
+
+        Args:
+            obs: The OPPONENT seat's ``(OBS_DIM,)`` observation, from
+                ``env.opponent_observation()``. Passed through untouched apart
+                from the float32/CPU coercion the net requires.
+
+        Returns:
+            The macro as an ``int`` in ``[0, N_ACTIONS)`` — ``DuelingDRQN.act``
+            can only return an index into its own Q head, so the env's range
+            check on ``opp_action`` is unreachable from here.
+        """
+        if torch.is_tensor(obs):
+            obs_tensor = obs.to(dtype=torch.float32, device=self._device)
+        else:
+            obs_tensor = torch.as_tensor(
+                obs, dtype=torch.float32, device=self._device
+            )
+        action, self._hidden = self._net.act(
+            obs_tensor,
+            self._hidden,
+            epsilon=self._epsilon,
+            generator=self._generator,
+        )
+        return int(action)
+
+    def observe_outcome(self, info: Mapping[str, Any]) -> None:
+        """Score the finished episode into the shared pool.
+
+        ``info["won"]`` is the LEARNER's win (this snapshot died), so the score
+        is written from the LEARNER's perspective, matching
+        :class:`~opponents.snapshot_pool.MatchResult`: 1.0 win, 0.0 loss,
+        :data:`~opponents.snapshot_pool.DRAW_SCORE` otherwise — the shared
+        constant, because ``SnapshotPool.record_result`` recognizes a draw by
+        exact equality with it to count ``selfplay/draw_rate``. "Otherwise"
+        covers a timeout AND an episode stopped by the rollout's ``max_steps`` —
+        in both, neither fighter died, which is a draw by any reading and must
+        not be recorded as a loss for the learner.
+
+        ``lost`` is tested FIRST so a malformed pair with both flags set reads
+        as a loss. ``MCPvPEnv`` already resolves them exclusively — a
+        simultaneous double death is a loss there, because the learner dying can
+        never count as a win — and this keeps the same rule rather than letting
+        a fake env or a future producer turn a double death into a win.
+
+        No-ops when no snapshot is loaded — the only way to reach that is an
+        ``observe_outcome`` without a preceding ``begin_episode``, and inventing
+        a match against no opponent would corrupt PFSP and Elo alike. An episode
+        aborted mid-flight by a ``BridgeError`` never reaches here at all, so a
+        lost pad is simply not scored, matching the scripted curriculum.
+        """
+        record = self._record
+        if record is None:
+            return
+        won = bool(info.get("won", False))
+        lost = bool(info.get("lost", False))
+        score = 0.0 if lost else (1.0 if won else DRAW_SCORE)
+        result = MatchResult.create(
+            snapshot_id=int(record.snapshot_id),
+            learner_epsilon=self._learner_epsilon,
+            opponent_epsilon=self._epsilon,
+            score=score,
+        )
+        self._pool.record_result(result)
+        self._last_match = result
+
+
+def build_snapshot_opponents(
+    cfg: TrainConfig,
+    *,
+    run_name: str = "selfplay",
+    snapshot_dir: Optional[str] = None,
+    net_factory: Optional[Callable[[], Any]] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> Tuple[SnapshotPool, Callable[[int], SnapshotOpponentDriver]]:
+    """Build the shared snapshot pool and a per-arena self-play driver factory.
+
+    The self-play twin of :func:`build_scripted_opponents`, with the same
+    lock-guarded MEMOIZATION: a given ``arena_id`` gets the SAME driver for the
+    whole run, and two arenas can never be handed one object.
+    :meth:`distributed.actor.ActorPool.build` requires that — two collectors
+    sharing a driver would share one LSTM hidden state (each arena's episode
+    stomping the other's memory mid-fight) and one ε-greedy generator, which is
+    exactly the cross-arena correlation the per-arena seed bands exist to
+    prevent. The memoization is lock-guarded, matching
+    :func:`build_scripted_opponents`: nothing in this factory's contract says
+    the caller builds every collector on one thread, and a torn read would hand
+    two collectors two DIFFERENT drivers for the same arena.
+
+    Seeds the pool's snapshot 0 from ``cfg.warm_start``, ``pinned=True``: the
+    run's first opponent is the policy the run itself starts from, and a pinned
+    member is never dropped, so PFSP always has a floor opponent and Elo always
+    has a fixed yardstick.
+
+    A directory that ALREADY holds a ``pool.json`` is RELOADED through
+    :meth:`~opponents.snapshot_pool.SnapshotPool.load` instead, and no snapshot
+    is seeded. Constructing a fresh pool over a populated directory would reset
+    the id counter to 0 and let the next ``add`` overwrite ``snap_0.pt`` — the
+    PINNED first reference — while the index still claimed the whole earlier
+    history. The reload also restores the Elo series and every head-to-head
+    statistic, so PFSP resumes from what the run actually measured rather than
+    from a flat table.
+
+    Args:
+        cfg: The training config. Reads ``warm_start`` (snapshot 0's weights),
+            ``snapshot_sampling``, ``elo_k``, ``elo_initial``,
+            ``opponent_epsilon`` and the seed scheme.
+        run_name: The run's name, used to derive the default pool directory via
+            :func:`snapshot_pool_directory` (so the default is
+            ``runs/selfplay/snapshots``). Ignored when ``snapshot_dir`` is
+            given.
+        snapshot_dir: Explicit pool directory, which OVERRIDES ``run_name``.
+            The multi-arena loop passes its own ``snapshot_dir`` straight
+            through; tests point it at a ``tmp_path``.
+        net_factory: Zero-arg builder for each driver's own net. MUST match the
+            learner's architecture (the multi-arena path passes the same
+            ``net_kwargs`` the learner was built with) or a snapshot load fails.
+        log: Sink for the pool's loud corruption/drop messages.
+
+    Returns:
+        ``(pool, opponent_for)`` — the shared pool and
+        ``arena_id -> SnapshotOpponentDriver``.
+
+    Raises:
+        ValueError: ``cfg.warm_start`` is ``None``. ``TrainConfig`` already
+            refuses that combination for ``opponent == "selfplay"``; this second
+            check covers a caller that built the pool from some other config,
+            because the alternative is seeding snapshot 0 from a randomly
+            initialized net and calling it a past self.
+        FileNotFoundError: ``cfg.warm_start`` does not exist.
+        opponents.snapshot_pool.PinnedSnapshotError: A reloaded pool is missing
+            a pinned snapshot's file — fatal, never recovered from.
+        opponents.snapshot_pool.SnapshotPoolError: An existing ``pool.json`` is
+            unreadable, of an unknown index version, or malformed.
+    """
+    if cfg.warm_start is None:
+        raise ValueError(
+            "build_snapshot_opponents requires cfg.warm_start: the pool's "
+            "snapshot 0 IS the warm-start policy, and with no checkpoint to "
+            "load the first opponent would be a freshly initialized net "
+            "presented as a past self. Pass --warm-start <checkpoint>."
+        )
+
+    directory = (
+        snapshot_pool_directory(run_name) if snapshot_dir is None else str(snapshot_dir)
+    )
+    if os.path.isfile(os.path.join(directory, INDEX_FILENAME)):
+        pool = SnapshotPool.load(directory, sampling=cfg.snapshot_sampling, log=log)
+    else:
+        pool = SnapshotPool(
+            directory,
+            elo_k=cfg.elo_k,
+            elo_initial=cfg.elo_initial,
+            sampling=cfg.snapshot_sampling,
+            log=log,
+        )
+        pool.add(
+            load_checkpoint_state_dict(str(cfg.warm_start)),
+            grad_step=0,
+            elo=cfg.elo_initial,
+            pinned=True,
+        )
+
+    drivers: Dict[int, SnapshotOpponentDriver] = {}
+    lock = threading.Lock()
+
+    def opponent_for(arena_id: int) -> SnapshotOpponentDriver:
+        key = int(arena_id)
+        with lock:
+            driver = drivers.get(key)
+            if driver is None:
+                driver = SnapshotOpponentDriver(
+                    cfg, pool, key, net_factory=net_factory
+                )
+                drivers[key] = driver
+            return driver
+
+    return pool, opponent_for
+
+
+def build_rated_eval_opponent(
+    cfg: TrainConfig,
+    pool: SnapshotPool,
+    *,
+    arena_id: Optional[int] = None,
+    net_factory: Optional[Callable[[], Any]] = None,
+    reference: Optional[SnapshotRecord] = None,
+) -> Callable[[], SnapshotOpponentDriver]:
+    """Return a factory for a RATED-eval self-play opponent (both ε exactly 0.0).
+
+    The counterpart of :func:`build_snapshot_opponents` for the eval side, and
+    the piece that makes ``elo/learner_rated`` reachable without making the
+    whole run greedy. At the shipped defaults a training driver stamps
+    ``cfg.opponent_epsilon`` (0.02) on every ``MatchResult`` while the learner
+    anneals only to ``cfg.eps_end`` (0.05), so no training match is ever
+    ``rated_eligible`` and the AC7 series is empty by construction until
+    something builds a driver like this one. Every match a driver from this
+    factory scores is rated, whatever the config says, and moves the series.
+
+    Deliberately NOT memoized and NOT shared with the training drivers. Two
+    reasons, both silent if ignored: a shared object would carry one LSTM hidden
+    state and one ε-greedy generator across the training/eval boundary, and
+    :meth:`SnapshotOpponentDriver.note_learner_epsilon` — which
+    :func:`collect_episode` calls on every TRAINING episode with the schedule's
+    ε — would knock a rated driver back off ``0.0``. (It now RAISES instead, but
+    a separate object is what makes the situation unreachable rather than loud.)
+
+    A FRESH driver per call, matching :func:`build_eval_opponent`: eval #1 and
+    eval #40 then start from the same seeded snapshot-sampling stream, so the
+    two cycles are comparable in the one respect this side controls.
+
+    Args:
+        cfg: The training config (seed scheme; ``cfg.opponent_epsilon`` is
+            deliberately NOT read — a rated driver is 0.0 whatever it says).
+        pool: The SHARED snapshot pool the training drivers also use. The eval
+            rates into the same Elo table and the same head-to-head statistics;
+            a second pool would rate against a different set of past selves.
+        arena_id: Seed band for the eval driver's private RNG streams. Defaults
+            to ``cfg.arenas`` — one past the last collector, the same band
+            :func:`build_eval_opponent` uses — so the eval's snapshot draws can
+            never coincide with a training arena's. No collision with that
+            function's own seed even at the same band: the roles differ
+            (``"snapshot_sample"``/``"snapshot_epsilon"`` vs ``"eval"``), and
+            :func:`opponent_seed` offsets by role.
+        net_factory: Zero-arg builder for the driver's net. MUST match the
+            learner's architecture or a snapshot load fails loudly.
+        reference: PIN the driver to one snapshot instead of sampling — what the
+            reference gauntlet passes, one track per member of
+            :meth:`~opponents.snapshot_pool.SnapshotPool.pinned_references`. With
+            it, neither of this driver's two RNG streams is ever drawn from: the
+            pool draw is replaced by the pin, and ``DuelingDRQN.act`` at
+            ``epsilon == 0.0`` short-circuits to ``argmax`` with no RNG touch at
+            all. That is why every reference track can share the one eval seed
+            band without correlating anything. ``None`` (the default) keeps the
+            sampling driver :func:`build_snapshot_opponents` builds.
+
+    Returns:
+        ``() -> SnapshotOpponentDriver`` with :attr:`SnapshotOpponentDriver.rated`
+        True.
+    """
+    band = int(cfg.arenas) if arena_id is None else int(arena_id)
+
+    def _build() -> SnapshotOpponentDriver:
+        return SnapshotOpponentDriver(
+            cfg,
+            pool,
+            band,
+            net_factory=net_factory,
+            rated=True,
+            reference=reference,
+        )
+
+    return _build
+
+
+#: Episodes per pinned reference in one eval cycle. Three references at ten
+#: episodes is thirty armored fights, which at the measured ~95-step bare
+#: episode (longer under iron) keeps a cycle near 30-45 minutes; twenty each
+#: would put it at 1-2 hours and cost the overnight run several cycles of the
+#: AC7 curve it exists to draw.
+DEFAULT_REFERENCE_EVAL_EPISODES: int = 10
+
+
+class _ReferenceTrack(NamedTuple):
+    """One leg of the reference gauntlet: WHICH past self, for how many episodes.
+
+    Built by :func:`build_reference_tracks` and consumed by
+    :func:`_eval_against_opponent`, which runs every leg over the SAME borrowed
+    connection, the same eval env and the same greedy policy — the frozen
+    candidate when the cycle has one.
+
+    Attributes:
+        snapshot_id: The pinned reference's id — the ``<id>`` in
+            ``selfplay/win_rate_vs_ref_<id>``, so this leg's report can be
+            attributed to a specific past self rather than to "the pool".
+        name: What :attr:`~eval.evaluate.EvalReport.opponent` records
+            (``"snapshot_<id>"``). It is passed to ``evaluate`` EXPLICITLY, and
+            has to be: ``evaluate`` falls back to the driver's own ``name`` once,
+            before the first episode, and :attr:`SnapshotOpponentDriver.name`
+            only becomes ``"snapshot_<id>"`` after ``begin_episode`` loads the
+            record — a freshly built pinned driver still reports plain
+            ``"snapshot"``, which would label every leg of the gauntlet
+            identically.
+        n_episodes: Episodes in this leg.
+        opponent_factory: Zero-arg builder for a FRESH rated driver pinned to
+            this reference. Fresh per leg so no LSTM state crosses a track
+            boundary, and rated so every match it scores is ``rated_eligible``.
+    """
+
+    snapshot_id: int
+    name: str
+    n_episodes: int
+    opponent_factory: Callable[[], SnapshotOpponentDriver]
+
+
+class _ReferenceOutcome(NamedTuple):
+    """One reference leg's result: which past self, and how the candidate did.
+
+    Attributes:
+        snapshot_id: The pinned reference fought.
+        report: That leg's :class:`~eval.evaluate.EvalReport`. Its ``win_rate``
+            is THIS CYCLE's raw rate over ``n_episodes``, which is what the
+            checkpoint selection compares; the ``selfplay/win_rate_vs_ref_<id>``
+            METRIC is the pool's Beta-smoothed lifetime rate and is a different
+            (deliberately smoother) number.
+    """
+
+    snapshot_id: int
+    report: Any
+
+
+def build_reference_tracks(
+    cfg: TrainConfig,
+    pool: SnapshotPool,
+    *,
+    n_episodes: int = DEFAULT_REFERENCE_EVAL_EPISODES,
+    net_factory: Optional[Callable[[], Any]] = None,
+    arena_id: Optional[int] = None,
+) -> Tuple[_ReferenceTrack, ...]:
+    """Build one rated eval track per PINNED reference in ``pool`` (AC8).
+
+    HOWEVER MANY EXIST. The plan creates snapshot 0 as a pinned reference at
+    seed and promotes two more at ``cfg.reference_promote_grad_steps``, so a
+    cycle before the first promotion has one reference, a cycle after the first
+    has two, and only the late run has three. Returning whatever
+    :meth:`~opponents.snapshot_pool.SnapshotPool.pinned_references` holds is what
+    makes the eval degrade gracefully instead of assuming three and either
+    crashing or silently skipping the gauntlet.
+
+    An EMPTY tuple is returned for an empty pool rather than raised on. It is
+    unreachable through :func:`build_snapshot_opponents` (snapshot 0 is seeded
+    pinned), so it means the caller passed a pool this run does not own — a
+    condition the eval reports and survives, because losing a night's training
+    to a bad eval argument is the worse outcome.
+
+    Args:
+        cfg: The training config (seed band, via :func:`build_rated_eval_opponent`).
+        pool: The run's SHARED snapshot pool — the same one the collectors draw
+            from, so the gauntlet rates into the same Elo table and the same
+            head-to-head statistics ``selfplay/win_rate_vs_ref_<id>`` reads.
+            ACCEPTED consequence (S7): those head-to-head stats are also the PFSP
+            weighting's input and take EVERY match, so a reference's lifetime
+            rate blends this cycle's ~30 ε=0 eval episodes with the thousands of
+            ε>0 training episodes against the same snapshot. Sharing is the
+            point — a second pool would give the run two disagreeing Elo tables —
+            and at that ratio the eval's pull on PFSP is negligible; but
+            ``selfplay/win_rate_vs_ref_<id>`` is a two-regime average, and the
+            single-cycle rate the checkpoint is actually selected on is the
+            ``_ReferenceOutcome`` report, not this series.
+        n_episodes: Episodes per reference (see
+            :data:`DEFAULT_REFERENCE_EVAL_EPISODES`).
+        net_factory: Zero-arg builder for each driver's net; MUST match the
+            learner's architecture or the snapshot load fails loudly.
+        arena_id: Seed band override, forwarded to
+            :func:`build_rated_eval_opponent`.
+
+    Returns:
+        One :class:`_ReferenceTrack` per pinned reference, ordered by snapshot
+        id ascending (the pool's own order).
+
+    Raises:
+        ValueError: ``n_episodes`` < 1 — a zero-episode track would report a
+            win rate of 0.0 for a fight that never happened, and that number
+            feeds the checkpoint selection.
+    """
+    episodes = int(n_episodes)
+    if episodes < 1:
+        raise ValueError(
+            f"reference eval episodes must be >= 1, got {n_episodes!r}; a track "
+            "with no episodes reports win_rate 0.0 for a fight that never ran, "
+            "and that value is a checkpoint-selection input"
+        )
+    tracks: List[_ReferenceTrack] = []
+    for record in pool.pinned_references():
+        tracks.append(
+            _ReferenceTrack(
+                snapshot_id=int(record.snapshot_id),
+                name=f"snapshot_{int(record.snapshot_id)}",
+                n_episodes=episodes,
+                # The factory, not a driver: `_eval_against_opponent` builds one
+                # per leg so a track never inherits the previous track's LSTM
+                # memory, which would make reference 1's first episodes a
+                # function of how reference 0's last one ended.
+                opponent_factory=build_rated_eval_opponent(
+                    cfg,
+                    pool,
+                    arena_id=arena_id,
+                    net_factory=net_factory,
+                    reference=record,
+                ),
+            )
+        )
+    return tuple(tracks)
+
+
+class _ReferenceVerdict(NamedTuple):
+    """One eval cycle's gauntlet, reduced to the two numbers selection uses.
+
+    Attributes:
+        aggregate: EPISODE-weighted win rate over every reference leg — total
+            wins divided by total reference episodes. Episode-weighted rather
+            than the mean of the per-leg rates so a shortened leg (a pool with a
+            reference added mid-run, a future per-reference episode budget)
+            cannot count as much as a full one.
+        worst: The lowest per-reference win rate in the cycle. Selection reads
+            this as well as ``aggregate`` because the two disagree exactly in
+            the case this run is most likely to produce: a policy that grows
+            decisive against the two recent references while collapsing against
+            the oldest still improves the mean.
+        references: How many legs were fought (1..3 in this run).
+        episodes: Total reference episodes in the cycle.
+    """
+
+    aggregate: float
+    worst: float
+    references: int
+    episodes: int
+
+
+def _summarize_reference_outcomes(
+    outcomes: Sequence[_ReferenceOutcome],
+) -> Optional[_ReferenceVerdict]:
+    """Reduce a cycle's reference legs to a :class:`_ReferenceVerdict`.
+
+    ``None`` when there were no legs at all (a non-self-play run, or a self-play
+    cycle whose pool holds no pinned reference). ``None`` rather than a zeroed
+    verdict on purpose: ``None`` is what makes the caller fall back to selecting
+    on the scripted yardstick, while a 0.0 aggregate would BE the selection
+    number — and 0.0 never clears the selector's "must beat zero" bar, so a run
+    with no reference would ship no checkpoint at all and report only that no
+    eval won an episode.
+
+    A leg with ``n_episodes == 0`` contributes nothing to either total —
+    :func:`build_reference_tracks` refuses to create one, so this only guards a
+    hand-built outcome — and when EVERY leg is empty the return is ``None`` for
+    the same reason as above.
+    """
+    total_episodes = 0
+    total_wins = 0.0
+    worst = 1.0
+    seen = 0
+    for outcome in outcomes:
+        episodes = int(getattr(outcome.report, "n_episodes", 0))
+        if episodes <= 0:
+            continue
+        rate = float(outcome.report.win_rate)
+        total_episodes += episodes
+        total_wins += rate * episodes
+        worst = min(worst, rate)
+        seen += 1
+    if seen == 0 or total_episodes == 0:
+        return None
+    return _ReferenceVerdict(
+        aggregate=total_wins / total_episodes,
+        worst=worst,
+        references=seen,
+        episodes=total_episodes,
+    )
+
+
+def selfplay_eval_cycle_row(
+    report: Optional[Any], verdict: Optional[_ReferenceVerdict]
+) -> Dict[str, float]:
+    """Return the EVAL-CYCLE metrics row a self-play eval logs at its boundary.
+
+    A row of its own, beside (not merged into) :func:`selfplay_log_row`'s: these
+    values are produced only at an eval boundary, while that row is also logged
+    on the checkpoint cadence and is deduplicated per grad step. Merging them
+    would tie a once-per-eval measurement to the lifetime of a row that a
+    checkpoint boundary can claim first, and lose it for good on the steps where
+    the two cadences coincide.
+
+    Module-level, like :func:`selfplay_log_row` and for the same reason: the
+    exact metric names live in one place and are unit-testable without driving a
+    multi-arena run. A typo in one of them costs the demo a curve and raises
+    nothing.
+
+    The row, and why each entry is in it:
+
+      * ``selfplay/scripted_win_rate`` — the ABSOLUTE yardstick (T13). Elo and
+        the per-reference rates are both relative to a pool of past selves and
+        can drift upward together; this one is scored against a fixed scripted
+        bot and is directly comparable to the M3 run's number.
+      * ``selfplay/reference_win_rate`` — the cycle's episode-weighted aggregate
+        across pinned references, and the headline number the checkpoint is
+        selected on.
+      * ``selfplay/worst_reference_win_rate`` — the cycle's weakest reference,
+        the second selection criterion. Logged rather than left implicit because
+        a curve where the aggregate climbs while this one falls is the
+        specialization failure, and it is invisible in the aggregate alone.
+      * ``selfplay/references_evaluated`` — how many legs the cycle actually
+        fought. It moves 1 -> 2 -> 3 as T18 promotes references, so an aggregate
+        that jumps between cycles can be read against a changing opponent set
+        rather than mistaken for a change in the agent.
+
+    Keys are OMITTED rather than zero-filled when the underlying measurement did
+    not happen (no reference in the pool, no eval report because the cycle was
+    skipped): a logged 0.0 reads as "lost everything", which is a different
+    claim from "did not play".
+
+    Args:
+        report: The MAIN (scripted yardstick) eval report, or ``None`` if the
+            cycle produced none.
+        verdict: The reference summary from
+            :func:`_summarize_reference_outcomes`, or ``None``.
+
+    Returns:
+        Metric name -> value, ready for ``logger.log(row, step=grad_step)``.
+        EMPTY when the cycle measured neither — the caller skips the log rather
+        than writing a bare row.
+    """
+    row: Dict[str, float] = {}
+    if report is not None:
+        row["selfplay/scripted_win_rate"] = float(report.win_rate)
+    if verdict is not None:
+        row["selfplay/reference_win_rate"] = float(verdict.aggregate)
+        row["selfplay/worst_reference_win_rate"] = float(verdict.worst)
+        row["selfplay/references_evaluated"] = float(verdict.references)
+    return row
+
+
+def selfplay_log_row(pool: SnapshotPool) -> Dict[str, float]:
+    """Return the self-play metrics row for one log step (issue #10, AC7/AC8).
+
+    A module-level builder rather than an inline dict inside the training loop,
+    for the same reason :func:`epsilon_log_row` is one: what gets logged is then
+    unit-testable without driving a whole multi-arena run, and the exact metric
+    names live in one place instead of being retyped at each call site.
+
+    The row, and why each entry is in it:
+
+      * ``elo/learner_rated`` — the AC7 rising-trend series and the
+        checkpoint-selection input. Moves ONLY on matches where both sides were
+        at ε=0, i.e. rated eval cycles (see :func:`build_rated_eval_opponent`).
+      * ``elo/learner_online`` — EVERY match, whatever the epsilons. Dense and
+        noisy. It is the pool's documented input for the rating a new snapshot
+        is frozen at (see ``SnapshotPool.add``'s ``elo`` argument), and it is
+        deliberately NOT the AC7 series nor the checkpoint-selection input. The
+        PFSP weighting itself reads ``MatchStats.win_rate()``, not this.
+      * ``selfplay/pool_size`` — live snapshots. Flat at 1 all night means the
+        archive cadence never fired and every episode was fought against the
+        warm start.
+      * ``selfplay/matches_scored`` / ``selfplay/rated_matches`` — the two
+        denominators. ``rated_matches`` at 0 is what separates "the learner
+        stopped improving" from "``elo/learner_rated`` has no data at all";
+        both render as a flat line and only this number tells them apart.
+      * ``selfplay/draw_rate`` — omitted until at least one match is scored,
+        because 0/0 is not a draw rate and logging 0.0 for it would read as "no
+        draws" rather than "no matches". A rate near 1.0 in the armored regime
+        means episodes are hitting the 600-step cap instead of terminating.
+      * ``selfplay/win_rate_vs_ref_<id>`` — one per PINNED reference, and only
+        once that reference has actually been played (AC8). Unplayed ones are
+        omitted rather than reported at the Beta(1, 1) prior's 0.5, which would
+        put a flat "even" segment on the front of a curve that has no data
+        behind it.
+
+    Assembled from several independent reads of a pool that arena threads are
+    scoring into concurrently, so it is a monitoring snapshot, not an atomic
+    one: two entries may be a match apart. Neither ratio can be internally
+    inconsistent, though — ``draw_rate`` is computed inside one lock
+    acquisition, and ``win_rate()`` runs on the COPY ``stats_for`` took under
+    the lock — so nothing here can report a rate above 1.0.
+
+    Args:
+        pool: The run's shared snapshot pool.
+
+    Returns:
+        Metric name -> value, ready for ``logger.log(row, step=grad_step)`` or
+        ``logger.summary(row)``.
+    """
+    # Read ONCE, not once for the value and once for the guard: an arena thread
+    # scoring between the two reads would otherwise emit a row saying zero
+    # matches AND carrying a draw rate.
+    matches_scored = pool.matches_scored
+    row: Dict[str, float] = {
+        "elo/learner_rated": float(pool.learner_elo_rated),
+        "elo/learner_online": float(pool.learner_elo_online),
+        "selfplay/pool_size": float(len(pool)),
+        "selfplay/matches_scored": float(matches_scored),
+        "selfplay/rated_matches": float(pool.rated_matches),
+    }
+    if matches_scored > 0:
+        row["selfplay/draw_rate"] = float(pool.draw_rate)
+    for record in pool.pinned_references():
+        stats = pool.stats_for(record.snapshot_id)
+        if stats.plays > 0:
+            row[f"selfplay/win_rate_vs_ref_{record.snapshot_id}"] = float(
+                stats.win_rate()
+            )
+    return row
+
+
+class _StampedWeightStore:
+    """Wraps a :class:`~distributed.weights.WeightStore` and DATES every publish.
+
+    :class:`SnapshotArchivist` has to freeze the learner's PUBLISHED weights and
+    label them with the gradient step those weights came out of. The store alone
+    cannot say which step that was: its ``version`` is a publish COUNTER, and
+    ``distributed.learner.LearnerLoop._maybe_publish`` fires on K-boundary
+    CROSSINGS, so version ``v`` can belong to any grad step at or above
+    ``v * cfg.weight_sync_every_k_steps``. Reading ``trainer.grad_step`` from the
+    driver thread when it notices a new version is worse still — the learner
+    never stopped, so that reads a LATER step than the weights. A snapshot
+    labelled with the wrong step corrupts the Elo history and every later
+    analysis, and nothing downstream can detect it.
+
+    The stamp is therefore taken HERE, inside :meth:`publish`, on the publishing
+    thread. ``LearnerLoop`` reads ``trainer.online.state_dict()`` and calls this
+    in one unbroken stretch of the learner thread with no ``learn()`` between the
+    two, so ``grad_step_of()`` returns exactly the step those tensors came out
+    of.
+
+    Composition rather than a subclass because ``train_multi_arena`` accepts an
+    INJECTED ``weight_store``: a wrapper dates whatever object the caller passed,
+    where a subclass could only date one this module constructed itself. The
+    delegation covers the two methods anything ever calls on a store — ``publish``
+    (``LearnerLoop``, plus the warm-start pre-publish below) and ``latest``
+    (``distributed.weights.SnapshotPolicy.maybe_refresh``) — and no production
+    path ``isinstance``-checks a store, so a duck-typed stand-in is safe here.
+
+    Args:
+        store: The real :class:`~distributed.weights.WeightStore` to wrap.
+        grad_step_of: Zero-arg reader of the learner's gradient step, called on
+            whichever thread publishes (``lambda: trainer.grad_step``).
+    """
+
+    def __init__(self, store: Any, grad_step_of: Callable[[], int]) -> None:
+        self._store = store
+        self._grad_step_of = grad_step_of
+        # Guards the (stored snapshot, stamp) PAIR, and is held across the inner
+        # publish so a reader can never see version v beside the stamp of v-1 —
+        # the one way this class could hand out a wrong grad step. Cheap: the
+        # only reader is the archive cadence (once per snapshot_every_grad_steps)
+        # and all it does under this lock is read the store's stored pair. The
+        # collector threads go through `latest`, which takes no lock of ours.
+        self._lock = threading.Lock()
+        self._version = -1
+        self._grad_step: Optional[int] = None
+
+    def publish(self, state_dict: Any, version: int) -> None:
+        """Publish to the wrapped store, recording the caller's grad step."""
+        # Read BEFORE the lock: `grad_step_of` is caller-supplied code, and the
+        # rule SnapshotPool applies to its `log` sink applies here too — never
+        # run injected code while holding a lock another thread waits on.
+        stamp = int(self._grad_step_of())
+        with self._lock:
+            self._store.publish(state_dict, version)
+            self._version = int(version)
+            self._grad_step = stamp
+
+    def latest(self) -> Any:
+        """The wrapped store's ``(state_dict, version)`` — the collector path.
+
+        Takes no lock of this wrapper's: every collector calls this at every
+        episode boundary and must not serialize behind a learner publish.
+        """
+        return self._store.latest()
+
+    def latest_stamped(self) -> Tuple[Any, int, Optional[int]]:
+        """Return ``(state_dict, version, grad_step)`` for the newest publish.
+
+        ``state_dict`` is ``None`` and ``version`` is ``-1`` until the first
+        publish. ``grad_step`` is ``None`` when this wrapper did not observe the
+        publish that produced the stored snapshot — reachable only if something
+        published to the wrapped store directly, behind this object's back. The
+        caller must skip such a snapshot rather than guess a step for it.
+        """
+        with self._lock:
+            state_dict, version = self._store.latest()
+            if int(version) != self._version:
+                return state_dict, int(version), None
+            return state_dict, int(version), self._grad_step
+
+
+class SnapshotArchivist:
+    """Archives the learner into the snapshot pool on a grad-step cadence (AC5).
+
+    The thing that makes the pool GROW. Without a caller driving this, the pool
+    holds exactly one member for the life of the run — snapshot 0, the warm start
+    — and the failure is silent and total: PFSP weights a single candidate so its
+    weighting means nothing, Elo has one opponent so the rating cannot move,
+    ``selfplay/pool_size`` reads 1 all night, and every self-play unit test still
+    passes because they exercise the pool directly.
+
+    Three rules, each protecting something specific:
+
+      * **PUBLISHED weights, never ``trainer.online``.** The learner mutates the
+        live net from its own thread with no thread-safety against a reader, and
+        the published snapshot is the decoupled CPU clone
+        :meth:`~distributed.weights.WeightStore.publish` already made for the
+        collectors — so archiving it costs no second read of the live net.
+      * **The PUBLISHED grad step, not the observed one.** :meth:`maybe_archive`
+        runs on the driver thread, which reads a grad step the learner has
+        already moved past; only the publish itself knows which step its weights
+        came from (see :class:`_StampedWeightStore`).
+      * **At most one archive per PUBLISH.** A cadence boundary reached with no
+        new publish behind it leaves the archive OWED, not skipped — it lands on
+        a later poll. Re-archiving one published version would mint a second
+        snapshot id for a single policy version, and that id IS the
+        policy-version identity PFSP weights and Elo rates.
+
+    Not thread-safe, and does not need to be: the multi-arena driver loop is the
+    sole caller. It holds no lock of its own either — :meth:`SnapshotPool.add`
+    does its own locking, keeps its ``torch.save`` off the state lock, and
+    persists the index itself.
+
+    Args:
+        pool: The run's shared :class:`~opponents.snapshot_pool.SnapshotPool`.
+        published: Zero-arg reader of the learner's published weights, returning
+            ``(state_dict, version, grad_step)`` — normally
+            :meth:`_StampedWeightStore.latest_stamped`. It MUST return published
+            weights; handing it ``trainer.online.state_dict()`` would reintroduce
+            the read-during-write race this class routes around.
+        every_grad_steps: Learner grad steps between archives
+            (``cfg.snapshot_every_grad_steps``).
+        promote_at: Grad steps at which the archived snapshot is PINNED as a
+            permanent reference (``cfg.reference_promote_grad_steps``). A
+            promotion boundary is a trigger in its own right, so a threshold that
+            is not a multiple of ``every_grad_steps`` still produces its
+            reference instead of being silently skipped.
+        log: ASCII-only ``str -> None`` sink for the archive lines.
+
+    Attributes:
+        archived: Snapshots this archivist has added to the pool.
+        promoted: How many of those were pinned as references.
+    """
+
+    def __init__(
+        self,
+        pool: SnapshotPool,
+        published: Callable[[], Tuple[Any, int, Optional[int]]],
+        *,
+        every_grad_steps: int,
+        promote_at: Tuple[int, ...] = (),
+        log: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        every = int(every_grad_steps)
+        if every < 1:
+            raise ValueError(
+                f"every_grad_steps must be >= 1, got {every_grad_steps!r}: a "
+                "cadence of 0 would archive on every poll of the driver loop"
+            )
+        self._pool = pool
+        self._published = published
+        self._every = every
+        # Sorted and de-duplicated: two equal thresholds would otherwise be
+        # consumed one at a time and pin two snapshots for one intended
+        # reference.
+        self._promote_at: List[int] = sorted({int(step) for step in promote_at})
+        self._log = log
+        self._next_at = every
+        # -1 so the first publish (version 0) is strictly greater. Per-PROCESS
+        # state on purpose, and never seeded from the reloaded pool: a resumed
+        # run's WeightStore numbers its versions from 0 again, so a watermark
+        # taken from what is on disk (the pool's last grad step, say) would sit
+        # above every version this process will ever publish and block every
+        # archive for the rest of the run.
+        self._last_version = -1
+        # Latch for the undated-publish line in `maybe_archive`, holding the
+        # version it has already been emitted for. That branch leaves the
+        # boundary DUE on purpose (the archive is owed, not skipped), so the
+        # driver loop re-enters it on every poll; unlatched, one publish behind
+        # the wrapper would repeat one identical line for the rest of the run
+        # and bury every other archive line in the log.
+        self._undated_version = -1
+        self.archived = 0
+        self.promoted = 0
+
+    def _emit(self, message: str) -> None:
+        if self._log is not None:
+            self._log(message)
+
+    def maybe_archive(self, grad_step: int) -> Optional[SnapshotRecord]:
+        """Archive one snapshot iff ``grad_step`` crossed a cadence/promotion boundary.
+
+        Args:
+            grad_step: The learner's CURRENT gradient step, as the driver loop
+                reads it. Used ONLY to test the boundaries — the snapshot itself
+                is labelled with the grad step the published weights carry, which
+                is at or before this one.
+
+        Returns:
+            The new :class:`~opponents.snapshot_pool.SnapshotRecord`, or ``None``
+            when no boundary was due or nothing new had been published yet.
+
+        Raises:
+            Exception: whatever :meth:`SnapshotPool.add` raises (a failed
+                ``torch.save``, an unwritable index). Deliberately NOT swallowed:
+                a self-play run whose pool stops growing is the exact silent
+                failure this class exists to prevent, so it must end the run
+                loudly instead of logging and continuing.
+        """
+        step = int(grad_step)
+        due = step >= self._next_at
+        promote = bool(self._promote_at) and step >= self._promote_at[0]
+        if not (due or promote):
+            return None
+
+        state_dict, version, published_step = self._published()
+        if not state_dict:
+            # Nothing published yet. `_next_at` deliberately does NOT advance:
+            # the archive is OWED, and lands on a later poll.
+            return None
+        if version <= self._last_version:
+            # No publish since the last archive, so these are the very weights
+            # already in the pool. A second id for one policy version would be
+            # counted twice by PFSP and rated twice by Elo.
+            return None
+        if published_step is None:
+            # The stamping wrapper did not see this publish, so there is no
+            # honest grad step to label the snapshot with. Loud, because the only
+            # way here is a publish that bypassed the wrapper — but ONCE per
+            # undated version, because this branch advances nothing and the
+            # boundary it declined stays due on every later poll.
+            if version != self._undated_version:
+                self._undated_version = int(version)
+                self._emit(
+                    "[archive] SKIPPED: the published weights carry no grad "
+                    "step, so this snapshot could only be labelled with a "
+                    "guess. Something published to the WeightStore behind "
+                    "the stamping wrapper."
+                )
+            return None
+        if published_step <= 0:
+            # Weights published at grad step 0 have taken no optimizer step: they
+            # ARE the warm start, which the pool already holds as pinned snapshot
+            # 0, and a second id for it would be one policy version wearing two.
+            # Reachable only when the first trigger boundary falls before the
+            # learner's first real publish (``weight_sync_every_k_steps`` larger
+            # than the cadence, or a promotion step below it); the archive stays
+            # owed and lands as soon as a trained net is published.
+            return None
+
+        pinned = promote
+        record = self._pool.add(
+            state_dict,
+            grad_step=published_step,
+            # The learner's rating RIGHT NOW, frozen onto the snapshot forever;
+            # the ONLINE series, because the rated one only moves on eval cycles
+            # and would leave most snapshots stamped with the initial value.
+            elo=self._pool.learner_elo_online,
+            pinned=pinned,
+        )
+        self._last_version = int(version)
+        self.archived += 1
+
+        if due:
+            # Absolute multiples of the cadence, NOT `step + every`: the driver
+            # loop polls, so `step` overshoots the boundary, and compounding that
+            # overshoot would stretch the cadence further on every archive across
+            # a 24-hour run. A boundary the loop missed entirely collapses into
+            # this one archive rather than firing a burst of near-identical
+            # snapshots.
+            self._next_at = (step // self._every + 1) * self._every
+        if promote:
+            self.promoted += 1
+            # Every threshold at or below `step` is consumed by THIS snapshot. If
+            # the loop lagged past two of them they name one policy version, and
+            # two pinned records of one net would be two identical yardsticks
+            # rather than two references — `pinned_references()` returns however
+            # many exist and T13's eval degrades gracefully.
+            self._promote_at = [
+                threshold for threshold in self._promote_at if threshold > step
+            ]
+
+        self._emit(
+            f"[archive] snapshot {record.snapshot_id} "
+            + ("PINNED as a reference, " if pinned else "")
+            + f"from published version {version} at grad_step {published_step} "
+            f"(elo {record.elo:.1f}); pool holds {len(self._pool)} snapshot(s), "
+            f"{len(self._pool.pinned_references())} pinned"
+        )
+        return record
+
+    def flush(self) -> None:
+        """Write the pool's index one final time. Never raises.
+
+        :meth:`SnapshotPool.record_result` deliberately never touches disk — it
+        is the per-episode hot path on every arena thread — so the match
+        statistics and BOTH Elo series reach ``pool.json`` only on the next
+        :meth:`SnapshotPool.add`. Whatever is scored after the last archive lives
+        in memory alone, while a restart and every post-run analysis read the
+        file. On a run that ends on its grad-step budget that is up to a full
+        cadence of Elo history; on one killed mid-flight, more.
+
+        Safe to call redundantly, and safe to call late. The payload is built
+        immediately before the write, so it carries the pool's CURRENT generation
+        stamp and ``persist`` never has cause to drop it, and a second call
+        writes the newest state rather than replaying an older one — this can
+        only move the index forward, never behind what the pool already wrote.
+
+        Swallows its own failure for the same reason the run's other teardown
+        steps do: the caller is about to re-raise the learner's own exception, and
+        a traceback from here would replace it.
+        """
+        try:
+            self._pool.persist(self._pool.index_payload())
+        except Exception as exc:  # noqa: BLE001 - must not mask the real error
+            self._emit(f"[archive] final pool index write FAILED: {exc}")
+
+
 class EvalOpponentDriver:
     """The PERIODIC EVAL's opponent: fixed tier schedule, fully deterministic.
 
@@ -1249,6 +2629,22 @@ def build_eval_opponent(
     collector — so the eval opponent's RNG can never coincide with any arena's
     training opponent or episode stream.
 
+    A SELF-PLAY run gets this SAME scripted driver — the "one scripted track"
+    of T13, and the reason it is here rather than a self-play-specific opponent.
+    Elo is relative: ``elo/learner_rated`` can climb all night while the whole
+    pool drifts, because a rating measures the learner against its own past
+    selves and nothing anchors that ladder to the ground. A win rate against the
+    fixed scripted bot cannot inflate, is the same measurement the M3 run
+    produced, and is therefore the one number in this run comparable to anything
+    outside it. Returning ``None`` here instead — which is what this function did
+    before T13 — pointed the periodic eval at the STATIONARY dummy: a win rate
+    against a target that never moves, used to select the demo checkpoint.
+
+    The rated self-play half of the cycle is NOT built here. It is a gauntlet of
+    one track per pinned reference rather than a single opponent, so it does not
+    fit a ``() -> opponent`` factory at all; see :func:`build_reference_tracks`,
+    which ``train_multi_arena`` passes alongside this one.
+
     Args:
         cfg: The training config.
         preset_choice: Optional override of ``cfg.eval_opponent_preset``.
@@ -1256,7 +2652,7 @@ def build_eval_opponent(
     Returns:
         ``() -> EvalOpponentDriver``, or ``None`` on the dummy path.
     """
-    if cfg.opponent != "scripted":
+    if cfg.opponent not in ("scripted", "selfplay"):
         return None
 
     base_seed = opponent_seed(cfg, arena_id=int(cfg.arenas), role="eval")
@@ -1351,7 +2747,7 @@ def collect_episode(
     episode_index: int,
     epsilon: float,
     episode_seed: int,
-    opponent: Optional[EpisodeOpponent] = None,
+    opponent: Optional[OpponentDriver] = None,
 ) -> Episode:
     """Roll ONE episode against ``env`` with ``policy`` and return it as an Episode.
 
@@ -1387,16 +2783,32 @@ def collect_episode(
             an episode, per the per-EPISODE schedule).
         episode_seed: Deterministic seed for BOTH the env reset and the policy's
             action RNG, so the exploration stream is replayable.
-        opponent: Optional per-arena :class:`EpisodeOpponent` (T12). ``None`` (the
-            default) is the M1/M2 stationary-dummy path and is BYTE-IDENTICAL to
-            what this loop did before the parameter existed: ``env.step(action)``
-            is called with one positional argument, no ``opp_action`` reaches the
-            wire, and the env is never asked for a raw view. When given, each
-            decision reads ``env.raw_opponent_view()``, asks the opponent for a
-            macro, and sends both actions in ONE ``env.step`` — see the
-            one-step-one-window invariant in this section's banner. The env must
-            then expose ``raw_opponent_view()`` and accept ``opp_action``
-            (``MCPvPEnv`` does; a fake env used with an opponent must too).
+        opponent: Optional per-arena opponent driver. ``None`` (the default) is
+            the M1/M2 stationary-dummy path and is BYTE-IDENTICAL to what this
+            loop did before the parameter existed: ``env.step(action)`` is
+            called with one positional argument, no ``opp_action`` reaches the
+            wire, and the env is never asked for anything extra.
+
+            Otherwise the driver's ``needs_observation`` attribute selects what
+            it is fed, ONCE per episode, before the first decision:
+
+              * absent/False — an :class:`EpisodeOpponent` (the scripted
+                curriculum, T12). Each decision reads
+                ``env.raw_opponent_view()``.
+              * ``True`` — an :class:`ObservationOpponent` (the self-play
+                snapshot driver, T10). Each decision reads
+                ``env.opponent_observation()``, the OPPONENT seat's 23-dim
+                vector, because a frozen ``DuelingDRQN`` needs the exact inputs
+                it was trained on and an ``OpponentView`` is not one of them.
+                That accessor RAISES unless the env was built with
+                ``mirror_opponent=True``, so a missed construction site fails on
+                the first episode rather than training an hour against garbage.
+
+            Either way it is ONE read, ONE macro, ONE ``env.step`` per decision
+            window — see the one-step-one-window invariant in this section's
+            banner. The env must accept ``opp_action`` and expose whichever
+            accessor the branch uses (``MCPvPEnv`` does; a fake env used with an
+            opponent must too).
 
     Returns:
         An immutable :class:`~distributed.serialization.Episode` whose
@@ -1415,10 +2827,27 @@ def collect_episode(
     policy.reseed(episode_seed)
     obs = env.reset(seed=episode_seed)
     hidden = policy.init_hidden()
-    # Episode boundary for the opponent: draw this episode's difficulty tier and
-    # start its bot's episode. AFTER env.reset(), because the reset re-arms the
-    # opponent's shadow swing meter that the bot's ATTACK gate reads.
+    # Which accessor this episode's opponent is fed. Resolved ONCE, before the
+    # first decision, so the routing cannot change mid-episode and the hot loop
+    # pays no attribute lookup per step.
+    opponent_observes = _needs_observation(opponent)
+    # Episode boundary for the opponent: draw this episode's difficulty tier (or
+    # snapshot) and start its episode. AFTER env.reset(), because the reset
+    # re-arms the opponent's shadow swing meter that the scripted bot's ATTACK
+    # gate reads, and re-primes the mirror the snapshot driver reads.
     if opponent is not None:
+        if opponent_observes:
+            # Report the LEARNER's ε for this episode so the driver can build a
+            # truthful MatchResult: the rated Elo series takes a match only when
+            # BOTH epsilons are exactly 0.0, and ε lives on this side of the
+            # seam (the schedule plus the Ape-X per-actor spread), not the
+            # driver's. Guarded rather than required, because it is NOT part of
+            # the ObservationOpponent protocol — a test recorder can omit it.
+            # It is never looked up on the view branch, so an EpisodeOpponent
+            # is untouched by this whether or not it has such an attribute.
+            note_epsilon = getattr(opponent, "note_learner_epsilon", None)
+            if callable(note_epsilon):
+                note_epsilon(float(epsilon))
         opponent.begin_episode()
 
     transitions: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
@@ -1440,6 +2869,16 @@ def collect_episode(
         if opponent is None:
             # The M1/M2 line, unchanged: one positional argument, no opp_action.
             next_obs, reward, done, info = env.step(action)
+        elif opponent_observes:
+            # ONE mirrored observation, ONE macro, ONE step. Same invariant as
+            # the view branch below, different accessor: a frozen DuelingDRQN
+            # decides from the OPPONENT seat's 23-dim vector. Read here rather
+            # than cached from an earlier step so the snapshot decides from the
+            # same window the agent just acted on; the env computed it EAGERLY
+            # when it ingested that state, so this read is a cache hit and does
+            # not age the mirror's perception memory.
+            opp_action = opponent.act(env.opponent_observation())
+            next_obs, reward, done, info = env.step(action, opp_action=opp_action)
         else:
             # ONE view, ONE macro, ONE step — the decision window the env counts.
             # The view is read here (not cached from an earlier step) so the
@@ -1466,11 +2905,12 @@ def collect_episode(
         if max_steps is not None and steps >= max_steps:
             break
 
-    # Score the finished episode into the curriculum. The FINAL step's info holds
-    # the terminal verdict (``won`` / ``lost`` / ``timeout``); an episode stopped
-    # by ``max_steps`` carries won=False, which is the right reading — it did not
-    # win. The loop body always runs at least once, so ``last_info`` is only None
-    # in a pathological env.
+    # Score the finished episode — into the curriculum gate on the scripted
+    # path, into the snapshot pool's stats and Elo on the self-play one. The
+    # FINAL step's info holds the terminal verdict (``won`` / ``lost`` /
+    # ``timeout``); an episode stopped by ``max_steps`` carries won=False, which
+    # is the right reading — it did not win. The loop body always runs at least
+    # once, so ``last_info`` is only None in a pathological env.
     if opponent is not None:
         opponent.observe_outcome(last_info if last_info is not None else {})
 
@@ -2499,17 +3939,169 @@ class _EvalOutcome(NamedTuple):
     makes "ship the best checkpoint" mean the net that actually earned the score.
 
     Attributes:
-        report: The :class:`~eval.evaluate.EvalReport`.
+        report: The :class:`~eval.evaluate.EvalReport` of the MAIN track — the
+            scripted yardstick on a scripted or self-play run, the dummy on an
+            M2 one. This is the report ``passed_m2`` and the eval log line read.
         weights: A detached CPU clone of ``trainer.online.state_dict()`` taken
-            immediately BEFORE the eval ran. Safe to serialize from any thread.
+            immediately BEFORE the eval ran — or, when the eval ran against a
+            frozen :class:`_FrozenCandidate`, that candidate's weights, which
+            are the bytes the tracks were actually scored on. Safe to serialize
+            from any thread.
         grad_step: ``trainer.grad_step`` as of that clone — the number that says
             which net the file holds. Read after the eval it would name a net
             that never sat the exam.
+        reference_outcomes: One :class:`_ReferenceOutcome` per pinned reference
+            fought in the SAME cycle, on the SAME weights (T13/AC8). Empty on
+            every non-self-play path and on a self-play cycle whose pool holds
+            no pinned reference, so a caller must treat "no references" as a
+            real state rather than an error.
     """
 
     report: Any
     weights: Mapping[str, Any]
     grad_step: int
+    reference_outcomes: Tuple[_ReferenceOutcome, ...] = ()
+
+
+#: Filename of the frozen eval candidate inside the snapshot-pool directory.
+#: One file, overwritten every cycle: it is a staging area for the CURRENT
+#: cycle's exam paper, not an archive (the archive is the pool, owned by
+#: :class:`SnapshotArchivist`, and this file is deliberately not a pool member —
+#: it must never become a sampleable opponent).
+EVAL_CANDIDATE_FILENAME: str = "eval_candidate.pt"
+
+
+class _FrozenCandidate(NamedTuple):
+    """ONE immutable net, on disk, that a whole eval cycle is scored on.
+
+    The failure this closes: :class:`~eval.evaluate.DRQNGreedyPolicy` holds
+    ``trainer.online`` BY REFERENCE, and on the multi-arena path only the
+    designated collector is paused for an eval — the learner thread keeps
+    stepping the optimizer for the whole cycle. A four-track, forty-episode
+    self-play cycle therefore scores a MOVING target: reference 0 is fought by
+    one net and reference 2 by a net thousands of gradient steps later, and the
+    three win rates the checkpoint is selected on describe three different
+    agents. Nothing raises; the numbers simply do not mean what they say.
+
+    So the candidate is written to disk, read BACK from disk, and loaded into a
+    net of its own. The round trip is the point, not ceremony: what the gauntlet
+    scores is then byte-for-byte what the save-best hook would ship, rather than
+    a live object that merely started out equal to it.
+
+    Attributes:
+        policy: The greedy policy over the frozen net. ONE object for the whole
+            cycle — every track shares it, which is the strongest available
+            statement that the tracks fought the same agent.
+        weights: The candidate's ``state_dict`` (detached CPU clone), handed to
+            the save-best hook so the shipped file IS the evaluated net.
+        grad_step: The learner's gradient step when the clone was taken.
+        path: Where the candidate was staged (see
+            :data:`EVAL_CANDIDATE_FILENAME`).
+    """
+
+    policy: Any
+    weights: Mapping[str, Any]
+    grad_step: int
+    path: str
+
+
+def _freeze_eval_candidate(
+    *,
+    trainer: "Trainer",
+    policy_cls: Callable[..., Any],
+    net_factory: Callable[[], Any],
+    directory: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[_FrozenCandidate]:
+    """Stage ONE immutable on-disk candidate and return a greedy policy over it.
+
+    Clones the learner's live weights, writes them atomically into ``directory``
+    under :data:`EVAL_CANDIDATE_FILENAME`, reads them back, and loads them into a
+    fresh CPU net. See :class:`_FrozenCandidate` for why the disk round trip is
+    load-bearing.
+
+    CPU, unconditionally, like every other frozen clone in this module: the
+    learner keeps training on its own device throughout the cycle and must not
+    share it with the exam.
+
+    Returns ``None`` — never raises any ``Exception`` — if anything goes wrong
+    (an unwritable directory, a full disk, a torch failure, a staged file that
+    reads back unloadable). The caller then falls back to the historical
+    live-net policy: a cycle scored on a moving target is a degradation worth
+    reporting loudly, while an exception here would end a multi-hour run over a
+    staging file. EVERY statement that can raise is inside the ``try``,
+    including the live-weight clone and the ``grad_step`` read — a promise this
+    broad is only worth what its narrowest statement is.
+
+    Args:
+        trainer: The learner, read for ``online`` and ``grad_step``.
+        policy_cls: The greedy-policy class (``eval.evaluate.DRQNGreedyPolicy``).
+            Called as ``policy_cls(net)`` with NO device, so the policy adopts
+            the frozen net's own (CPU) device rather than the learner's.
+        net_factory: Zero-arg builder producing the learner's architecture; the
+            multi-arena loop passes the same one the collectors use.
+        directory: Where to stage the file — the run's snapshot-pool directory.
+        log: Optional sink for the failure line.
+
+    Returns:
+        The :class:`_FrozenCandidate`, or ``None`` if staging failed.
+    """
+    # Bound BEFORE the try only so the failure line below can name a grad step
+    # even when reading it is the thing that failed; the real read is the first
+    # statement inside.
+    grad_step = -1
+    try:
+        from distributed.weights import clone_state_dict
+
+        # BEFORE anything else: from here on the learner keeps mutating the live
+        # net, so both numbers must be read as close together as possible.
+        # INSIDE the try (S1): the docstring promises this function never
+        # raises, and a torch failure is exactly what `state_dict()` and
+        # `clone_state_dict` can produce — reading them outside would have let
+        # the case the promise names end the run anyway. The pairing survives
+        # the move: they are still adjacent and still the first thing read.
+        grad_step = int(trainer.grad_step)
+        weights = clone_state_dict(trainer.online.state_dict())
+        path = os.path.join(directory, EVAL_CANDIDATE_FILENAME)
+        os.makedirs(directory, exist_ok=True)
+        # The same checkpoint shape load_checkpoint_state_dict reads, so the
+        # staged file is loadable by every tool in this repo that opens a
+        # checkpoint — including a human debugging the morning after.
+        _atomic_torch_save(
+            {
+                "model": weights,
+                "grad_step": grad_step,
+                "code_version": code_version(),
+            },
+            path,
+        )
+        # CPU before the load, not after: `load_state_dict` copies INTO the
+        # existing parameters, so moving the module afterwards would already
+        # have allocated the candidate on whatever device `net_factory` chose.
+        net = net_factory().to(torch.device("cpu"))
+        # strict=True (torch's default): a candidate that does not fit the
+        # learner's architecture is rejected outright rather than loaded
+        # partially, so this cycle can never score a half-initialized net — it
+        # degrades to the live-net policy below, and says so.
+        net.load_state_dict(load_checkpoint_state_dict(path, map_location="cpu"))
+        net.eval()
+        # Inside the try as well: `DRQNGreedyPolicy` touches the net (eval mode,
+        # parameter device), and a failure there is the same kind of degradation
+        # as a failed write — not a reason to end a multi-hour run.
+        policy = policy_cls(net)
+    except Exception as exc:  # noqa: BLE001 - a staging failure must not end the run
+        if log is not None:
+            log(
+                f"[multi] eval candidate could NOT be frozen at grad_step "
+                f"{grad_step} ({type(exc).__name__}: {exc}); this cycle is "
+                "scored on the LIVE net, which the learner keeps stepping - "
+                "its per-reference win rates describe slightly different "
+                "networks and are weaker evidence than usual"
+            )
+        return None
+    return _FrozenCandidate(
+        policy=policy, weights=weights, grad_step=grad_step, path=path
+    )
 
 
 def _eval_against_opponent(
@@ -2527,6 +4119,9 @@ def _eval_against_opponent(
     base_seed: int,
     log: Optional[Callable[[str], None]],
     opponent: Optional[Any] = None,
+    mirror_opponent: bool = False,
+    candidate: Optional[_FrozenCandidate] = None,
+    reference_tracks: Sequence[_ReferenceTrack] = (),
 ) -> Any:
     """Run ONE greedy (ε=0) eval of the current online net vs the stage opponent.
 
@@ -2535,6 +4130,15 @@ def _eval_against_opponent(
     :class:`EvalOpponentDriver` when the run fights the scripted opponent — in
     which case the eval steps it exactly as collection does, so the win rate this
     returns is a win rate against the SAME moving opponent training faces.
+
+    ``mirror_opponent`` builds the eval env with the opponent-seat observation
+    mirror, and MUST be true whenever ``opponent`` is a self-play
+    :class:`SnapshotOpponentDriver` — that driver reads
+    ``env.opponent_observation()``, which raises on an env without the mirror.
+    It is the SECOND of the two construction sites the self-play wiring has to
+    reach, and the more dangerous one: the training factory's mistake surfaces
+    on the first episode, this one's only at the first eval cycle, potentially
+    an hour into a run.
 
     The bridge serves EXACTLY ONE connection, so eval must not open a second one:
     a fresh eval socket adopts the stream and the bridge destroys the training
@@ -2560,12 +4164,27 @@ def _eval_against_opponent(
     the eval started from, so the save-best path serializes the net that earned
     the score instead of whatever the learner thread has since produced.
 
-    SCOPE, deliberately: the eval still runs against the LIVE net (the policy
-    holds ``trainer.online`` by reference), so a long eval on the multi-arena
-    path scores a moving target — episode 1 and episode 100 can run on different
-    weights, and the returned clone is "the weights the eval started from", not a
-    net frozen for its duration. Evaluating a snapshot net instead is the real
-    fix and is deliberately OUT OF SCOPE here.
+    ``candidate`` (T13) replaces BOTH of those with a
+    :class:`_FrozenCandidate` — a net staged on disk and read back, plus the
+    weights and grad step it was taken at. With it, the eval no longer scores a
+    moving target: the policy is the frozen one and the returned weights are the
+    exact bytes every track was scored on. ``None`` (the default) keeps the
+    historical behavior described in the paragraph below, byte for byte, on the
+    dummy and scripted paths.
+
+    ``reference_tracks`` (T13/AC8) are extra legs run over the SAME eval env,
+    the SAME borrowed connection and the SAME policy, after the main track:
+    ten episodes against each pinned reference, each leg driven by a FRESH rated
+    :class:`SnapshotOpponentDriver` whose matches are what fill
+    ``elo/learner_rated``. They are run HERE, inside the one env construction and
+    the one collector pause, because each track is otherwise a separate borrow of
+    a connection the bridge only grants once.
+
+    WITH ``candidate=None``, the scope note stands: the eval runs against the
+    LIVE net (the policy holds ``trainer.online`` by reference), so a long eval
+    on the multi-arena path scores a moving target — episode 1 and episode 100
+    can run on different weights, and the returned clone is "the weights the eval
+    started from", not a net frozen for its duration.
 
     What the clone removes is the multi-thousand-grad-step gap between the eval
     that produced a win rate and the save that recorded it — without it the
@@ -2583,22 +4202,36 @@ def _eval_against_opponent(
 
     from distributed.weights import clone_state_dict
 
-    # BEFORE evaluate(): from here on the learner thread keeps mutating the live
-    # net, so anything read afterwards is a different (later) network.
-    eval_grad_step = int(trainer.grad_step)
-    weights = clone_state_dict(trainer.online.state_dict())
+    if candidate is None:
+        # BEFORE evaluate(): from here on the learner thread keeps mutating the
+        # live net, so anything read afterwards is a different (later) network.
+        eval_grad_step = int(trainer.grad_step)
+        weights = clone_state_dict(trainer.online.state_dict())
+        policy = policy_cls(trainer.online, device=trainer.device)
+    else:
+        # The frozen path: nothing here reads the live net at all, which is what
+        # makes every track below comparable to every other.
+        eval_grad_step = int(candidate.grad_step)
+        weights = candidate.weights
+        policy = candidate.policy
 
-    policy = policy_cls(trainer.online, device=trainer.device)
     # auto_connect=False: the shared transport is already connected by the training
     # env; reconnecting would re-handshake the live bridge mid-run.
     eval_env = MCPvPEnv(
         transport=shared_transport,
         max_episode_steps=env_max_episode_steps,
         auto_connect=False,
+        # The self-play eval's second construction site (AC13). False on every
+        # other path, which is byte-identical to the pre-M4 call.
+        mirror_opponent=bool(mirror_opponent),
     )
     # Switch back to train mode afterward: DRQNGreedyPolicy flips the net to eval()
-    # for inference; the next collection/learn step expects train mode.
+    # for inference; the next collection/learn step expects train mode. Read even
+    # on the frozen path, where nothing touches trainer.online: restoring a mode
+    # that was never changed is a no-op, and the guard is cheaper than a branch
+    # that has to stay in step with which policy was built.
     was_training = trainer.online.training
+    reference_outcomes: List[_ReferenceOutcome] = []
     try:
         report = evaluate(
             eval_env,
@@ -2612,13 +4245,48 @@ def _eval_against_opponent(
             log=log,
             opponent=opponent,
         )
+        for track in reference_tracks:
+            reference_outcomes.append(
+                _ReferenceOutcome(
+                    snapshot_id=int(track.snapshot_id),
+                    report=evaluate(
+                        eval_env,
+                        policy,
+                        n_episodes=int(track.n_episodes),
+                        # logger=None ON PURPOSE. `evaluate` logs its per-episode
+                        # rows at step=episode_index and writes a run `summary`;
+                        # handing it the run's logger would make every track
+                        # overwrite the main track's series at steps 0..9 and
+                        # end the cycle with the LAST reference's numbers in the
+                        # run summary. The per-reference series that survives is
+                        # `selfplay/win_rate_vs_ref_<id>`, logged by
+                        # `selfplay_log_row` from the pool these matches feed.
+                        logger=None,
+                        timeout_cap=timeout_cap,
+                        base_seed=base_seed,
+                        is_live=is_live,
+                        max_episode_steps=eval_step_cap,
+                        log=log,
+                        # A FRESH driver per track: a shared one would carry
+                        # reference 0's LSTM memory into reference 1's opening
+                        # episodes.
+                        opponent=track.opponent_factory(),
+                        opponent_name=track.name,
+                    ),
+                )
+            )
     finally:
         # Do NOT close eval_env: it borrows training's socket and must not send
         # `close` or tear down the shared transport. The training env owns and
         # closes that socket exactly once in train_vs_dummy's finally.
         if was_training:
             trainer.online.train()
-    return _EvalOutcome(report=report, weights=weights, grad_step=eval_grad_step)
+    return _EvalOutcome(
+        report=report,
+        weights=weights,
+        grad_step=eval_grad_step,
+        reference_outcomes=tuple(reference_outcomes),
+    )
 
 
 #: Historical name for :func:`_eval_against_opponent`, from when the eval could
@@ -2723,6 +4391,15 @@ class MultiArenaResult:
         best_save_failures: How many best-checkpoint saves raised. Non-zero means
             the selected peak is NOT the file on disk; see the
             ``[multi] BEST checkpoint save FAILED`` lines in the run log.
+        selection_opponent: WHO ``best_win_rate`` / ``best_selected_win_rate``
+            are a win rate against, when that is NOT ``eval_opponent``. Empty on
+            every path where the two coincide. A self-play run sets it to a
+            description of the reference gauntlet, because its checkpoint is
+            selected on the AGGREGATE rate across pinned references while
+            ``eval_opponent`` still names the scripted yardstick track — and a
+            "best checkpoint: win_rate=0.62 vs scripted_mixed" line reporting a
+            number earned against past selves is exactly the kind of false
+            summary freeze day picks a checkpoint from.
 
     SELECTED vs PERSISTED, and why they are two fields: the save hook can raise
     (disk full at 4am, a permission error, a serialization fault) and that
@@ -2750,6 +4427,7 @@ class MultiArenaResult:
     best_selected_win_rate: float = -1.0
     best_selected_grad_step: int = -1
     best_save_failures: int = 0
+    selection_opponent: str = ""
 
     def __post_init__(self) -> None:
         if self.reports is None:
@@ -2762,6 +4440,74 @@ class MultiArenaResult:
 #: ``MCPvPEnv`` over a ``TcpBridgeClient(host, base_port + arena_id)``; tests inject
 #: a factory returning a fake env.
 EnvFactoryFor = Callable[[int], Callable[[], "EnvProtocol"]]
+
+
+def build_live_env_factory_for(
+    cfg: TrainConfig,
+    *,
+    host: str,
+    base_port: int,
+    max_episode_steps: Optional[int] = MAX_EPISODE_STEPS,
+) -> EnvFactoryFor:
+    """Build the LIVE per-arena env factory: pad ``i`` -> a fresh connected env.
+
+    The TRAINING half of the two ``MCPvPEnv`` construction sites a self-play run
+    must reach (the other is the eval env inside
+    :func:`_eval_against_opponent`). Both derive their ``mirror_opponent`` flag
+    from the same ``cfg.opponent == "selfplay"`` test, so a run cannot mirror on
+    one side and not the other.
+
+    Module-level rather than a closure inside :func:`_main_multi_arena` for one
+    reason: this is the wiring AC13 is about, and wiring that can only be
+    exercised by starting a real fleet is wiring nothing tests. Here a test
+    builds the factory from a config and inspects the env it produces.
+
+    Each returned builder opens ONE
+    :class:`~env.mc_pvp_env.TcpBridgeClient` to ``base_port + arena_id``.
+    ``auto_connect`` stays at its default ``True``: the collector treats a
+    successful return as a working connection, and a connect failure raises
+    ``BridgeError`` into its recovery path. One TCP connection per arena — the
+    wire carries no arena id, and a bridge accepts exactly one client.
+
+    Args:
+        cfg: The training config; only ``opponent`` is read (for the mirror).
+        host: Bridge host shared by every pad.
+        base_port: Pad 0's bridge port; pad ``i`` listens on ``base_port + i``.
+        max_episode_steps: Episode truncation handed to every env; ``None``
+            disables truncation entirely.
+
+    Returns:
+        An :data:`EnvFactoryFor` — ``arena_id -> (() -> MCPvPEnv)``.
+    """
+    # Function-local, like every other env import in this module (there is no
+    # module-level one), so importing agent.train never drags in the env
+    # package. Resolved HERE, at factory-build time — the builders below close
+    # over these two names, which is the same binding moment the closure this
+    # replaced had inside _main_multi_arena.
+    from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
+
+    # Evaluated ONCE, not per arena: every pad in a run mirrors or none does.
+    mirror_opponent = cfg.opponent == "selfplay"
+
+    def _factory_for(arena_id: int) -> Callable[[], Any]:
+        port = int(base_port) + int(arena_id)
+
+        def _build() -> Any:
+            transport = TcpBridgeClient(host=host, port=port)
+            return MCPvPEnv(
+                transport=transport,
+                max_episode_steps=max_episode_steps,
+                # Self-play drives the second fighter from a frozen DuelingDRQN,
+                # which needs the OPPONENT seat's observation.
+                # ``opponent_observation()`` RAISES without this flag, so
+                # omitting it here fails on the run's first episode rather than
+                # quietly feeding the snapshot nothing.
+                mirror_opponent=mirror_opponent,
+            )
+
+        return _build
+
+    return _factory_for
 
 
 class _BestCheckpointSelector:
@@ -2782,25 +4528,88 @@ class _BestCheckpointSelector:
         Until something is actually won there is no evidence to select on, and
         the honest answer is that no best checkpoint exists.
 
+    A self-play cycle adds a THIRD rule by passing ``worst_reference``: the
+    candidate must also beat the incumbent's weakest reference score — AND clear
+    ``min_win_rate`` on it, because on the first cycle of a selector there is no
+    incumbent to beat. A single aggregate hides the failure this run is most
+    likely to produce — a policy that learns to beat the two recent references
+    decisively while collapsing against the oldest one still gains on the mean.
+    That is not improvement, it is specialization, and it is exactly the
+    checkpoint a human challenger with an unfamiliar style would beat on demo day.
+
     Args:
         min_win_rate: A report must strictly exceed this to be selectable
-            (default 0.0 — it must have won at least one eval episode).
+            (default 0.0 — it must have won at least one eval episode). On a
+            self-play cycle BOTH the aggregate and the worst reference must
+            exceed it, so a shipped checkpoint has never been swept by any single
+            past self.
     """
 
     def __init__(self, *, min_win_rate: float = 0.0) -> None:
         self.best_win_rate: float = -1.0
         self.best_grad_step: int = -1
+        #: The SHIPPED candidate's weakest per-reference win rate. ``-1.0`` until
+        #: something ships — the sentinel means "no incumbent", NOT "anything
+        #: clears it": the first cycle still has to beat ``min_win_rate`` on this
+        #: number, exactly as it does on the aggregate. See :meth:`consider`.
+        self.best_worst_reference: float = -1.0
         self._min_win_rate = float(min_win_rate)
 
-    def consider(self, win_rate: float, grad_step: int) -> bool:
-        """Record this eval; return True iff it is the new checkpoint to ship."""
+    def consider(
+        self,
+        win_rate: float,
+        grad_step: int,
+        *,
+        worst_reference: Optional[float] = None,
+    ) -> bool:
+        """Record this eval; return True iff it is the new checkpoint to ship.
+
+        Args:
+            win_rate: The cycle's headline rate — the scripted win rate on a
+                scripted run, the AGGREGATE across pinned references on a
+                self-play one.
+            grad_step: The grad step the EVALUATED weights were taken at.
+            worst_reference: The cycle's weakest per-reference win rate.
+                ``None`` (every non-self-play cycle, and a self-play cycle whose
+                pool holds no reference) keeps the historical single-criterion
+                rule byte for byte.
+
+        Returns:
+            Whether this eval is the new checkpoint to ship.
+        """
         rate = float(win_rate)
-        if rate <= self.best_win_rate:
+        if worst_reference is None:
+            if rate <= self.best_win_rate:
+                return False
+            self.best_win_rate = rate
+            if rate <= self._min_win_rate:
+                # Tracked as the high-water mark, but not worth shipping yet.
+                return False
+            self.best_grad_step = int(grad_step)
+            return True
+
+        # Both bars are the SHIPPED candidate's own scores, and both advance
+        # only together, on an actual ship. Advancing one of them for a
+        # candidate that was not shipped would raise the bar without changing
+        # the incumbent, so a later candidate could be rejected for failing to
+        # beat a net nobody is holding.
+        floor = float(worst_reference)
+        if rate <= self.best_win_rate or floor <= self.best_worst_reference:
+            return False
+        # BOTH numbers face the absolute bar, not just the aggregate (W1). The
+        # incumbent bar above is vacuous on the FIRST cycle of a selector — it is
+        # still the -1.0 sentinel — so gating only `rate` here let a cycle that
+        # scored 0.60 on the mean while being SWEPT by one reference ship, and
+        # then become the incumbent every later candidate is measured against. A
+        # fresh run hides it (the first eval predates the first promotion, so
+        # there is one reference and aggregate == worst); a RESUMED run does not:
+        # this selector is rebuilt per `train_multi_arena` call, so a restart
+        # against a reloaded pool of three pinned references re-opens the window
+        # with the run's whole history behind it.
+        if rate <= self._min_win_rate or floor <= self._min_win_rate:
             return False
         self.best_win_rate = rate
-        if rate <= self._min_win_rate:
-            # Tracked as the high-water mark, but not worth shipping yet.
-            return False
+        self.best_worst_reference = floor
         self.best_grad_step = int(grad_step)
         return True
 
@@ -2822,6 +4631,9 @@ def _eval_via_designated_arena(
     log: Optional[Callable[[str], None]],
     pause_timeout: float,
     opponent: Optional[Any] = None,
+    mirror_opponent: bool = False,
+    candidate: Optional[_FrozenCandidate] = None,
+    reference_tracks: Sequence[_ReferenceTrack] = (),
 ) -> Optional[_EvalOutcome]:
     """Run ONE greedy eval on the designated arena via the pause/handoff protocol.
 
@@ -2840,10 +4652,21 @@ def _eval_via_designated_arena(
     the collector's curriculum-driven one, so the eval neither perturbs training's
     opponent RNG nor inherits its drifting mixture.
 
+    ``mirror_opponent`` is forwarded unchanged to :func:`_eval_against_opponent`,
+    which is where the eval env is actually built; see that function for why the
+    flag has to reach it. ``candidate`` and ``reference_tracks`` (T13) are
+    forwarded the same way: the WHOLE self-play cycle — the scripted yardstick
+    plus every pinned-reference leg — runs inside this ONE pause, on this ONE
+    borrowed connection. Splitting the gauntlet into a track-per-call would
+    pause and resume the designated collector once per reference and let it
+    restart episodes in between, and every extra borrow is another chance to
+    take a connection the bridge grants exactly once.
+
     Returns the eval :class:`_EvalOutcome` (report + the weight snapshot the eval
-    started from), or ``None`` if the designated collector could not be brought to
-    an idle boundary within ``pause_timeout`` (e.g. it is mid-relaunch), in which
-    case eval is SKIPPED this cycle rather than risking a second connection.
+    started from + any per-reference outcomes), or ``None`` if the designated
+    collector could not be brought to an idle boundary within ``pause_timeout``
+    (e.g. it is mid-relaunch), in which case eval is SKIPPED this cycle rather
+    than risking a second connection.
 
     NOTE: pausing the designated collector does NOT pause the learner — it keeps
     stepping the optimizer off the other N-1 arenas for the whole eval. That is
@@ -2888,6 +4711,9 @@ def _eval_via_designated_arena(
             base_seed=base_seed,
             log=log,
             opponent=opponent,
+            mirror_opponent=mirror_opponent,
+            candidate=candidate,
+            reference_tracks=reference_tracks,
         )
     finally:
         # Always resume the collector, even if eval raised, so a single arena is
@@ -2907,6 +4733,7 @@ def train_multi_arena(
     max_grad_steps: Optional[int] = None,
     eval_every_grad_steps: int = 1_000,
     eval_episodes: int = 100,
+    reference_eval_episodes: int = DEFAULT_REFERENCE_EVAL_EPISODES,
     designated_arena: int = 0,
     timeout_cap: int = MAX_EPISODE_STEPS,
     env_max_episode_steps: int = MAX_EPISODE_STEPS,
@@ -2919,6 +4746,7 @@ def train_multi_arena(
     best_checkpoint_hook: Optional[BestCheckpointHook] = None,
     checkpoint_every_grad_steps: Optional[int] = None,
     eval_opponent_factory: Optional[Callable[[], Any]] = None,
+    snapshot_dir: Optional[str] = None,
     is_live: bool = False,
     log: Optional[Callable[[str], None]] = None,
     poll_interval: float = 0.05,
@@ -2987,6 +4815,16 @@ def train_multi_arena(
             Indexed off the learner's grad step (not episodes) because the learner is
             the single clock under N collectors.
         eval_episodes: Episodes per greedy eval. AC6 uses 100; tests use a few.
+            On a self-play run this sizes the SCRIPTED yardstick track only; the
+            reference gauntlet is sized by ``reference_eval_episodes``.
+        reference_eval_episodes: Episodes against EACH pinned reference in a
+            self-play eval cycle (default
+            :data:`DEFAULT_REFERENCE_EVAL_EPISODES`). Ignored entirely on the
+            dummy and scripted paths, which have no references. The whole cycle
+            costs ``eval_episodes + len(pinned_references) * this``; three
+            references at ten is thirty extra armored fights, roughly 30-45
+            minutes, and twenty each would cost the night several cycles of the
+            AC7 curve.
         designated_arena: The single arena eval pauses/borrows (default 0). Eval never
             fans out across arenas.
         timeout_cap / env_max_episode_steps / rollout_step_cap: Episode-length knobs,
@@ -3028,7 +4866,19 @@ def train_multi_arena(
             so every eval faces an identical opponent. ``None`` (the default)
             means the eval is built from ``cfg`` via :func:`build_eval_opponent` —
             which yields ``None`` on the dummy path, keeping the M2 eval's wire
-            line byte-identical.
+            line byte-identical. MUST NOT build a TRAINING driver: ``evaluate``
+            calls ``observe_outcome`` duck-typed on whatever it is handed, and
+            :meth:`ScriptedOpponentDriver.observe_outcome` scores into the shared
+            :class:`OpponentCurriculum` and can FIRE its gate — so the eval would
+            move the training distribution it exists to measure. Every production
+            path passes :class:`EvalOpponentDriver`, which has no
+            ``observe_outcome`` at all; this is a note for the next caller, not a
+            live bug.
+        snapshot_dir: Where the self-play snapshot pool lives. Read only when
+            ``cfg.opponent == "selfplay"``; ``None`` falls back to
+            ``snapshot_pool_directory("selfplay")``. The live CLI passes
+            ``snapshot_pool_directory(--run-name)`` so two runs cannot share one
+            pool of past selves, and a test points it at a ``tmp_path``.
         is_live: Marks reports/result as live vs offline.
         log: Optional ASCII-only ``str -> None`` sink (Windows cp1252-safe).
         poll_interval: Seconds between the driver's budget/health polls.
@@ -3093,6 +4943,13 @@ def train_multi_arena(
         )
     if eval_episodes <= 0:
         raise ValueError(f"eval_episodes must be > 0, got {eval_episodes}")
+    if reference_eval_episodes <= 0:
+        # Refused here rather than at the first eval cycle, which on a live run
+        # is an hour in: a zero-episode reference track reports win_rate 0.0 for
+        # a fight that never happened, and that number selects the checkpoint.
+        raise ValueError(
+            f"reference_eval_episodes must be > 0, got {reference_eval_episodes}"
+        )
     if eval_every_grad_steps < 0:
         raise ValueError(
             f"eval_every_grad_steps must be >= 0, got {eval_every_grad_steps}"
@@ -3139,14 +4996,73 @@ def train_multi_arena(
             "live run, or a fake launcher in tests."
         )
 
-    # --- the opponent curriculum (T12) --------------------------------------
+    # --- the opponent drivers (T12 scripted / T10 self-play) ----------------
     # "dummy" (the default) builds nothing at all: no opponent_for reaches the
-    # pool, no opp_action reaches the wire, and the M2 path is untouched.
+    # ACTOR pool, no opp_action reaches the wire, and the M2 path is untouched.
     # "scripted" builds ONE shared curriculum gate plus one driver per arena.
+    # "selfplay" builds ONE shared snapshot pool plus one driver per arena.
+    #
+    # EVERY non-dummy choice MUST have a branch here. A choice that reaches this
+    # block without one leaves `opponent_for` at None, and then the whole run
+    # trains against the stationary bridge-served dummy while every log line,
+    # every metric label and the logger's own config record all say otherwise —
+    # a silent night, not a crash.
     curriculum: Optional[OpponentCurriculum] = None
-    opponent_for: Optional[Callable[[int], EpisodeOpponent]] = None
+    snapshot_pool: Optional[SnapshotPool] = None
+    # None on every other path, which is what keeps the archive cadence off the
+    # dummy/scripted runs entirely (they have no pool to archive into).
+    snapshot_archivist: Optional[SnapshotArchivist] = None
+    opponent_for: Optional[Callable[[int], OpponentDriver]] = None
+    # "Does this run mirror the opponent seat?" — the eval env's flag, below.
+    # `build_live_env_factory_for` applies the SAME test on the training side,
+    # so the two construction sites AC13 names cannot disagree.
+    mirror_opponent = cfg.opponent == "selfplay"
     if cfg.opponent == "scripted":
         curriculum, opponent_for = build_scripted_opponents(cfg)
+    elif cfg.opponent == "selfplay":
+        snapshot_pool, opponent_for = build_snapshot_opponents(
+            cfg,
+            snapshot_dir=snapshot_dir,
+            # The SAME net_kwargs the learner was built with, so a published
+            # state_dict loads into a frozen clone strictly. `net_kwargs` is
+            # already normalized to a dict above; `_net_factory` is defined
+            # further down for the collector policies and does exactly this.
+            net_factory=lambda: DuelingDRQN(**net_kwargs),
+            log=log,
+        )
+        # From here on the learner publishes THROUGH the stamping wrapper, so
+        # every published snapshot carries the grad step it was produced at and
+        # the archive below can label a pool member with a fact rather than an
+        # estimate. Only on this branch: a dummy/scripted run keeps whatever
+        # store the caller passed, untouched. It MUST be installed before every
+        # PUBLISHER is handed the store — `LearnerLoop` below, and the warm-start
+        # pre-publish further down — because a publish that bypasses the wrapper
+        # carries no stamp, `maybe_archive` refuses to date such a version rather
+        # than guess, and the pool then stops growing with only a SKIPPED line to
+        # say so. NOT an ordering constraint for the collectors: `latest`
+        # delegates to the wrapped store untouched, so `ActorPool.build` below
+        # sees every publish whichever of the two objects it is handed.
+        weight_store = _StampedWeightStore(weight_store, lambda: trainer.grad_step)
+        # AC5's actual mechanism. Without it the pool never grows past snapshot 0
+        # and nothing in the run reports that.
+        snapshot_archivist = SnapshotArchivist(
+            snapshot_pool,
+            weight_store.latest_stamped,
+            every_grad_steps=cfg.snapshot_every_grad_steps,
+            promote_at=cfg.reference_promote_grad_steps,
+            log=log,
+        )
+        # The pool's own line, because "selfplay" in the config record proves
+        # only that the flag was parsed. This says a pool exists, where it is,
+        # and how many past selves the collectors can actually draw from.
+        _emit(
+            f"[multi] opponent=selfplay: snapshot pool at "
+            f"{snapshot_pool.directory!r} holds {len(snapshot_pool)} snapshot(s), "
+            f"sampling={snapshot_pool.sampling}, opponent_epsilon="
+            f"{cfg.opponent_epsilon}, archiving every "
+            f"{cfg.snapshot_every_grad_steps} grad steps with pinned references "
+            f"promoted at {tuple(cfg.reference_promote_grad_steps)}"
+        )
 
     # --- the EVAL's own opponent (T13) --------------------------------------
     # Separate from the collectors' drivers on purpose: the eval must fight the
@@ -3154,6 +5070,12 @@ def train_multi_arena(
     # target and selects the wrong checkpoint) while staying identical across
     # evals (or two win rates are not comparable and "select the best" is
     # meaningless). None on the dummy path.
+    #
+    # On a SELF-PLAY run this is the scripted YARDSTICK track, not the rated
+    # half of the cycle: an Elo ladder measured entirely against past selves can
+    # rise while the whole pool drifts, so the cycle also needs one number that
+    # cannot inflate and is comparable to the M3 run. The rated half is the
+    # reference gauntlet built per cycle below.
     if eval_opponent_factory is None:
         eval_opponent_factory = build_eval_opponent(cfg)
     eval_opponent_name = "dummy"
@@ -3168,6 +5090,25 @@ def train_multi_arena(
 
     def _net_factory() -> Any:
         return DuelingDRQN(**net_kwargs)
+
+    # --- the RATED half of a self-play eval cycle (T13 / AC7, AC8) ----------
+    # Rebuilt per cycle, deliberately, and not hoisted: `pinned_references()`
+    # GROWS during the run (snapshot 0 at seed, then T18's promotions at
+    # `cfg.reference_promote_grad_steps`), so a tuple captured once here would
+    # pin the gauntlet to whatever existed at startup and the two promoted
+    # references would never be fought — with `selfplay/win_rate_vs_ref_<id>`
+    # simply never appearing for them and nothing reporting why. Defined below
+    # `_net_factory` because it closes over it: the gauntlet's frozen nets must
+    # be the learner's architecture or every snapshot load fails.
+    def _reference_tracks_now() -> Tuple[_ReferenceTrack, ...]:
+        if snapshot_pool is None:
+            return ()
+        return build_reference_tracks(
+            cfg,
+            snapshot_pool,
+            n_episodes=reference_eval_episodes,
+            net_factory=_net_factory,
+        )
 
     policies: Dict[int, Any] = {}
 
@@ -3267,6 +5208,13 @@ def train_multi_arena(
     best_saved_win_rate = -1.0
     best_saved_grad_step = -1
     best_save_failures = 0
+    # WHO the two win rates above were earned against, when that is not
+    # `eval_opponent_name`. Set on the first self-play cycle that actually
+    # fought a reference and left alone afterwards, so the end-of-run "which
+    # file to ship" line can never label a reference-gauntlet aggregate as a
+    # scripted win rate. Empty string, not None, so the caller's `or` fallback
+    # is a plain truthiness test.
+    selection_opponent = ""
 
     def _save_latest(grad_step: int, why: str) -> bool:
         """Fire the LATEST-net hook, never letting a save failure kill the run.
@@ -3307,6 +5255,62 @@ def train_multi_arena(
             return
         logger.log(epsilon_log_row(counter.value, cfg), step=int(grad_step))
 
+    # --- self-play observability: both Elo series + the pool's shape (T12) ---
+    # Emitted at grad-step boundaries the loop ALREADY has: the eval cycle (AC7
+    # states the rated series is logged each eval cycle) and the periodic
+    # checkpoint, so a run started with --eval-every-grad-steps 0 still leaves a
+    # curve behind instead of nothing. The latch below is why both call sites are
+    # safe: when the two boundaries fall in the SAME loop iteration they carry
+    # the same `grad_step`, and one step must not produce two identical rows.
+    last_selfplay_log_step = -1
+
+    def _maybe_log_selfplay(grad_step: int) -> None:
+        nonlocal last_selfplay_log_step
+        if snapshot_pool is None:
+            return
+        step = int(grad_step)
+        if step == last_selfplay_log_step:
+            return
+        last_selfplay_log_step = step
+        row = selfplay_log_row(snapshot_pool)
+        if logger is not None:
+            logger.log(row, step=step)
+        # Said on stderr too, and NOT behind `logger is not None`: this line is
+        # the 3am read of whether AC7 will have any data in the morning, and a
+        # run configured with no metrics backend is exactly when it matters.
+        rated = int(row["selfplay/rated_matches"])
+        draw_rate = row.get("selfplay/draw_rate")
+        _emit(
+            f"[multi grad_step {step}] selfplay: "
+            f"elo_rated={row['elo/learner_rated']:.1f} "
+            + (
+                f"({rated} rated match(es))"
+                if rated
+                else "(0 rated matches - elo/learner_rated is EMPTY)"
+            )
+            + f" elo_online={row['elo/learner_online']:.1f} "
+            f"pool={int(row['selfplay/pool_size'])} "
+            f"matches={int(row['selfplay/matches_scored'])} "
+            + (
+                "draw_rate=n/a"
+                if draw_rate is None
+                else f"draw_rate={draw_rate:.3f}"
+            )
+        )
+
+    def _summarize_selfplay() -> None:
+        # The run's FINAL numbers, from the teardown `finally` so a night that
+        # ended on a learner error or a 4am Ctrl-C still records what it measured.
+        # Wrapped for the same reason `_save_latest` is: the caller re-raises the
+        # learner's own exception right after this, and a logger that raises here
+        # would replace it with a teardown traceback.
+        if snapshot_pool is None or logger is None:
+            return
+        try:
+            logger.summary(selfplay_log_row(snapshot_pool))
+        except Exception as exc:  # noqa: BLE001 - must not mask the real error
+            _emit(f"[multi] self-play summary FAILED: {exc}")
+
     _emit(
         f"[multi] starting {cfg.arenas} pads - "
         f"weight_sync_every_k={cfg.weight_sync_every_k_steps}, "
@@ -3319,11 +5323,31 @@ def train_multi_arena(
             f"{cfg.opponent_gate_winrate:.2f} over {cfg.opponent_gate_window} "
             f"EASY eps), "
             if curriculum is not None
-            else "opponent=dummy, "
+            # Three branches, not two: with `snapshot_pool` folded into the
+            # `else` a self-play run opened its own log by announcing
+            # "opponent=dummy", which is the exact false-summary this run cannot
+            # afford - it is also the true symptom of the wiring bug where
+            # `opponent_for` stays None.
+            else (
+                f"opponent=selfplay (sampling={snapshot_pool.sampling}, "
+                f"opponent_epsilon={cfg.opponent_epsilon}), "
+                if snapshot_pool is not None
+                else "opponent=dummy, "
+            )
         )
         + (
             f"eval every {eval_every_grad_steps} grad steps on arena "
             f"{designated_arena} vs {eval_opponent_name}"
+            # Said out loud because the cycle's WALL CLOCK is the sum of both
+            # tracks: at 25 pads a self-play cycle is one scripted track plus
+            # one leg per pinned reference, and an operator sizing the night
+            # needs to see the multiplier rather than infer it from a gap in
+            # the eval timestamps.
+            + (
+                f" + {reference_eval_episodes} eps vs EACH pinned reference"
+                if snapshot_pool is not None
+                else ""
+            )
             if do_eval
             else "eval disabled"
         )
@@ -3425,130 +5449,312 @@ def train_multi_arena(
                 stop_reason = "max_episodes"
                 break
 
+            # --- the snapshot archive cadence (T18 / AC5) -----------------------
+            # THE call that makes the pool grow. Delete it and a 24-hour self-play
+            # run fights the frozen warm start every single episode: PFSP has one
+            # candidate, Elo has one opponent so the rating cannot move, and
+            # `selfplay/pool_size` reads 1 all night. Nothing raises. Placed
+            # BEFORE the checkpoint/eval blocks so a snapshot archived on this
+            # iteration is already counted by the `selfplay/pool_size` those
+            # blocks log at this same grad step.
+            if snapshot_archivist is not None:
+                snapshot_archivist.maybe_archive(grad_step)
+
             # --- periodic checkpoint of the LATEST net (eval-independent) -------
             if do_periodic_checkpoint and grad_step >= next_checkpoint_at:
+                _maybe_log_selfplay(grad_step)
                 _save_latest(grad_step, "periodic")
                 # Re-read grad_step: saving takes time and the learner kept going.
                 next_checkpoint_at = int(trainer.grad_step) + checkpoint_every
 
             # --- periodic designated-arena eval via pause/handoff ---------------
             if do_eval and grad_step >= next_eval_at:
-                _maybe_log_mean_epsilon(grad_step)
-                outcome = _eval_via_designated_arena(
-                    trainer=trainer,
-                    pool=pool,
-                    designated_arena=designated_arena,
-                    evaluate=evaluate,
-                    policy_cls=DRQNGreedyPolicy,
-                    n_episodes=eval_episodes,
-                    timeout_cap=timeout_cap,
-                    env_max_episode_steps=env_max_episode_steps,
-                    eval_step_cap=rollout_step_cap,
-                    logger=logger,
-                    is_live=is_live,
-                    base_seed=cfg.seed,
-                    log=log,
-                    pause_timeout=eval_pause_timeout,
-                    # A FRESH opponent per eval, from the same fixed seed: every
-                    # eval fights the identical opponent, so the win-rate series
-                    # measures the AGENT and nothing else.
-                    opponent=(
-                        eval_opponent_factory()
-                        if eval_opponent_factory is not None
+                # The WHOLE cycle is guarded (W2). It is the scripted track
+                # PLUS one `evaluate` per pinned reference - four calls and tens
+                # of minutes of live bridge traffic once three references are
+                # pinned - and a BridgeError in the last leg (or an
+                # `opponent_observation()` refusal from a mis-built env) used to
+                # propagate straight through this loop into teardown and END a
+                # 24-hour run, throwing away the legs already fought with it.
+                # `_save_latest` and the best-checkpoint hook already swallow
+                # and shout; eval is the biggest exposure of the three and was
+                # the only one left unguarded.
+                try:
+                    _maybe_log_mean_epsilon(grad_step)
+                    # ONE immutable on-disk candidate for the WHOLE cycle (T13).
+                    # Built before the collector is paused so the pause window holds
+                    # only bridge traffic, and `None` on every non-self-play path,
+                    # where the historical live-net policy is unchanged.
+                    candidate = (
+                        _freeze_eval_candidate(
+                            trainer=trainer,
+                            policy_cls=DRQNGreedyPolicy,
+                            net_factory=_net_factory,
+                            directory=snapshot_pool.directory,
+                            log=log,
+                        )
+                        if snapshot_pool is not None
                         else None
-                    ),
-                )
-                # Advance the boundary past the CURRENT grad step so a long eval (the
-                # learner kept stepping during the borrow) does not immediately re-fire.
-                next_eval_at = int(trainer.grad_step) + eval_every_grad_steps
-
-                if outcome is not None:
-                    report = outcome.report
-                    reports.append(report)
-                    last_report = report
-                    # The grad step the EVALUATED weights were taken at, not
-                    # trainer.grad_step now: the learner never stopped, so "now"
-                    # names a net this win rate says nothing about.
-                    eval_grad_step = int(outcome.grad_step)
-                    # Selection is by WIN RATE, not recency (see the selector).
-                    if selector.consider(report.win_rate, eval_grad_step):
-                        if best_checkpoint_hook is not None:
-                            try:
-                                best_checkpoint_hook(
-                                    trainer,
-                                    eval_grad_step,
-                                    {
-                                        "win_rate": float(report.win_rate),
-                                        "eval_opponent": eval_opponent_name,
-                                        "eval_episodes": int(report.n_episodes),
-                                        "mean_episode_length": float(
-                                            report.mean_episode_length
-                                        ),
-                                        "passed_m2": bool(report.passed_m2),
-                                    },
-                                    # The weights that EARNED this win rate. The
-                                    # hook must write these, not the live net.
-                                    outcome.weights,
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                # Swallowed on purpose: one unwritable path must
-                                # not end a 12-hour run. But the high-water mark
-                                # the summary reports is recorded in the `else`
-                                # below, so nothing that failed here can be
-                                # printed at the end as a file to ship.
-                                best_save_failures += 1
-                                _emit(
-                                    "[multi] BEST checkpoint save FAILED at "
-                                    f"grad_step {eval_grad_step}: {exc}"
-                                )
-                            else:
-                                best_saved_win_rate = float(report.win_rate)
-                                best_saved_grad_step = eval_grad_step
-                                _emit(
-                                    f"[multi] best checkpoint saved: win_rate="
-                                    f"{report.win_rate:.3f} vs {eval_opponent_name} "
-                                    f"at grad_step {eval_grad_step}"
-                                )
-                        else:
-                            # Legacy single-hook callers keep the old save-best
-                            # behavior; the periodic/final saves are additional.
-                            # This path still writes the LIVE net (the 2-arg
-                            # CheckpointHook has nowhere to put a snapshot), so it
-                            # keeps the stale-weights exposure the 4-arg
-                            # best_checkpoint_hook above fixes. Left as-is
-                            # deliberately: the live CLI always passes a
-                            # best_checkpoint_hook when a best path is configured
-                            # (see _best_checkpoint_path), so tonight's run never
-                            # takes this branch.
-                            if _save_latest(eval_grad_step, "best"):
-                                best_saved_win_rate = float(report.win_rate)
-                                best_saved_grad_step = eval_grad_step
-                            elif checkpoint_hook is not None:
-                                # A hook existed and raised — same accounting as
-                                # the 4-arg path above. No hook at all is not a
-                                # failure, just a run with nowhere to save.
-                                best_save_failures += 1
-                    _emit(
-                        f"[multi grad_step {eval_grad_step}] "
-                        f"win_rate={report.win_rate:.3f} "
-                        f"mean_len={report.mean_episode_length:.1f} "
-                        f"aim_invisible={report.aim_while_invisible:.3f} "
-                        f"passed_m2={report.passed_m2} "
-                        f"opponent={eval_opponent_name}"
                     )
-                    if report.passed_m2:
-                        # Two INDEPENDENT concerns, kept independent on purpose.
-                        # `passed` is the verdict the CLI turns into an exit code
-                        # (_main_multi_arena returns `0 if passed_m2 else 1`);
-                        # `stop_on_pass` only decides whether the loop breaks.
-                        # Folding the verdict into the break made a scripted run
-                        # (which defaults stop_on_pass False, see T13) train all
-                        # night, clear the gate, ship a good checkpoint — and
-                        # still exit 1.
-                        passed = True
-                        if stop_on_pass:
-                            stop_reason = "passed_m2"
-                            break
+                    outcome = _eval_via_designated_arena(
+                        trainer=trainer,
+                        pool=pool,
+                        designated_arena=designated_arena,
+                        evaluate=evaluate,
+                        policy_cls=DRQNGreedyPolicy,
+                        n_episodes=eval_episodes,
+                        timeout_cap=timeout_cap,
+                        env_max_episode_steps=env_max_episode_steps,
+                        eval_step_cap=rollout_step_cap,
+                        logger=logger,
+                        is_live=is_live,
+                        base_seed=cfg.seed,
+                        log=log,
+                        pause_timeout=eval_pause_timeout,
+                        # A FRESH opponent per eval, from the same fixed seed: every
+                        # eval fights the identical opponent, so the win-rate series
+                        # measures the AGENT and nothing else.
+                        opponent=(
+                            eval_opponent_factory()
+                            if eval_opponent_factory is not None
+                            else None
+                        ),
+                        # AC13's second construction site. Derived from the SAME cfg
+                        # field as the training factory's flag so the two sites
+                        # cannot disagree about whether this run mirrors.
+                        mirror_opponent=mirror_opponent,
+                        candidate=candidate,
+                        # The rated gauntlet: one leg per PINNED reference, rebuilt
+                        # each cycle so a reference promoted mid-run is fought from
+                        # the next cycle on. Empty off the self-play path.
+                        reference_tracks=_reference_tracks_now(),
+                    )
+                    # Advance the boundary past the CURRENT grad step so a long
+                    # eval (the learner kept stepping during the borrow) does not
+                    # immediately re-fire.
+                    next_eval_at = int(trainer.grad_step) + eval_every_grad_steps
+
+                    verdict = _summarize_reference_outcomes(
+                        () if outcome is None else outcome.reference_outcomes
+                    )
+                    # AFTER the gauntlet, not before it (where T12 had to put it,
+                    # having nothing to wait for): the rated matches this cycle just
+                    # scored are what make `elo/learner_rated` non-empty, so a row
+                    # written first reports the PREVIOUS cycle's rating and the
+                    # first cycle of a run reports an empty series. Still labelled
+                    # with the ITERATION's `grad_step`, never `trainer.grad_step`,
+                    # which the learner has moved on during the borrow. When the
+                    # periodic-checkpoint boundary above already logged this step,
+                    # the latch drops this call — the pool row is then one cycle
+                    # behind for that step and fresh again at the next one, which is
+                    # the price of never emitting two contradictory rows at one x.
+                    _maybe_log_selfplay(grad_step)
+                    # The CYCLE's own rates, in their own row and NOT behind the
+                    # latch. They are a different measurement with a different
+                    # lifetime — one per eval, never once per checkpoint — and they
+                    # exist only here, so dropping them on a step the checkpoint
+                    # boundary happened to share would lose them for good rather
+                    # than delay them. (`_maybe_log_mean_epsilon` above already
+                    # writes a second row at this same step; two rows at one step is
+                    # this loop's established shape, not a new one.)
+                    cycle_row = selfplay_eval_cycle_row(
+                        None if outcome is None else outcome.report, verdict
+                    )
+                    if logger is not None and cycle_row and snapshot_pool is not None:
+                        logger.log(cycle_row, step=grad_step)
+                    if verdict is not None:
+                        _emit(
+                            f"[multi grad_step {grad_step}] reference gauntlet: "
+                            f"aggregate={verdict.aggregate:.3f} "
+                            f"worst={verdict.worst:.3f} over {verdict.references} "
+                            f"reference(s), {verdict.episodes} episode(s) - "
+                            + " ".join(
+                                f"ref{ref.snapshot_id}={ref.report.win_rate:.3f}"
+                                for ref in outcome.reference_outcomes
+                            )
+                        )
+                    elif snapshot_pool is not None and outcome is not None:
+                        # A self-play cycle that fought NO reference. Reachable only
+                        # through a pool with no pinned member, which
+                        # `build_snapshot_opponents` cannot produce — so it means the
+                        # loop is holding a pool this run does not own, and
+                        # `elo/learner_rated` will stay empty all night.
+                        _emit(
+                            f"[multi grad_step {grad_step}] reference gauntlet ran "
+                            "NO references: the snapshot pool holds no pinned "
+                            "member, so no rated match was played and "
+                            "elo/learner_rated cannot move"
+                        )
+
+                    if outcome is not None:
+                        report = outcome.report
+                        reports.append(report)
+                        last_report = report
+                        # The grad step the EVALUATED weights were taken at, not
+                        # trainer.grad_step now: the learner never stopped, so "now"
+                        # names a net this win rate says nothing about.
+                        eval_grad_step = int(outcome.grad_step)
+                        # WHAT the checkpoint is selected on. A self-play cycle with
+                        # references selects on the reference AGGREGATE gated by the
+                        # WORST reference; every other path keeps selecting on the
+                        # single eval win rate, unchanged.
+                        selection_rate = (
+                            report.win_rate if verdict is None else verdict.aggregate
+                        )
+                        worst_reference = None if verdict is None else verdict.worst
+                        if verdict is not None:
+                            # Deliberately COUNTLESS. The gauntlet grows 1 -> 2 -> 3
+                            # as references are promoted, so a label naming this
+                            # cycle's count would still be on the result at the end
+                            # of a run that later fought three. The count that
+                            # matters rides with the checkpoint that earned it, in
+                            # the save-best hook's `references_evaluated`.
+                            selection_opponent = (
+                                "the pinned reference gauntlet (aggregate)"
+                            )
+                        # Selection is by WIN RATE, not recency (see the selector).
+                        if selector.consider(
+                            selection_rate,
+                            eval_grad_step,
+                            worst_reference=worst_reference,
+                        ):
+                            if best_checkpoint_hook is not None:
+                                # `win_rate` is the SELECTION number and
+                                # `eval_opponent` names what it was earned against,
+                                # so the pair is always self-consistent: the
+                                # scripted yardstick on a scripted/dummy run, the
+                                # reference aggregate on a self-play one. The
+                                # scripted rate is carried alongside rather than
+                                # dropped — it is the only number comparable to M3.
+                                meta: Dict[str, Any] = {
+                                    "win_rate": float(selection_rate),
+                                    "eval_opponent": (
+                                        selection_opponent or eval_opponent_name
+                                    ),
+                                    "eval_episodes": int(report.n_episodes),
+                                    "mean_episode_length": float(
+                                        report.mean_episode_length
+                                    ),
+                                    "passed_m2": bool(report.passed_m2),
+                                    "scripted_win_rate": float(report.win_rate),
+                                    "scripted_opponent": eval_opponent_name,
+                                    # HOW MUCH the win rate above is worth (S2).
+                                    # True: every track fought the same net,
+                                    # staged on disk and read back, so these are
+                                    # the bytes that sat the exam. False: the
+                                    # cycle was scored on the LIVE net the
+                                    # learner kept stepping, so the score is
+                                    # approximately-these-bytes — by design off
+                                    # the self-play path, and by DEGRADATION on
+                                    # it (`_freeze_eval_candidate` returned None
+                                    # and said so, hours before anyone reads
+                                    # this file). Without the flag two
+                                    # `.best.pt` files are indistinguishable in
+                                    # provenance on freeze morning.
+                                    "candidate_frozen": candidate is not None,
+                                }
+                                if verdict is not None:
+                                    meta["worst_reference_win_rate"] = float(
+                                        verdict.worst
+                                    )
+                                    meta["references_evaluated"] = int(
+                                        verdict.references
+                                    )
+                                    meta["reference_episodes"] = int(verdict.episodes)
+                                try:
+                                    best_checkpoint_hook(
+                                        trainer,
+                                        eval_grad_step,
+                                        meta,
+                                        # The weights that EARNED this win rate. The
+                                        # hook must write these, not the live net.
+                                        outcome.weights,
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    # Swallowed on purpose: one unwritable path must
+                                    # not end a 12-hour run. But the high-water mark
+                                    # the summary reports is recorded in the `else`
+                                    # below, so nothing that failed here can be
+                                    # printed at the end as a file to ship.
+                                    best_save_failures += 1
+                                    _emit(
+                                        "[multi] BEST checkpoint save FAILED at "
+                                        f"grad_step {eval_grad_step}: {exc}"
+                                    )
+                                else:
+                                    best_saved_win_rate = float(selection_rate)
+                                    best_saved_grad_step = eval_grad_step
+                                    _emit(
+                                        f"[multi] best checkpoint saved: win_rate="
+                                        f"{selection_rate:.3f} vs "
+                                        f"{selection_opponent or eval_opponent_name} "
+                                        f"at grad_step {eval_grad_step}"
+                                    )
+                            else:
+                                # Legacy single-hook callers keep the old save-best
+                                # behavior; the periodic/final saves are additional.
+                                # This path still writes the LIVE net (the 2-arg
+                                # CheckpointHook has nowhere to put a snapshot), so it
+                                # keeps the stale-weights exposure the 4-arg
+                                # best_checkpoint_hook above fixes. Left as-is
+                                # deliberately: the live CLI always passes a
+                                # best_checkpoint_hook when a best path is configured
+                                # (see _best_checkpoint_path), so tonight's run never
+                                # takes this branch.
+                                if _save_latest(eval_grad_step, "best"):
+                                    best_saved_win_rate = float(selection_rate)
+                                    best_saved_grad_step = eval_grad_step
+                                elif checkpoint_hook is not None:
+                                    # A hook existed and raised — same accounting as
+                                    # the 4-arg path above. No hook at all is not a
+                                    # failure, just a run with nowhere to save.
+                                    best_save_failures += 1
+                        _emit(
+                            f"[multi grad_step {eval_grad_step}] "
+                            f"win_rate={report.win_rate:.3f} "
+                            f"mean_len={report.mean_episode_length:.1f} "
+                            f"aim_invisible={report.aim_while_invisible:.3f} "
+                            f"passed_m2={report.passed_m2} "
+                            f"opponent={eval_opponent_name}"
+                        )
+                        if report.passed_m2:
+                            # Two INDEPENDENT concerns, kept independent on purpose.
+                            # `passed` is the verdict the CLI turns into an exit code
+                            # (_main_multi_arena returns `0 if passed_m2 else 1`);
+                            # `stop_on_pass` only decides whether the loop breaks.
+                            # Folding the verdict into the break made a scripted run
+                            # (which defaults stop_on_pass False, see T13) train all
+                            # night, clear the gate, ship a good checkpoint — and
+                            # still exit 1.
+                            passed = True
+                            if stop_on_pass:
+                                stop_reason = "passed_m2"
+                                break
+                except Exception as exc:  # noqa: BLE001 - eval must not end the run
+                    # `Exception`, never `BaseException`: a Ctrl-C at 4am and a
+                    # SystemExit must still reach the `finally` below, which is
+                    # what writes the night's final checkpoint.
+                    #
+                    # Re-armed HERE as well as on the success path, because that
+                    # assignment sits AFTER the eval call: an exception raised
+                    # before it would leave next_eval_at in the past and the very
+                    # next poll would re-fire the same failing cycle, retrying it
+                    # every poll_interval for the rest of the night.
+                    next_eval_at = int(trainer.grad_step) + eval_every_grad_steps
+                    # Nothing here has to unwind the pause: the collector is
+                    # resumed by `_eval_via_designated_arena`'s own `finally` and
+                    # train mode restored by `_eval_against_opponent`'s, both of
+                    # which have already run by the time this handler is entered.
+                    # A skipped cycle that left the designated arena parked would
+                    # silently stall 1/N of collection - worse than the crash
+                    # this replaces, because nothing would report it.
+                    _emit(
+                        f"[multi grad_step {grad_step}] eval cycle SKIPPED: it "
+                        f"raised {type(exc).__name__}: {exc}. Training continues "
+                        "and the next cycle is due at grad_step "
+                        f"{next_eval_at}; this cycle selected no checkpoint and "
+                        "rated no match, so both series simply have a gap here."
+                    )
 
             # Park briefly; the learner and collectors run on their own threads.
             time.sleep(poll_interval)
@@ -3577,6 +5783,22 @@ def train_multi_arena(
         # _save_latest swallows its own failures so teardown can never mask the
         # error that got us here.
         _save_latest(int(trainer.grad_step), "final")
+        # --- the pool's LAST index write (T18) ------------------------------
+        # `SnapshotPool.record_result` never touches disk — it is the per-episode
+        # hot path on every arena thread — so everything scored since the last
+        # archive (both Elo series, every head-to-head statistic, the match
+        # counters behind selfplay/draw_rate) exists ONLY in memory, while a
+        # restart and every post-run analysis read pool.json. Here rather than
+        # earlier because `pool.stop()` above has signalled and joined the
+        # collectors and the learner thread has been joined too, so this writes
+        # the run's settled numbers rather than a mid-flight view; inside the
+        # `finally` so a run killed at 4am still flushes what it had. `flush`
+        # builds its payload immediately before writing it, so this can only move
+        # pool.json forward, and it swallows its own failure so teardown never
+        # replaces the learner's exception with its own.
+        if snapshot_archivist is not None:
+            snapshot_archivist.flush()
+        _summarize_selfplay()
 
     # --- surface a learner error or a pool abort LOUDLY ----------------------
     if learner.error is not None:
@@ -3609,6 +5831,7 @@ def train_multi_arena(
         best_selected_win_rate=selector.best_win_rate,
         best_selected_grad_step=selector.best_grad_step,
         best_save_failures=best_save_failures,
+        selection_opponent=selection_opponent,
     )
 
 
@@ -3667,7 +5890,22 @@ def _build_parser() -> "Any":
     )
     parser.add_argument(
         "--eval-episodes", type=int, default=100,
-        help="episodes per greedy eval (default: 100, per AC6).",
+        help="episodes per greedy eval (default: 100, per AC6). With "
+        "--opponent selfplay this sizes the SCRIPTED yardstick track only; the "
+        "reference gauntlet is sized by --reference-eval-episodes.",
+    )
+    parser.add_argument(
+        "--reference-eval-episodes",
+        type=int,
+        default=DEFAULT_REFERENCE_EVAL_EPISODES,
+        help=(
+            f"episodes against EACH pinned reference in a --opponent selfplay "
+            f"eval cycle (default: {DEFAULT_REFERENCE_EVAL_EPISODES}). Ignored "
+            "on the dummy/scripted paths, which have no references. A cycle "
+            "costs --eval-episodes plus this times the number of pinned "
+            "references (1 at seed, up to 3 after promotion), so 10 keeps a "
+            "cycle near 30-45 min and 20 pushes it past an hour."
+        ),
     )
     parser.add_argument(
         "--host", type=str, default="127.0.0.1",
@@ -3697,13 +5935,18 @@ def _build_parser() -> "Any":
         "measurement --arenas.",
     )
     parser.add_argument(
-        "--opponent", type=str, default="dummy", choices=("dummy", "scripted"),
+        "--opponent", type=str, default="dummy",
+        choices=("dummy", "scripted", "selfplay"),
         help="who the agent fights (default: dummy). 'dummy' is the M1/M2 "
         "stationary dummy served entirely by the bridge - no opponent action ever "
         "goes on the wire. 'scripted' steps the ScriptedBot curriculum in Python "
-        "and threads its macro through as opp_action; it requires --arenas >1 "
-        "(the single-arena loop steps no opponent policy and refuses rather than "
-        "silently fighting the dummy).",
+        "and threads its macro through as opp_action. 'selfplay' steps a FROZEN "
+        "past self drawn from the run's snapshot pool and threads its macro "
+        "through the same way; it additionally requires --warm-start (the pool's "
+        "snapshot 0 is that checkpoint) and builds every env with the "
+        "opponent-seat observation mirror. Both non-dummy choices require "
+        "--arenas >1 (the single-arena loop steps no opponent policy and refuses "
+        "rather than silently fighting the dummy).",
     )
     # -- curriculum knobs (all default to TrainConfig's own values) ----------
     # Every one of these defaults to None and is applied only when given, so
@@ -3759,11 +6002,81 @@ def _build_parser() -> "Any":
         "the fresh-init 1.0 would spend the whole decay window acting mostly at "
         "random and throw the warm start away.",
     )
+    # -- self-play knobs (T11b; all default to None -> the config) ------------
+    # Same None-default rule as the curriculum block above: TrainConfig owns
+    # every default, so an argparse default can never drift away from the
+    # dataclass it configures. Each of these is read by the run ONLY when
+    # --opponent selfplay, and each says so, because a knob that silently does
+    # nothing on the path the operator is actually running is worse than absent.
+    parser.add_argument(
+        "--warm-start-sha256", type=str, default=None,
+        help="expected SHA-256 of the --warm-start checkpoint, as 64 lowercase hex "
+        "characters. The run REFUSES to start when the file on disk hashes to "
+        "anything else, naming BOTH digests. Omitted, nothing is verified. A "
+        "self-play run seeds snapshot 0 - the pool's first PINNED member, never "
+        "dropped and never evicted - entirely from this file, so the wrong "
+        "checkpoint becomes a permanent reference opponent; and a stale path or a "
+        "half-copied file loads perfectly cleanly into the same architecture.",
+    )
+    parser.add_argument(
+        "--snapshot-every-grad-steps", type=int, default=None,
+        help="--opponent selfplay only: learner gradient steps between snapshot-pool "
+        "archive events, each of which freezes the PUBLISHED weights as a new past "
+        "self the collectors can be drawn against (default: TrainConfig's 1000). "
+        "Read by the archive hook (T18), not by this module.",
+    )
+    parser.add_argument(
+        "--snapshot-sampling", type=str, default=None, choices=("uniform", "pfsp"),
+        help="--opponent selfplay only: how each episode's opponent snapshot is "
+        "drawn (default: TrainConfig's pfsp). 'pfsp' weights the pool toward the "
+        "snapshots the learner is roughly even with; 'uniform' draws every live "
+        "member with equal probability and is the documented fallback if PFSP has "
+        "to be cut.",
+    )
+    # DELIBERATELY still a RUN-WIDE value, and still not the ε=0 knob a RATED
+    # eval needs. That gap is closed elsewhere, not here: `rated=True` on
+    # `SnapshotOpponentDriver` (via `build_rated_eval_opponent`) pins BOTH
+    # epsilons to a literal 0.0 for an eval driver, which is what makes
+    # `MatchResult.rated_eligible` — and so `elo/learner_rated` (AC7) — reachable
+    # at all. Passing 0 to THIS flag would instead make the frozen opponent
+    # greedy in every TRAINING episode, which is the deterministic lock-in the
+    # nonzero default exists to prevent.
+    parser.add_argument(
+        "--opponent-epsilon", type=float, default=None,
+        help="--opponent selfplay only: exploration epsilon applied to the FROZEN "
+        "snapshot opponent, never to the learner (default: TrainConfig's 0.02). It "
+        "never decays. Do not set it to 0 for a whole run: a greedy learner facing "
+        "a greedy snapshot can lock the pair into one deterministic episode "
+        "replayed until morning.",
+    )
+    parser.add_argument(
+        "--reference-promote-grad-steps", type=int, nargs=2, default=None,
+        metavar=("FIRST", "SECOND"),
+        help="--opponent selfplay only: the two grad steps at which pinned reference "
+        "snapshots 2 and 3 are promoted (default: TrainConfig's 5000 15000). Must "
+        "be strictly increasing. Reference 1 is snapshot 0, pinned at creation from "
+        "the warm start, and is not listed here. Read by the promotion hook (T18), "
+        "not by this module.",
+    )
+    parser.add_argument(
+        "--elo-k", type=float, default=None,
+        help="--opponent selfplay only: Elo K-factor, the largest rating swing one "
+        "rated match can produce (default: TrainConfig's 24).",
+    )
+    parser.add_argument(
+        "--elo-initial", type=float, default=None,
+        help="--opponent selfplay only: the learner's Elo before any rated match "
+        "(default: TrainConfig's 1000). A snapshot's rating is frozen at creation "
+        "from the learner's rating at that moment; only the learner's own rating "
+        "moves afterwards.",
+    )
     parser.add_argument(
         "--stop-on-pass", dest="stop_on_pass", action="store_true", default=None,
         help="stop the run as soon as an eval clears the M2 gate. DEFAULT: on for "
-        "--opponent dummy, OFF for --opponent scripted (the M2 gate is defined "
-        "against the stationary dummy, so it is not this retrain's finish line).",
+        "--opponent dummy, OFF for every other opponent (the M2 gate is defined "
+        "against the STATIONARY dummy, so clearing it says nothing about a run "
+        "that fights a scripted bot or a past self, and a warm-started agent can "
+        "clear it in its first eval).",
     )
     parser.add_argument(
         "--no-stop-on-pass", dest="stop_on_pass", action="store_false",
@@ -3777,8 +6090,8 @@ def _build_parser() -> "Any":
         "the episodes that many pads are projected to collect overnight) - every "
         "pad claims from ONE shared episode counter, so a single-arena number is "
         "spent N times too fast. The projection assumes an UNMEASURED mean episode "
-        "length; set this flag from the smoke run's measured mean (do NOT use 400, "
-        "which is the timeout, not a typical episode).",
+        "length; set this flag from the smoke run's measured mean (do NOT use 600, "
+        "which is MAX_EPISODE_STEPS - the truncation cap, not a typical episode).",
     )
     parser.add_argument(
         "--replay-capacity", type=int, default=None,
@@ -3863,6 +6176,18 @@ _CONFIG_OVERRIDE_FLAGS: Tuple[Tuple[str, str, Callable[[Any], Any]], ...] = (
     ("eval_opponent_preset", "eval_opponent_preset", str),
     ("warm_start", "warm_start", str),
     ("warm_start_eps_start", "warm_start_eps_start", float),
+    ("warm_start_sha256", "warm_start_sha256", str),
+    ("snapshot_every_grad_steps", "snapshot_every_grad_steps", int),
+    ("snapshot_sampling", "snapshot_sampling", str),
+    ("opponent_epsilon", "opponent_epsilon", float),
+    # `tuple`, NOT a passthrough. argparse `nargs=2` hands over a LIST, and
+    # `TrainConfig.__post_init__` rejects a non-tuple outright: a list field on a
+    # frozen dataclass makes `hash(cfg)` raise at whatever unrelated call site
+    # hashes the config first, arbitrarily far from this line. The entries are
+    # already `int` — the flag declares `type=int`.
+    ("reference_promote_grad_steps", "reference_promote_grad_steps", tuple),
+    ("elo_k", "elo_k", float),
+    ("elo_initial", "elo_initial", float),
     ("eps_decay_episodes", "eps_decay_episodes", int),
     ("replay_capacity", "replay_capacity", int),
     ("min_replay", "min_replay", int),
@@ -3916,12 +6241,82 @@ def _config_from_args(args: Any) -> TrainConfig:
     return dataclasses.replace(TrainConfig(), **overrides)
 
 
+#: Bytes read per hashing iteration in :func:`_verify_warm_start_checksum`. A
+#: checkpoint is a few MB today; a fixed-size loop costs nothing now and keeps a
+#: future larger net from being read into memory whole just to fingerprint it.
+_HASH_CHUNK_BYTES: int = 1 << 20
+
+
+def _verify_warm_start_checksum(cfg: TrainConfig) -> None:
+    """Refuse to start when ``--warm-start``'s bytes disagree with its checksum.
+
+    AC14's second half. ``TrainConfig`` validates only the SHAPE of
+    ``warm_start_sha256`` (64 lowercase hex characters) and never opens the
+    file; this is the only place the checkpoint's actual bytes are hashed.
+
+    A no-op unless ``cfg.warm_start_sha256`` is set, so every run that does not
+    pass ``--warm-start-sha256`` is unaffected.
+
+    Why the gate earns its own failure mode: a self-play run seeds snapshot 0 —
+    the pool's first PINNED member, which by
+    :class:`~opponents.snapshot_pool.SnapshotPool`'s corruption policy is never
+    dropped and never evicted — entirely from this file. A stale path, the wrong
+    run's checkpoint or a half-copied file loads perfectly cleanly into the same
+    architecture, and the run then spends the night measured against a permanent
+    reference opponent nobody can identify afterwards.
+
+    Args:
+        cfg: The run config, read for ``warm_start`` and ``warm_start_sha256``.
+
+    Raises:
+        ValueError: ``warm_start`` is unset (unreachable through
+            ``TrainConfig``, which already refuses that pair), or the file's
+            SHA-256 is not ``warm_start_sha256``. The mismatch message carries
+            BOTH digests: "checksum mismatch" alone cannot tell an operator
+            whether they pasted the wrong checksum or aimed at the wrong file.
+        FileNotFoundError: ``warm_start`` names no existing file. Raised here,
+            before a logger or a fleet exists, rather than inside ``Trainer``.
+    """
+    expected = cfg.warm_start_sha256
+    if expected is None:
+        return
+    if cfg.warm_start is None:
+        # Unreachable via TrainConfig (it rejects a checksum with no warm start),
+        # kept so this function cannot hash the literal string "None" if it is
+        # ever called with a config built some other way.
+        raise ValueError(
+            "warm_start_sha256 is set but warm_start is None: there is no "
+            f"checkpoint to hash against {expected}"
+        )
+    path = str(cfg.warm_start)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"--warm-start {path!r} is not an existing file, so the "
+            f"--warm-start-sha256 {expected} cannot be verified against it. "
+            "Fix the path (an absolute one survives a change of working "
+            "directory) or drop the checksum."
+        )
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise ValueError(
+            "warm-start checksum MISMATCH - refusing to start. "
+            f"--warm-start {path!r} hashes to {actual}, but "
+            f"--warm-start-sha256 says {expected}. Either the checkpoint is not "
+            "the one this run was sized against, or the checksum was copied "
+            "from a different file; do not start until you know which."
+        )
+
+
 def _resolve_stop_on_pass(explicit: Optional[bool], cfg: TrainConfig) -> bool:
     """Resolve ``--stop-on-pass`` / ``--no-stop-on-pass``, defaulting by opponent.
 
     An explicit flag always wins. With neither, the default is ``True`` for the
-    dummy (today's M2 behavior, unchanged) and ``False`` for the scripted
-    opponent.
+    dummy (today's M2 behavior, unchanged) and ``False`` for every other
+    opponent — the scripted curriculum and self-play alike.
 
     The asymmetry is not a preference, it is what the gate MEANS. ``passed_m2``
     is AC6's gate: >= 95% win rate **against the stationary dummy**. A retrain
@@ -4073,14 +6468,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     # are stamped the same way (TrainConfig validates every one of them).
     cfg = _config_from_args(args)
 
+    # The rest of the config validation, continued from TrainConfig into the one
+    # check that has to touch the disk. FIRST, so no later early return can skip
+    # it, and before the logger exists so a refused run leaves no run directory.
+    _verify_warm_start_checksum(cfg)
+    if cfg.warm_start_sha256 is not None:
+        print(
+            f"[train] warm start {cfg.warm_start} verified: "
+            f"sha256={cfg.warm_start_sha256}",
+            file=sys.stderr,
+        )
+
     # Refuse the one combination that cannot be honored, before anything starts:
-    # the single-arena loop steps no opponent policy, so --opponent scripted there
-    # would quietly train against the stationary dummy instead.
+    # the single-arena loop steps no opponent policy, so --opponent scripted or
+    # selfplay there would quietly train against the stationary dummy instead.
     if int(args.arenas) < 2 and cfg.opponent != "dummy":
         print(
             f"[train] FATAL: --opponent {cfg.opponent} needs --arenas >1. The "
-            "single-arena loop never steps an opponent policy (the dummy is served "
-            "by the bridge), so it would silently train against the stationary "
+            "single-arena loop never steps an opponent policy - neither the "
+            "scripted curriculum nor a self-play snapshot (the dummy is served "
+            "by the bridge) - so it would silently train against the stationary "
             "dummy while this run's config claimed otherwise. Re-run with "
             "--arenas N (N >= 2) against a booted pad fleet. Aborting.",
             file=sys.stderr,
@@ -4131,6 +6538,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             "per_actor_eps_alpha": cfg.per_actor_eps_alpha,
             "replay_capacity": cfg.replay_capacity,
             "min_replay": cfg.min_replay,
+            # WHO THIS RUN FOUGHT. `opponent` above proves only that the flag
+            # parsed; these decide which past self was drawn, how often a new
+            # one was archived, and what its rating meant. Recorded on every run
+            # (they are constants either way) — the loop reads them only when
+            # opponent == "selfplay".
+            "warm_start_sha256": cfg.warm_start_sha256,
+            "snapshot_every_grad_steps": cfg.snapshot_every_grad_steps,
+            "snapshot_sampling": cfg.snapshot_sampling,
+            "opponent_epsilon": cfg.opponent_epsilon,
+            # `list`, not the tuple: `json.dump` writes a tuple as a JSON array
+            # anyway, so converting here keeps summary.json and a W&B config the
+            # same shape rather than backend-dependent.
+            "reference_promote_grad_steps": list(cfg.reference_promote_grad_steps),
+            "elo_k": cfg.elo_k,
+            "elo_initial": cfg.elo_initial,
+            # Where this run's past selves live — through the SAME helper
+            # `_main_multi_arena` hands the loop, so the record and the pool
+            # cannot name two directories. None off the self-play path, which
+            # builds no pool at all.
+            "snapshot_pool_dir": (
+                snapshot_pool_directory(args.run_name)
+                if cfg.opponent == "selfplay"
+                else None
+            ),
             **reward_cfg,
         },
     )
@@ -4253,10 +6684,11 @@ def _main_multi_arena(
 ) -> int:
     """Live multi-arena (N>1) run: wire real clients + the subprocess launcher.
 
-    Constructs, per pad ``i``, an env factory that opens a
-    :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port ``--port + i`` and wraps
-    it in an :class:`~env.mc_pvp_env.MCPvPEnv`, then runs :func:`train_multi_arena`.
-    The N pads must ALREADY be booted AND PRIMED by the human
+    Constructs, via :func:`build_live_env_factory_for`, an env factory that per
+    pad ``i`` opens a :class:`~env.mc_pvp_env.TcpBridgeClient` to bridge port
+    ``--port + i`` and wraps it in an :class:`~env.mc_pvp_env.MCPvPEnv` (with
+    the self-play observation mirror when ``--opponent selfplay``), then runs
+    :func:`train_multi_arena`. The N pads must ALREADY be booted AND PRIMED by the human
     (``server/setup/start-pads.sh --pads N``, which resets every pad before any pad
     may step); T8 only connects clients. The
     :class:`~distributed.launcher.SubprocessArenaLauncher` is imported lazily here so
@@ -4269,6 +6701,11 @@ def _main_multi_arena(
       * ``--mc-port`` is handed to BOTH the launcher (which refuses to spawn a bridge
         against an unreachable JVM) and the pool's :func:`~distributed.actor.jvm_alive`
         watchdog (whose ``False`` aborts the run). One value, one meaning.
+      * A self-play run's ``snapshot_dir`` is resolved HERE, from ``--run-name``
+        via :func:`snapshot_pool_directory`, and handed to
+        :func:`train_multi_arena`. Left unset, the loop's own fallback names
+        ``runs/selfplay/snapshots`` for every run alike, and a second run would
+        silently inherit the first's past selves and its Elo series.
       * A :class:`~distributed.actor.ShutdownSignal` is created HERE, before the
         launcher, because the launcher takes its ``sleep`` at construction. The pool
         sets it on stop/abort, so a shutdown that lands while a collector is inside
@@ -4283,8 +6720,6 @@ def _main_multi_arena(
     # distributed.actor imports FROM agent.train, so a module-level import here
     # would be a cycle.
     from distributed.actor import ShutdownSignal, jvm_alive
-
-    from env.mc_pvp_env import MCPvPEnv, TcpBridgeClient
 
     base_port = int(args.port)
     host = str(args.host)
@@ -4314,20 +6749,14 @@ def _main_multi_arena(
         )
         return 1
 
-    def _env_factory_for(arena_id: int) -> Callable[[], Any]:
-        port = base_port + arena_id
-
-        def _build() -> Any:
-            # auto_connect=True (default): the collector treats a successful return as
-            # a working connection; a connect failure raises BridgeError into its
-            # recovery path. One TCP connection per arena (the wire has no arena id).
-            transport = TcpBridgeClient(host=host, port=port)
-            return MCPvPEnv(
-                transport=transport,
-                max_episode_steps=MAX_EPISODE_STEPS,
-            )
-
-        return _build
+    # The per-pad env factory, including the self-play observation mirror. Built
+    # by a module-level helper so the mirror wiring is testable without a fleet.
+    _env_factory_for = build_live_env_factory_for(
+        cfg,
+        host=host,
+        base_port=base_port,
+        max_episode_steps=MAX_EPISODE_STEPS,
+    )
 
     # The launcher is the only piece that cannot be exercised offline. Import it
     # lazily and fail loudly (not silently) if it is missing — it is required to
@@ -4351,6 +6780,18 @@ def _main_multi_arena(
     # target that cannot be knocked back and (on a minecraft-data bump) cannot
     # walk — with clean logs the whole way.
     dummy_knockback_immune = cfg.opponent == "dummy"
+
+    # WHERE THIS RUN'S PAST SELVES LIVE. Derived from --run-name here rather than
+    # left to train_multi_arena's `snapshot_dir=None` fallback, which resolves to
+    # runs/selfplay/snapshots for EVERY run regardless of its name: a second
+    # self-play run would then reload the first one's pool, resample its
+    # snapshots and continue its Elo series as though the two learners were one.
+    # `None` off the self-play path, where the loop never reads it — and
+    # `args.run_name` is read only there, deliberately without a getattr
+    # fallback, because a default would be a shared pool by another name.
+    snapshot_dir = (
+        snapshot_pool_directory(args.run_name) if cfg.opponent == "selfplay" else None
+    )
 
     # The shutdown signal must exist BEFORE the launcher: the launcher takes its
     # polling sleep as a constructor argument, and that sleep is the only hook that
@@ -4392,10 +6833,17 @@ def _main_multi_arena(
         max_grad_steps=args.max_grad_steps,
         eval_every_grad_steps=args.eval_every_grad_steps,
         eval_episodes=args.eval_episodes,
+        # getattr, matching every other optional flag on this call: a caller
+        # that built `args` by hand (the M2 smoke harness does) must not have to
+        # know about a flag only the self-play path reads.
+        reference_eval_episodes=getattr(
+            args, "reference_eval_episodes", DEFAULT_REFERENCE_EVAL_EPISODES
+        ),
         stop_on_pass=_resolve_stop_on_pass(getattr(args, "stop_on_pass", None), cfg),
         checkpoint_every_grad_steps=getattr(
             args, "checkpoint_every_grad_steps", None
         ),
+        snapshot_dir=snapshot_dir,
         logger=logger,
         checkpoint_hook=checkpoint_hook,
         best_checkpoint_hook=best_checkpoint_hook,
@@ -4428,10 +6876,17 @@ def _main_multi_arena(
     # it cannot end the night, and a line naming a file that was never written is
     # worse than no line at all. Every branch below keeps the "best checkpoint:"
     # prefix so grepping for it on freeze day finds the bad news too.
+    #
+    # WHO the number was earned against comes from `selection_opponent` when the
+    # run set one — a self-play run selects on the reference-gauntlet aggregate
+    # while `eval_opponent` still names the scripted yardstick, and printing the
+    # aggregate under the scripted label would put a false number on the one
+    # line freeze day reads.
+    selection_basis = result.selection_opponent or result.eval_opponent
     if result.best_grad_step >= 0:
         _log(
             f"  best checkpoint: win_rate={result.best_win_rate:.3f} vs "
-            f"{result.eval_opponent} at grad_step {result.best_grad_step}"
+            f"{selection_basis} at grad_step {result.best_grad_step}"
         )
         if (
             result.best_save_failures
@@ -4452,7 +6907,7 @@ def _main_multi_arena(
             f"  best checkpoint: NONE WRITTEN - all {result.best_save_failures} "
             "save(s) FAILED. The run selected "
             f"win_rate={result.best_selected_win_rate:.3f} vs "
-            f"{result.eval_opponent} at grad_step "
+            f"{selection_basis} at grad_step "
             f"{result.best_selected_grad_step}, but NO best checkpoint file "
             "exists - do not ship from this line; see the '[multi] BEST "
             "checkpoint save FAILED' lines above"
@@ -4465,12 +6920,12 @@ def _main_multi_arena(
             "  best checkpoint: NONE WRITTEN - no checkpoint path was configured, "
             "so nothing was saved. The run selected "
             f"win_rate={result.best_selected_win_rate:.3f} vs "
-            f"{result.eval_opponent} at grad_step "
+            f"{selection_basis} at grad_step "
             f"{result.best_selected_grad_step}"
         )
     elif result.reports:
         _log(
-            f"  no best checkpoint: no eval vs {result.eval_opponent} won a single "
+            f"  no best checkpoint: no eval vs {selection_basis} won a single "
             "episode, so the latest periodic/final checkpoint is all there is"
         )
     return 0 if result.passed_m2 else 1

@@ -73,7 +73,9 @@ def _sample_state_dict():
             "yaw": 3.14,
             "pitch": -0.2,
             "velocity": [0.1, 0.0, -0.1],
+            "on_ground": True,
             "health": 18.0,  # PRIVILEGED true health (reward only, never obs).
+            "held_item": "iron_sword",
         },
         "events": {
             "damage_dealt": 2.0,
@@ -260,6 +262,82 @@ def test_validate_still_rejects_other_extra_state_fields():
 
 
 # ---------------------------------------------------------------------------
+# state.opponent.on_ground / .held_item — the mirrored-observation fields (TC1).
+#
+# The opponent seat needs the same 23-dim observation the learner gets, and two
+# of its inputs had no wire channel at all. These are REQUIRED, not optional:
+# unlike the swing report there is no "not reported" reading to represent, and a
+# silently-absent field would reach the mirrored observation as a fabricated
+# default rather than as an error. The five surfaces that must agree are
+# schema.json, this module, bot.js's producer AND its assembler, and
+# transport.js — this file guards two of them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("on_ground", [True, False])
+@pytest.mark.parametrize("held_item", ["iron_sword", "", "minecraft:iron_sword"])
+def test_opponent_block_roundtrips_the_new_fields(on_ground, held_item):
+    """TC1: dict -> dataclass -> dict preserves both, exactly and by identity."""
+    d = _sample_state_dict()
+    d["opponent"]["on_ground"] = on_ground
+    d["opponent"]["held_item"] = held_item
+    validate(d)
+
+    parsed = StateMsg.from_dict(d)
+    # `is` for the bool: a truthy int surviving as 1 would validate here but
+    # reach the observation as a non-boolean.
+    assert parsed.opponent.on_ground is on_ground
+    assert parsed.opponent.held_item == held_item
+    assert parsed.to_dict() == d
+
+
+@pytest.mark.parametrize("field_name", ["on_ground", "held_item"])
+def test_validate_rejects_an_opponent_missing_a_new_field(field_name):
+    """TC1: the validator REJECTS the omission — it does not default it in."""
+    d = _sample_state_dict()
+    del d["opponent"][field_name]
+    with pytest.raises(SchemaError):
+        validate(d)
+
+
+@pytest.mark.parametrize("field_name", ["on_ground", "held_item"])
+def test_opponent_from_dict_raises_on_a_missing_new_field(field_name):
+    """Parsing an unvalidated block still fails loudly rather than defaulting."""
+    d = _sample_state_dict()
+    del d["opponent"][field_name]
+    with pytest.raises(KeyError):
+        StateMsg.from_dict(d)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad"),
+    [
+        # bool is an int subclass in Python, so an int here would sail through a
+        # bare truthiness check and land in the observation as 1.0-ish garbage.
+        ("on_ground", 1),
+        ("on_ground", "true"),
+        ("on_ground", None),
+        ("held_item", 7),
+        ("held_item", None),
+        ("held_item", ["iron_sword"]),
+    ],
+)
+def test_validate_rejects_wrong_typed_new_opponent_fields(field_name, bad):
+    d = _sample_state_dict()
+    d["opponent"][field_name] = bad
+    with pytest.raises(SchemaError):
+        validate(d)
+
+
+def test_validate_rejects_an_unknown_extra_opponent_field():
+    """The opponent block stays exact — extra keys are rejected, as before."""
+    d = _sample_state_dict()
+    d["opponent"]["sprinting"] = True
+    with pytest.raises(SchemaError):
+        validate(d)
+
+
+# ---------------------------------------------------------------------------
 # Inbound parse_line dispatch.
 # ---------------------------------------------------------------------------
 
@@ -351,7 +429,9 @@ def test_state_msg_to_json_line_validates():
             yaw=0.0,
             pitch=0.0,
             velocity=[0.0, 0.0, 0.0],
+            on_ground=True,
             health=20.0,
+            held_item="iron_sword",
         ),
         events=Events(damage_dealt=0.0, damage_taken=0.0, i_died=False, opponent_died=False),
         arena=Arena(wall_distances=[5.0, 5.0]),
@@ -535,6 +615,28 @@ def test_schema_json_declares_optional_swing_report():
     )
     assert state["properties"]["opp_action_executed"]["type"] == ["boolean", "null"]
     assert "opp_action_executed" not in state["required"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "json_type"), [("on_ground", "boolean"), ("held_item", "string")]
+)
+def test_schema_json_requires_the_new_opponent_fields(field_name, json_type):
+    """schema.json is the canonical form — REQUIRED there, not merely declared.
+
+    Declaring a property without listing it in ``required`` would let a producer
+    that forgot the field ship a message the mirrored observation then reads as
+    a fabricated default. ``additionalProperties: false`` covers the other
+    direction.
+    """
+    opponent = _schema_branch("state")["properties"]["opponent"]
+    assert opponent["additionalProperties"] is False
+    assert field_name in opponent["properties"], (
+        f"state.opponent.{field_name} is missing from bridge/schema.json — the "
+        "canonical form of the contract. Adding it to schema.md and messages.py "
+        "only leaves it rejected on the wire the moment it is used."
+    )
+    assert opponent["properties"][field_name]["type"] == json_type
+    assert field_name in opponent["required"]
 
 
 @pytest.mark.parametrize("mtype", MESSAGE_TYPES)

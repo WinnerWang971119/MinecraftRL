@@ -15,7 +15,8 @@ count; you just pick which anchor to fly to.
 
 ## Before you join — four things that will bite you
 
-**1. You will spawn in survival, inside pad 0, next to a bot holding an iron sword.**
+**1. You will spawn in survival, inside pad 0, next to a bot holding an iron sword and
+wearing a full iron set.**
 
 `server.properties` sets `gamemode=survival` **and** `force-gamemode=true`, so every
 join forces you to survival regardless of what you were last time. The world spawn is
@@ -71,11 +72,16 @@ acceptance — do not treat it as throwaway. `run_random` reports the crash half
 and says nothing about damage; the damage half comes from what you see in the world
 and, definitively, from `eval.combat_probe` (below).
 
-**Budget about 25–30 minutes for those 20 episodes**, not a few minutes. An episode is
-capped at `MAX_EPISODE_STEPS = 400` decisions at `DECISION_INTERVAL_MS = 200`, i.e.
-**80 seconds**, and a random policy mostly times out rather than killing — so 20 × 80 s
-≈ 27 minutes, plus a reset between each. Do not Ctrl-C at minute 10 and void the run.
+**Budget about 40–45 minutes for those 20 episodes**, not a few minutes. An episode is
+capped at `MAX_EPISODE_STEPS = 600` decisions at `DECISION_INTERVAL_MS = 200`, i.e.
+**120 seconds**, and a random policy mostly times out rather than killing — so
+20 × 120 s = **40 minutes**, plus a reset between each.
 Drop `--episodes` if you only want a look; keep it at 20 if you want the acceptance.
+
+**Do not Ctrl-C at minute 27.** This page used to say the cap was 400 decisions and
+budget 27 minutes, which was right when `MAX_EPISODE_STEPS` was 400. It is 600 now, so
+a healthy run is still going a good 13 minutes after the old budget says it should
+have finished. Killing it there voids AC10 and you get to run it again.
 
 **3. Your normal Minecraft client works. You do not need a cracked client.**
 
@@ -258,9 +264,20 @@ scoreboard objectives add hp health
 scoreboard objectives setdisplay list hp
 ```
 
-Now hold Tab and every player's current health shows next to their name, live. The
-arena datapack uses no scoreboard objectives, so this cannot collide with anything.
+Now hold Tab and every player's current health shows next to their name, live.
 Remove it when you are done with `scoreboard objectives remove hp`.
+
+> **Do not do this during a human exhibition.** The arena datapack uses no
+> scoreboard objectives, so while you are watching a training fleet there is
+> nothing to collide with. The exhibition bridge is the exception: in
+> `opponentMode: 'human'` it binds its own `rl_deaths` objective to the **same
+> `list` display slot** (`bridge/bot.js`), and a slot holds one objective.
+> Running `setdisplay list hp` displaces `rl_deaths`, and being display-bound is
+> the only thing that makes the server broadcast score packets at all, so the
+> challenger's deaths stop being reported. Nothing errors and nothing in the log
+> says so; a match the human loses just does not end. Re-bind it with
+> `scoreboard objectives setdisplay list rl_deaths` if you have already run the
+> command.
 
 For a single spot reading instead, from the console:
 
@@ -294,11 +311,20 @@ no corner holes; a player jumps ~1.25 blocks and the bots cannot place blocks.
 the geometry was silently not built.
 
 **4. The dummy takes damage and dies.**
-A fully-cooled iron-sword hit does **6** damage, so a clean kill is `6, 6, 6, 2` — four
-hits, exactly 20 HP. With the tab-list readout on, the dummy's number should drop in
-steps and **never tick back up**: `naturalRegeneration` is off, so any mid-episode
-healing is a defect. You will also see the hurt flash and hear the hit, which is the
-signal to watch for if you skipped the scoreboard setup.
+A fully-cooled iron-sword hit does **6** damage against an *unarmored* target, so a
+clean kill is `6, 6, 6, 2` — four hits, exactly 20 HP. With the tab-list readout on,
+the dummy's number should drop in steps and **never tick back up**:
+`naturalRegeneration` is off, so any mid-episode healing is a defect. You will also see
+the hurt flash and hear the hit, which is the signal to watch for if you skipped the
+scoreboard setup.
+
+> **The dummy is no longer unarmored, so the number you *watch* is not 6.** Since M4
+> (issue #33) `spawn_dummy_pad.mcfunction` gives it a full iron set — 15 armor points,
+> about 48% off an incoming 6, so roughly **3.12** a hit and about **7** hits to a kill.
+> `eval.combat_probe` **has** been recalibrated (T23): it now derives the expectation
+> from the target's loadout and expects `3.12` six times then `1.28`. It prints what it
+> expects before the first cycle. An earlier revision of this box said the tool had not
+> been recalibrated — that was true when written and is not now.
 
 Expect a **mix, weighted toward timeouts**: a random policy has to still be standing
 in melee range at the moment it happens to pick ATTACK, and it wanders. Kills happen;
