@@ -50,6 +50,26 @@ is not repeated:
   before grad step 15,000 and 3 after. Adding a harder reference lowers it mechanically.
   Compare per-reference rates, or compare only cycles with the same reference set.
 
+## Against a human — 11 matches, 11 agent wins
+
+Rehearsal on 2026-08-20, `runs/m4_selfplay.best.pt` (grad step 93,712) playing greedily
+against one human in full iron with an iron sword, same loadout as the agent.
+
+```
+808, 68, 73, 62, 63, 37, 46, 43, 105, 31, 39   decision steps, all AGENT WIN
+```
+
+Mean excluding the first match: **57 decision steps**, against 47 in self-play. A human is
+marginally harder than its own copies and not enough to matter. Fight length trends DOWN
+across the set (37, 46, 43, 31, 39 in the last five) while the human was actively adapting.
+
+This contradicts the pre-run prediction recorded in the plan, that the agent would be
+"competitive against a casual player, beatable by anyone who knows PvP mechanics". It was
+not close.
+
+The `reset` chat keyword was confirmed working in the same session, which is the one demo
+step no automated test covers.
+
 ## For the demo
 
 The scripted opponent is **saturated** at a 1.000 win rate and cannot rank tonight's
