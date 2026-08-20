@@ -70,6 +70,31 @@ not close.
 The `reset` chat keyword was confirmed working in the same session, which is the one demo
 step no automated test covers.
 
+### The same human against a 4%-trained net
+
+`snap_5` (grad step 5,000) against the same player, same loadout: **6 matches, 6 agent
+wins.** So the agent's floor is already above this human in this arena, and no checkpoint
+in the run is reliably winnable. Plan the demo around that rather than around a staged
+close match.
+
+The player reported the weaker net as *noticeably* weaker while still losing every match.
+Fight length does NOT corroborate that and in fact inverts it:
+
+```
+vs snap_5   (grad 5,000)   n=6    mean 49.7 steps   (33.2 excluding match 1)
+vs best.pt  (grad 93,712)  n=11   mean 125.0 steps  (56.7 excluding match 1)
+```
+
+The weaker net kills FASTER. Two readings, untested: the human trades more freely against
+an opponent they do not respect, or the undertrained policy just charges and swings, which
+is crude but effective against someone not landing clean hits, while the trained one plays
+spacing and takes longer to close.
+
+**Fight length is not a difficulty metric and should not be used as one.** The measurement
+that would settle it — damage dealt by the human before dying — is not recorded: the
+exhibition logs only the match outcome and a decision-step count. Worth adding after the
+demo, since "how close was it" is the question every future rehearsal will ask.
+
 ## For the demo
 
 The scripted opponent is **saturated** at a 1.000 win rate and cannot rank tonight's
